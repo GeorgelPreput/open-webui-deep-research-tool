@@ -16,7 +16,6 @@ import tiktoken
 from open_webui.constants import TASKS
 from open_webui.main import generate_chat_completions
 from open_webui.models.users import User
-from open_webui.utils.embeddings import generate_embeddings
 from pydantic import BaseModel, Field
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
@@ -196,10 +195,6 @@ class Pipe:
         SYNTHESIS_MODEL: str = Field(
             default="gemma3:27b",
             description="Optional separate model for final synthesis (leave empty to use RESEARCH_MODEL)",
-        )
-        EMBEDDING_MODEL: str = Field(
-            default="granite-embedding:30m",
-            description="Model for semantic comparison of content",
         )
         QUALITY_FILTER_MODEL: str = Field(
             default="gemma3:4b",
@@ -607,26 +602,24 @@ class Pipe:
             return int(len(text.split()) * 1.3)
 
     async def get_embedding(self, text: str) -> Optional[List[float]]:
-        """Get embedding for a text string using the configured embedding model with caching"""
+        """Get embedding via Open WebUI's configured embedding function (handles
+        local sentence-transformers, Ollama, OpenAI, or Azure OpenAI transparently)."""
         if not text or not text.strip():
             return None
 
         text = text[:2000]
         text = text.replace(":", " - ")
 
-        # Check cache first
         cached_embedding = self.embedding_cache.get(text)
         if cached_embedding is not None:
             return cached_embedding
 
-        # If not in cache, get from API
         try:
-            response: Any = await generate_embeddings(
-                self.__request__,
-                {"model": self.valves.EMBEDDING_MODEL, "input": text},
-                self.__user__,
-            )
-            embedding = response["data"][0]["embedding"]
+            embedding_fn = self.__request__.app.state.EMBEDDING_FUNCTION
+            if embedding_fn is None:
+                logger.error("Open WebUI EMBEDDING_FUNCTION is not initialized")
+                return None
+            embedding: Any = await embedding_fn(text, user=self.__user__)
             if embedding:
                 self.embedding_cache.set(text, embedding)
                 return embedding
@@ -740,83 +733,11 @@ class Pipe:
             self.vocabulary_cache = await self.create_context_vocabulary(context_text)
             return self.vocabulary_cache
 
-    async def load_prebuilt_vocabulary_embeddings(self):
-        """Download and load pre-built vocabulary embeddings from GitHub"""
-        try:
-            import gzip
-            import json
-            import os
-            import tempfile
-
-            logger.info("Attempting to download pre-built vocabulary embeddings")
-            url = "https://github.com/atineiatte/deep-research-at-home/raw/main/granite30m%20mit%2010k.gz"
-
-            # Download the compressed file
-            connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                    if response.status == 200:
-                        # Create a temporary file
-                        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                            temp_filename = temp_file.name
-                            # Write the compressed data to the temporary file
-                            temp_file.write(await response.read())
-
-                        # Decompress and load the embeddings
-                        try:
-                            with gzip.open(temp_filename, "rt", encoding="utf-8") as f:
-                                data = json.load(f)
-
-                            # Clean up the temporary file
-                            os.unlink(temp_filename)
-
-                            # Convert the data to the expected format
-                            self.vocabulary_cache = []
-                            self.vocabulary_embeddings = {}
-
-                            for word, embedding in data.items():
-                                self.vocabulary_cache.append(word)
-                                self.vocabulary_embeddings[word] = embedding
-
-                            logger.info(
-                                f"Successfully loaded {len(self.vocabulary_embeddings)} pre-built vocabulary embeddings"
-                            )
-
-                            # Store in state for persistence across calls
-                            self.update_state(
-                                "vocabulary_embeddings", self.vocabulary_embeddings
-                            )
-
-                            return self.vocabulary_embeddings
-                        except Exception as e:
-                            logger.error(
-                                f"Error decompressing or parsing embeddings: {e}"
-                            )
-                            # Clean up the temporary file if it exists
-                            if os.path.exists(temp_filename):
-                                os.unlink(temp_filename)
-                    else:
-                        logger.warning(
-                            f"Failed to download pre-built embeddings: HTTP {response.status}"
-                        )
-
-            # If we get here, something went wrong - fall back to original method
-            logger.info("Falling back to on-demand vocabulary embedding generation")
-            return await self.load_vocabulary_embeddings()
-
-        except Exception as e:
-            logger.error(f"Error downloading pre-built vocabulary embeddings: {e}")
-            # Fall back to the original method
-            logger.info("Falling back to on-demand vocabulary embedding generation")
-            return await self.load_vocabulary_embeddings()
-
     async def load_vocabulary_embeddings(self):
-        """Get embeddings for vocabulary words using existing batch processing or pre-built embeddings"""
-        # If we already have the embeddings, return them
+        """Generate vocabulary embeddings on demand using Open WebUI's configured embedding function."""
         if self.vocabulary_embeddings is not None:
             return self.vocabulary_embeddings
 
-        # Check if we have them in state
         state = self.get_state()
         cached_embeddings = state.get("vocabulary_embeddings")
         if cached_embeddings:
@@ -826,39 +747,30 @@ class Pipe:
             )
             return self.vocabulary_embeddings
 
-        # Try to load pre-built embeddings first
-        prebuilt_embeddings = await self.load_prebuilt_vocabulary_embeddings()
-        if prebuilt_embeddings:
-            return prebuilt_embeddings
-
-        # If pre-built embeddings failed, load vocabulary and generate embeddings
         vocab = await self.load_vocabulary()
         if not vocab:
             logger.error("Failed to load vocabulary for embeddings")
             return {}
 
-        self.vocabulary_embeddings = {}
+        embedding_fn = self.__request__.app.state.EMBEDDING_FUNCTION
+        if embedding_fn is None:
+            logger.error("Open WebUI EMBEDDING_FUNCTION is not initialized")
+            return {}
 
-        # Log the start of embedding process
-        logger.info(f"Preloading embeddings for {len(vocab)} vocabulary words")
+        logger.info(f"Generating embeddings for {len(vocab)} vocabulary words (batched)")
+        try:
+            embeddings: Any = await embedding_fn(vocab, user=self.__user__)
+        except Exception as e:
+            logger.error(f"Failed to generate vocabulary embeddings: {e}")
+            return {}
 
-        # Process words sequentially
-        for i, word in enumerate(vocab):
-            if i % 100 == 0:  # Log progress every 100 words
-                logger.info(f"Processing vocabulary word {i}/{len(vocab)}")
-
-            # Get embedding for this word
-            embedding = await self.get_embedding(word)
-            if embedding:
-                self.vocabulary_embeddings[word] = embedding
-
+        self.vocabulary_embeddings = {
+            word: emb for word, emb in zip(vocab, embeddings) if emb
+        }
         logger.info(
             f"Generated embeddings for {len(self.vocabulary_embeddings)} vocabulary words"
         )
-
-        # Store in state for persistence across calls
         self.update_state("vocabulary_embeddings", self.vocabulary_embeddings)
-
         return self.vocabulary_embeddings
 
     def chunk_text(self, text: str) -> List[str]:
@@ -9325,10 +9237,6 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         from datetime import datetime
 
         self.research_date = datetime.now().strftime("%Y-%m-%d")
-
-        # Preload vocabulary embeddings in background as soon as possible
-        self.vocabulary_embeddings = None  # Force reload
-        asyncio.create_task(self.load_prebuilt_vocabulary_embeddings())
 
         # Get state for this conversation
         state = self.get_state()
