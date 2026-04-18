@@ -12,9 +12,11 @@ from typing import Any, Dict, List, Optional, Set
 import aiohttp
 import yarl
 import numpy as np
+import tiktoken
 from open_webui.constants import TASKS
 from open_webui.main import generate_chat_completions
 from open_webui.models.users import User
+from open_webui.utils.embeddings import generate_embeddings
 from pydantic import BaseModel, Field
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
@@ -284,9 +286,6 @@ class Pipe:
         )
         SYNTHESIS_TEMPERATURE: float = Field(
             default=0.6, description="Temperature for final synthesis", ge=0.0, le=2.0
-        )
-        OLLAMA_URL: str = Field(
-            default="http://localhost:11434", description="URL for Ollama API"
         )
         SEARCH_URL: str = Field(
             default="http://192.168.1.1:8888/search?q=",
@@ -596,36 +595,16 @@ class Pipe:
         return [{"id": f"{name}-pipe", "name": f"{name} Pipe"}]
 
     async def count_tokens(self, text: str) -> int:
-        """Count tokens in text using Ollama API"""
+        """Count tokens in text using tiktoken (cl100k_base encoding)"""
         if not text:
             return 0
 
         try:
-            # Use Ollama's tokenize endpoint with the specified model
-            connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                payload = {
-                    "model": self.valves.RESEARCH_MODEL,
-                    "prompt": text,  # Do not limit length for token counting
-                }
-
-                async with session.post(
-                    f"{self.valves.OLLAMA_URL}/api/tokenize", json=payload, timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        tokens = result.get("tokens", [])
-                        # If we got only a partial count due to truncation, estimate full count
-                        if len(text) > 2000:
-                            ratio = len(text) / 2000
-                            return int(len(tokens) * ratio)
-                        return len(tokens)
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
         except Exception as e:
-            logger.error(f"Error counting tokens with Ollama API: {e}")
-
-        # Fallback to simple estimation if API call fails
-        words = text.split()
-        return int(len(words) * 1.3)  # Approximate token count using words
+            logger.error(f"Error counting tokens with tiktoken: {e}")
+            return int(len(text.split()) * 1.3)
 
     async def get_embedding(self, text: str) -> Optional[List[float]]:
         """Get embedding for a text string using the configured embedding model with caching"""
@@ -642,37 +621,15 @@ class Pipe:
 
         # If not in cache, get from API
         try:
-            connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                payload = {
-                    "model": self.valves.EMBEDDING_MODEL,
-                    "input": text,
-                }
-
-                async with session.post(
-                    f"{self.valves.OLLAMA_URL}/api/embed", json=payload, timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        # Handle both old and new API response formats
-                        if "embedding" in result:
-                            embedding = result.get("embedding", [])
-                            if embedding:
-                                # Cache the result
-                                self.embedding_cache.set(text, embedding)
-                                return embedding
-                        elif "embeddings" in result and result["embeddings"]:
-                            # New format with batch response (we only sent one text, so take first)
-                            embedding = result["embeddings"][0]
-                            if embedding:
-                                # Cache the result
-                                self.embedding_cache.set(text, embedding)
-                                return embedding
-                    else:
-                        logger.warning(
-                            f"Embedding request failed with status {response.status}"
-                        )
-
+            response: Any = await generate_embeddings(
+                self.__request__,
+                {"model": self.valves.EMBEDDING_MODEL, "input": text},
+                self.__user__,
+            )
+            embedding = response["data"][0]["embedding"]
+            if embedding:
+                self.embedding_cache.set(text, embedding)
+                return embedding
             return None
         except Exception as e:
             logger.error(f"Error getting embedding: {e}")
