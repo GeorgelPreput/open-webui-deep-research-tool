@@ -404,6 +404,44 @@ class Pipe:
             le=2,
         )
 
+        # --- Report-level budgeting ---
+        RESEARCH_MODEL_CONTEXT_WINDOW: int = Field(
+            default=8192,
+            description="Usable context window (tokens) for the research model",
+            ge=512,
+            le=131072,
+        )
+        SYNTHESIS_MODEL_CONTEXT_WINDOW: int = Field(
+            default=8192,
+            description="Usable context window (tokens) for the synthesis model",
+            ge=512,
+            le=131072,
+        )
+        REPORT_BUDGET_SAFETY_MARGIN: int = Field(
+            default=400,
+            description="Extra token headroom subtracted from every report-level budget",
+            ge=0,
+            le=4096,
+        )
+        MAX_REPORT_FIT_PASSES: int = Field(
+            default=4,
+            description="Maximum passes when iteratively trimming a fitted report context",
+            ge=1,
+            le=10,
+        )
+        REVIEW_WINDOW_OVERLAP_RATIO: float = Field(
+            default=0.12,
+            description="Fractional overlap between adjacent review windows (0.0–0.5)",
+            ge=0.0,
+            le=0.5,
+        )
+        MIN_SECTION_COVERAGE_CHUNKS: int = Field(
+            default=1,
+            description="Minimum chunks kept per section when packing a fitted context",
+            ge=1,
+            le=5,
+        )
+
     def __init__(self):
         self.type = "manifold"
         self.valves = self.Valves()
@@ -1445,6 +1483,408 @@ class Pipe:
 
         return "\n".join(merged_lines)
 
+    # -----------------------------------------------------------------------
+    # Report-level token-budget helpers
+    # -----------------------------------------------------------------------
+
+    async def _count_message_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        """Estimate total tokens for an OpenAI-style messages list.
+
+        Adds a small per-message overhead for chat framing that count_tokens()
+        alone misses, plus a priming overhead for the assistant turn.
+        """
+        PER_MESSAGE_OVERHEAD = 10  # role + separator tokens approximation
+        PRIMING_OVERHEAD = 3       # <|start|>assistant\n priming
+
+        total = PRIMING_OVERHEAD
+        for msg in messages:
+            role_tokens = await self.count_tokens(msg.get("role", ""))
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    part.get("text", "") for part in content if isinstance(part, dict)
+                )
+            content_tokens = await self.count_tokens(content)
+            total += role_tokens + content_tokens + PER_MESSAGE_OVERHEAD
+        return total
+
+    def _get_model_context_window(self, model: str) -> int:
+        """Return the configured usable context window for *model*."""
+        if model == self.get_synthesis_model():
+            return self.valves.SYNTHESIS_MODEL_CONTEXT_WINDOW
+        return self.valves.RESEARCH_MODEL_CONTEXT_WINDOW
+
+    async def _get_task_context_budget(
+        self,
+        task_name: str,
+        model: str,
+        fixed_messages: List[Dict[str, Any]],
+        output_reserve: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Compute the allowed input-content token budget for one model call.
+
+        Returns a dict with keys:
+            context_window, prompt_tokens, output_reserve,
+            safety_margin, input_budget
+        """
+        _TASK_OUTPUT_RESERVES: Dict[str, int] = {
+            "titles": 250,
+            "abstract": 700,
+            "introduction": 600,
+            "conclusion": 800,
+            "review": 1200,
+        }
+        if output_reserve is None:
+            output_reserve = _TASK_OUTPUT_RESERVES.get(task_name, 600)
+
+        context_window = self._get_model_context_window(model)
+        prompt_tokens = await self._count_message_tokens(fixed_messages)
+        safety_margin = self.valves.REPORT_BUDGET_SAFETY_MARGIN
+        input_budget = context_window - prompt_tokens - output_reserve - safety_margin
+        input_budget = max(200, input_budget)
+
+        return {
+            "context_window": context_window,
+            "prompt_tokens": prompt_tokens,
+            "output_reserve": output_reserve,
+            "safety_margin": safety_margin,
+            "input_budget": input_budget,
+        }
+
+    async def _score_section_chunks(
+        self,
+        sections: Dict[str, str],
+        anchor_text: str,
+        summary_text: Optional[str] = None,
+        task_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Score all chunks across sections for relevance to *anchor_text*.
+
+        Returns a flat list of chunk records, each with keys:
+            section_title, chunk_index, text, tokens, score, pinned
+        """
+        anchor_embedding = await self.get_embedding(anchor_text[:2000])
+        summary_embedding: Optional[List[float]] = None
+        if summary_text:
+            summary_embedding = await self.get_embedding(summary_text[:2000])
+
+        records: List[Dict[str, Any]] = []
+
+        for section_title, content in sections.items():
+            if not content or not content.strip():
+                continue
+            chunks = self.chunk_text(content)
+            n = len(chunks)
+
+            # Compute embeddings chunk by chunk, keeping index alignment
+            chunk_embeddings: List[Optional[List[float]]] = []
+            for chunk in chunks:
+                emb = await self.get_embedding(chunk)
+                chunk_embeddings.append(emb)
+
+            for idx, (chunk, emb) in enumerate(zip(chunks, chunk_embeddings)):
+                token_count = await self.count_tokens(chunk)
+
+                # Base score from anchor similarity
+                if emb and anchor_embedding:
+                    try:
+                        sim = cosine_similarity([emb], [anchor_embedding])[0][0]
+                    except Exception:
+                        sim = 0.3
+                else:
+                    sim = 0.3  # conservative default when embedding unavailable
+
+                score = float(sim)
+
+                # Blend with summary similarity if available
+                if emb and summary_embedding:
+                    try:
+                        sum_sim = cosine_similarity([emb], [summary_embedding])[0][0]
+                        score = score * 0.6 + float(sum_sim) * 0.4
+                    except Exception:
+                        pass
+
+                # Small positional bonuses
+                if idx == 0:
+                    score += 0.05
+                if idx == n - 1 and n > 1:
+                    score += 0.03
+
+                records.append(
+                    {
+                        "section_title": section_title,
+                        "chunk_index": idx,
+                        "text": chunk,
+                        "tokens": token_count,
+                        "score": score,
+                        "pinned": False,
+                    }
+                )
+
+        return records
+
+    async def _pack_sections_to_budget(
+        self,
+        sections: Dict[str, str],
+        input_budget: int,
+        anchor_text: str,
+        task_name: str,
+        include_query_line: bool = True,
+        include_section_headings: bool = True,
+        pinned_prefix: str = "",
+        min_chunks_per_section: Optional[int] = None,
+        allow_lossy: bool = True,
+    ) -> str:
+        """Pack section content into *input_budget* tokens preserving cross-section coverage.
+
+        Returns a single assembled string that fits within *input_budget* tokens.
+        """
+        if min_chunks_per_section is None:
+            min_chunks_per_section = self.valves.MIN_SECTION_COVERAGE_CHUNKS
+
+        # ------------------------------------------------------------------ #
+        # Step 1 — Score all chunks
+        # ------------------------------------------------------------------ #
+        chunk_records = await self._score_section_chunks(
+            sections, anchor_text, task_name=task_name
+        )
+
+        # ------------------------------------------------------------------ #
+        # Step 2 — Account for pinned prefix (query line, outline, headings)
+        # ------------------------------------------------------------------ #
+        pinned_tokens = await self.count_tokens(pinned_prefix) if pinned_prefix else 0
+
+        # Section heading tokens
+        heading_tokens: Dict[str, int] = {}
+        if include_section_headings:
+            for title in sections:
+                heading_tokens[title] = await self.count_tokens(f"## {title}\n")
+
+        total_heading_tokens = sum(heading_tokens.values()) if include_section_headings else 0
+        remaining_budget = input_budget - pinned_tokens - total_heading_tokens
+        remaining_budget = max(50, remaining_budget)
+
+        # ------------------------------------------------------------------ #
+        # Step 3 — Guarantee minimum per-section coverage
+        # ------------------------------------------------------------------ #
+        selected: List[Dict[str, Any]] = []
+        used_tokens = 0
+        covered_sections: set = set()
+
+        # For each section pick the top min_chunks_per_section chunks
+        from collections import defaultdict
+        by_section: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for rec in chunk_records:
+            by_section[rec["section_title"]].append(rec)
+        for title in by_section:
+            by_section[title].sort(key=lambda r: r["score"], reverse=True)
+
+        for title, recs in by_section.items():
+            for rec in recs[:min_chunks_per_section]:
+                if used_tokens + rec["tokens"] <= remaining_budget:
+                    selected.append(rec)
+                    used_tokens += rec["tokens"]
+                    covered_sections.add(title)
+                    break  # one guaranteed chunk per section in this pass
+
+        selected_keys = {(r["section_title"], r["chunk_index"]) for r in selected}
+
+        # ------------------------------------------------------------------ #
+        # Step 4 — Fill remaining budget with highest-scoring remaining chunks
+        # ------------------------------------------------------------------ #
+        remaining_records = sorted(
+            [r for r in chunk_records if (r["section_title"], r["chunk_index"]) not in selected_keys],
+            key=lambda r: r["score"],
+            reverse=True,
+        )
+        for rec in remaining_records:
+            if used_tokens + rec["tokens"] > remaining_budget:
+                continue
+            selected.append(rec)
+            used_tokens += rec["tokens"]
+
+        # ------------------------------------------------------------------ #
+        # Step 5 — Rebuild in document order
+        # ------------------------------------------------------------------ #
+        # Sort by section order then chunk_index
+        section_order = list(sections.keys())
+        selected.sort(
+            key=lambda r: (
+                section_order.index(r["section_title"])
+                if r["section_title"] in section_order
+                else 9999,
+                r["chunk_index"],
+            )
+        )
+
+        # ------------------------------------------------------------------ #
+        # Step 6 — Assemble final text
+        # ------------------------------------------------------------------ #
+        parts: List[str] = []
+        if pinned_prefix:
+            parts.append(pinned_prefix)
+
+        current_section: Optional[str] = None
+        for rec in selected:
+            if include_section_headings and rec["section_title"] != current_section:
+                parts.append(f"## {rec['section_title']}")
+                current_section = rec["section_title"]
+            parts.append(rec["text"])
+
+        assembled = "\n\n".join(parts)
+
+        # ------------------------------------------------------------------ #
+        # Step 7 — Verify and iteratively trim if needed
+        # ------------------------------------------------------------------ #
+        for _pass in range(self.valves.MAX_REPORT_FIT_PASSES):
+            actual_tokens = await self.count_tokens(assembled)
+            if actual_tokens <= input_budget:
+                break
+            # Drop lowest-scoring non-pinned chunk
+            if not selected:
+                break
+            # Find lowest-score non-pinned chunk
+            min_idx = min(
+                range(len(selected)),
+                key=lambda i: selected[i]["score"],
+            )
+            selected.pop(min_idx)
+
+            # Reassemble
+            parts = []
+            if pinned_prefix:
+                parts.append(pinned_prefix)
+            current_section = None
+            for rec in selected:
+                if include_section_headings and rec["section_title"] != current_section:
+                    parts.append(f"## {rec['section_title']}")
+                    current_section = rec["section_title"]
+                parts.append(rec["text"])
+            assembled = "\n\n".join(parts)
+        else:
+            # All passes exhausted — hard truncate
+            actual_tokens = await self.count_tokens(assembled)
+            if actual_tokens > input_budget:
+                char_ratio = input_budget / actual_tokens
+                assembled = assembled[: int(len(assembled) * char_ratio)]
+
+        return assembled
+
+    # -----------------------------------------------------------------------
+    # Task-specific context builders
+    # -----------------------------------------------------------------------
+
+    async def _build_titles_context(
+        self,
+        user_message: str,
+        sections: Dict[str, str],
+        input_budget: int,
+    ) -> str:
+        """Compact context for title generation: query + section titles + 1 key chunk each."""
+        section_titles_line = "\n".join(f"- {t}" for t in sections)
+        anchor = f"{user_message}\n{section_titles_line}"
+        pinned = f"Research Query: {user_message}\n\nSection Titles:\n{section_titles_line}"
+        body = await self._pack_sections_to_budget(
+            sections,
+            input_budget=max(50, input_budget - await self.count_tokens(pinned) - 4),
+            anchor_text=anchor,
+            task_name="titles",
+            include_query_line=False,
+            include_section_headings=False,
+            pinned_prefix="",
+            min_chunks_per_section=1,
+        )
+        if body.strip():
+            return f"{pinned}\n\nKey content per section:\n{body}"
+        return pinned
+
+    async def _build_abstract_context(
+        self,
+        user_message: str,
+        sections: Dict[str, str],
+        bibliography: List[Any],
+        input_budget: int,
+    ) -> str:
+        """Context for abstract: query + section coverage + source count."""
+        section_titles_line = "\n".join(f"- {t}" for t in sections)
+        anchor = f"{user_message}\n{section_titles_line}"
+        source_line = f"\n\nTotal sources: {len(bibliography)}" if bibliography else ""
+        pinned = (
+            f"Research Query: {user_message}\n\nSections:\n{section_titles_line}{source_line}"
+        )
+        body = await self._pack_sections_to_budget(
+            sections,
+            input_budget=max(50, input_budget - await self.count_tokens(pinned) - 4),
+            anchor_text=anchor,
+            task_name="abstract",
+            include_query_line=False,
+            include_section_headings=True,
+            pinned_prefix="",
+            min_chunks_per_section=1,
+        )
+        if body.strip():
+            return f"{pinned}\n\nSection content:\n{body}"
+        return pinned
+
+    async def _build_intro_context(
+        self,
+        user_message: str,
+        outline: List[Dict[str, Any]],
+        sections: Dict[str, str],
+        input_budget: int,
+    ) -> str:
+        """Context for introduction: query + outline bullets + section chunks."""
+        section_titles_line = "\n".join(f"- {t}" for t in sections)
+        outline_bullets = ""
+        for topic in outline:
+            outline_bullets += f"- {topic.get('topic', '')}\n"
+            for sub in topic.get("subtopics", []):
+                outline_bullets += f"  - {sub}\n"
+
+        anchor = f"{user_message}\n{section_titles_line}"
+        pinned = (
+            f"Research Query: {user_message}\n\n"
+            f"Research Outline:\n{outline_bullets}\n"
+            f"Sections:\n{section_titles_line}"
+        )
+        body = await self._pack_sections_to_budget(
+            sections,
+            input_budget=max(50, input_budget - await self.count_tokens(pinned) - 4),
+            anchor_text=anchor,
+            task_name="introduction",
+            include_query_line=False,
+            include_section_headings=True,
+            pinned_prefix="",
+            min_chunks_per_section=1,
+        )
+        if body.strip():
+            return f"{pinned}\n\nSection content:\n{body}"
+        return pinned
+
+    async def _build_conclusion_context(
+        self,
+        user_message: str,
+        sections: Dict[str, str],
+        input_budget: int,
+    ) -> str:
+        """Context for conclusion: query + section-aware packed content."""
+        section_titles_line = "\n".join(f"- {t}" for t in sections)
+        anchor = f"{user_message}\n{section_titles_line}"
+        pinned = f"Research Query: {user_message}\n\nSections:\n{section_titles_line}"
+        body = await self._pack_sections_to_budget(
+            sections,
+            input_budget=max(50, input_budget - await self.count_tokens(pinned) - 4),
+            anchor_text=anchor,
+            task_name="conclusion",
+            include_query_line=False,
+            include_section_headings=True,
+            pinned_prefix="",
+            min_chunks_per_section=1,
+        )
+        if body.strip():
+            return f"{pinned}\n\nKey findings:\n{body}"
+        return pinned
+
     async def compress_content_with_local_similarity(
         self,
         content: str,
@@ -1452,6 +1892,7 @@ class Pipe:
         summary_embedding: Optional[List[float]] = None,
         ratio: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        _retry_depth: int = 0,
     ) -> str:
         """Apply semantic compression with local similarity influence and token limiting"""
         # Skip compression for very short content
@@ -1644,23 +2085,28 @@ class Pipe:
             else:  # Paragraph levels
                 compressed_content = "\n".join(selected_chunks)
 
-            # Verify token count if max_tokens specified
+            # Verify token count if max_tokens specified — depth-bounded retry
             if max_tokens:
                 final_tokens = await self.count_tokens(compressed_content)
-
-                # If still over limit, apply additional compression
                 if final_tokens > max_tokens:
-                    # Calculate new ratio based on tokens
-                    new_ratio = max_tokens / final_tokens
-                    # Recursively compress with more aggressive ratio
-                    compressed_content = (
-                        await self.compress_content_with_local_similarity(
-                            compressed_content,
-                            query_embedding,
-                            summary_embedding,
-                            ratio=new_ratio,
+                    if _retry_depth < self.valves.MAX_REPORT_FIT_PASSES - 1:
+                        new_ratio = max_tokens / final_tokens
+                        compressed_content = (
+                            await self.compress_content_with_local_similarity(
+                                compressed_content,
+                                query_embedding,
+                                summary_embedding,
+                                ratio=new_ratio,
+                                max_tokens=max_tokens,
+                                _retry_depth=_retry_depth + 1,
+                            )
                         )
-                    )
+                    else:
+                        # Final deterministic truncation — last resort
+                        char_ratio = max_tokens / final_tokens
+                        compressed_content = compressed_content[
+                            : int(len(compressed_content) * char_ratio)
+                        ]
 
             return compressed_content
 
@@ -1685,6 +2131,7 @@ class Pipe:
         summary_embedding: Optional[List[float]] = None,
         ratio: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        _retry_depth: int = 0,
     ) -> str:
         """Apply semantic compression using eigendecomposition with token limiting"""
         # Skip compression for very short content
@@ -1923,22 +2370,28 @@ class Pipe:
                     compressed_content = "\n".join(selected_chunks)
 
                 # Verify token count if max_tokens specified
+                # Verify token count if max_tokens specified — depth-bounded retry
                 if max_tokens:
                     final_tokens = await self.count_tokens(compressed_content)
-
-                    # If still over limit, apply additional compression
                     if final_tokens > max_tokens:
-                        # Calculate new ratio based on tokens
-                        new_ratio = max_tokens / final_tokens
-                        # Recursively compress with more aggressive ratio
-                        compressed_content = (
-                            await self.compress_content_with_eigendecomposition(
-                                compressed_content,
-                                query_embedding,
-                                summary_embedding,
-                                ratio=new_ratio,
+                        if _retry_depth < self.valves.MAX_REPORT_FIT_PASSES - 1:
+                            new_ratio = max_tokens / final_tokens
+                            compressed_content = (
+                                await self.compress_content_with_eigendecomposition(
+                                    compressed_content,
+                                    query_embedding,
+                                    summary_embedding,
+                                    ratio=new_ratio,
+                                    max_tokens=max_tokens,
+                                    _retry_depth=_retry_depth + 1,
+                                )
                             )
-                        )
+                        else:
+                            # Final deterministic truncation — last resort
+                            char_ratio = max_tokens / final_tokens
+                            compressed_content = compressed_content[
+                                : int(len(compressed_content) * char_ratio)
+                            ]
 
                 return compressed_content
 
@@ -8580,7 +9033,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         research_outline: List[Dict[str, Any]],
         synthesis_model: str,
     ) -> Dict[str, Any]:
-        """Review the compiled synthesis and suggest edits"""
+        """Review the compiled synthesis and suggest edits.
+
+        Uses the full verbatim report when it fits the review budget.
+        Falls back to overlapping verbatim windows when it does not, to
+        preserve exact find_text / replace_text applicability.
+        """
         review_prompt = {
             "role": "system",
             "content": """You are a post-grad research editor reviewing a comprehensive research report assembled per-section in different model contexts.
@@ -8613,7 +9071,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
     The find_text must be the EXACT text string as it appears in the document, and the replace_text must be the EXACT text to replace it with.""",
         }
 
-        # Create context with all sections
+        # Build full verbatim review context (same as before)
         review_context = f"# Complete Research Report on: {original_query}\n\n"
         review_context += "## Research Outline:\n"
         for topic in research_outline:
@@ -8622,19 +9080,17 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 review_context += f"  - {subtopic}\n"
         review_context += "\n"
 
-        # Add the full content of each section
         review_context += "## Complete Report Content by Section:\n\n"
         state = self.get_state()
         memory_stats = state.get("memory_stats", {})
-        section_tokens = memory_stats.get("section_tokens", {})
+        section_tokens_map = memory_stats.get("section_tokens", {})
 
         for section_title, content in compiled_sections.items():
-            # Get token count for this section
-            tokens = section_tokens.get(section_title, 0)
+            tokens = section_tokens_map.get(section_title, 0)
             if tokens == 0:
                 tokens = await self.count_tokens(content)
-                section_tokens[section_title] = tokens
-                memory_stats["section_tokens"] = section_tokens
+                section_tokens_map[section_title] = tokens
+                memory_stats["section_tokens"] = section_tokens_map
                 self.update_state("memory_stats", memory_stats)
 
             review_context += f"### {section_title} [{tokens} tokens]\n\n"
@@ -8642,44 +9098,95 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
         review_context += "\nReview this research report and respond with necessary edits with specified JSON structure. Please don't include any other text in your response but the edits."
 
-        # Create messages array
-        messages = [review_prompt, {"role": "user", "content": review_context}]
+        review_temperature = self.valves.SYNTHESIS_TEMPERATURE * 0.5
 
-        # Generate the review
+        async def _run_single_review(ctx: str) -> Dict[str, Any]:
+            """Run the review prompt against one verbatim context string."""
+            msgs = [review_prompt, {"role": "user", "content": ctx}]
+            resp = await self.generate_completion(
+                synthesis_model, msgs, stream=False, temperature=review_temperature
+            )
+            if resp and "choices" in resp and len(resp["choices"]) > 0:
+                raw = resp["choices"][0]["message"]["content"]
+                try:
+                    js = raw[raw.find("{") : raw.rfind("}") + 1]
+                    return json.loads(js)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    logger.error(f"Error parsing review JSON: {exc}")
+            return {"global_edits": []}
+
         try:
             await self.emit_status(
                 "info", "Reviewing and improving the synthesis...", False
             )
 
-            # Scale temperature based on synthesis temperature valve
-            review_temperature = (
-                self.valves.SYNTHESIS_TEMPERATURE * 0.5
-            )  # Lower temperature for more consistent review
+            budget = await self._get_task_context_budget(
+                "review", synthesis_model, [review_prompt]
+            )
+            input_budget = budget["input_budget"]
+            review_tokens = await self.count_tokens(review_context)
 
-            # Use synthesis model for reviewing
-            response = await self.generate_completion(
-                synthesis_model,
-                messages,
-                stream=False,
-                temperature=review_temperature,
+            use_windowed = review_tokens > input_budget
+
+            logger.info(
+                f"[budget] review | model={synthesis_model} | "
+                f"ctx_window={budget['context_window']} | "
+                f"prompt_tokens={budget['prompt_tokens']} | "
+                f"output_reserve={budget['output_reserve']} | "
+                f"safety_margin={budget['safety_margin']} | "
+                f"input_budget={input_budget} | "
+                f"review_context_tokens={review_tokens} | "
+                f"windowed={use_windowed}"
             )
 
-            if response and "choices" in response and len(response["choices"]) > 0:
-                review_content = response["choices"][0]["message"]["content"]
+            if not use_windowed:
+                # Full single-pass verbatim review
+                return await _run_single_review(review_context)
 
-                # Parse the JSON review
-                try:
-                    review_json_str = review_content[
-                        review_content.find("{") : review_content.rfind("}") + 1
-                    ]
-                    review_data = json.loads(review_json_str)
-                    return review_data
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.error(f"Error parsing review JSON: {e}")
-                    # Return a minimal structure if parsing fails
-                    return {"global_edits": [], "section_edits": {}}
-            else:
-                return {"global_edits": [], "section_edits": {}}
+            # ----------------------------------------------------------------
+            # Windowed verbatim review fallback
+            # ----------------------------------------------------------------
+            overlap_ratio = self.valves.REVIEW_WINDOW_OVERLAP_RATIO
+            # Split review_context into characters; windows sized by budget
+            # Estimate chars per token (rough average of 4)
+            chars_per_token = max(1, len(review_context) // max(1, review_tokens))
+            window_chars = input_budget * chars_per_token
+            step_chars = int(window_chars * (1.0 - overlap_ratio))
+            step_chars = max(1, step_chars)
+
+            windows: List[str] = []
+            pos = 0
+            while pos < len(review_context):
+                end = min(pos + int(window_chars), len(review_context))
+                windows.append(review_context[pos:end])
+                if end >= len(review_context):
+                    break
+                pos += step_chars
+
+            logger.info(
+                f"[review] windowed into {len(windows)} windows "
+                f"(~{int(window_chars)} chars each, {int(overlap_ratio*100)}% overlap)"
+            )
+
+            all_edits: List[Dict[str, str]] = []
+            for idx, window in enumerate(windows):
+                window_data = await _run_single_review(window)
+                window_edits = window_data.get("global_edits", [])
+                all_edits.extend(window_edits)
+
+            # Merge: deduplicate, discard empty find_text
+            seen: set = set()
+            merged: List[Dict[str, str]] = []
+            for edit in all_edits:
+                find_text = edit.get("find_text", "").strip()
+                if not find_text:
+                    continue
+                key = (find_text, edit.get("replace_text", ""))
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(edit)
+
+            return {"global_edits": merged}
 
         except Exception as e:
             logger.error(f"Error generating synthesis review: {e}")
@@ -9009,8 +9516,13 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
             return queries
 
-    async def generate_titles(self, user_message, comprehensive_answer):
-        """Generate a main title and subtitle for the research report"""
+    async def generate_titles(
+        self,
+        user_message: str,
+        comprehensive_answer: str,
+        sections: Optional[Dict[str, str]] = None,
+    ):
+        """Generate a main title and subtitle for the research report."""
         titles_prompt = {
             "role": "system",
             "content": """You are a post-grad research writer creating compelling titles for research reports.
@@ -9038,29 +9550,52 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 	}""",
         }
 
-        # Create a context with the research query and a summary of the comprehensive answer
-        titles_context = f"""Original Research Query: {user_message}
-
-	Research Report Content Summary:
-	{comprehensive_answer}...
-
-	Generate an appropriate main title and subtitle for this research report."""
-
         try:
-            # Get the research model for title generation
             research_model = self.get_research_model()
 
-            # Generate titles
+            # Compute task budget before building context
+            budget = await self._get_task_context_budget(
+                "titles", research_model, [titles_prompt]
+            )
+            input_budget = budget["input_budget"]
+
+            if sections:
+                titles_context = await self._build_titles_context(
+                    user_message, sections, input_budget
+                )
+            else:
+                # Legacy fallback: use raw comprehensive_answer trimmed to budget
+                raw_context = (
+                    f"Original Research Query: {user_message}\n\n"
+                    f"Research Report Content Summary:\n{comprehensive_answer}"
+                )
+                raw_tokens = await self.count_tokens(raw_context)
+                if raw_tokens > input_budget:
+                    char_ratio = input_budget / raw_tokens
+                    raw_context = raw_context[: int(len(raw_context) * char_ratio)]
+                titles_context = raw_context
+
+            titles_context += "\n\nGenerate an appropriate main title and subtitle for this research report."
+
+            logger.info(
+                f"[budget] titles | model={research_model} | "
+                f"ctx_window={budget['context_window']} | "
+                f"prompt_tokens={budget['prompt_tokens']} | "
+                f"output_reserve={budget['output_reserve']} | "
+                f"safety_margin={budget['safety_margin']} | "
+                f"input_budget={input_budget} | "
+                f"context_tokens={await self.count_tokens(titles_context)}"
+            )
+
             response = await self.generate_completion(
                 research_model,
                 [titles_prompt, {"role": "user", "content": titles_context}],
-                temperature=0.7,  # Allow some creativity for titles
+                temperature=0.7,
             )
 
             if response and "choices" in response and len(response["choices"]) > 0:
                 titles_content = response["choices"][0]["message"]["content"]
 
-                # Extract JSON from response
                 try:
                     json_str = titles_content[
                         titles_content.find("{") : titles_content.rfind("}") + 1
@@ -9077,13 +9612,11 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     return {"main_title": main_title, "subtitle": subtitle}
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.error(f"Error parsing titles JSON: {e}")
-                    # Fallback to simple titles
                     return {
                         "main_title": f"Research Report: {user_message[:50]}",
                         "subtitle": "A Comprehensive Analysis and Synthesis",
                     }
             else:
-                # Fallback titles
                 return {
                     "main_title": f"Research Report: {user_message[:50]}",
                     "subtitle": "A Comprehensive Analysis and Synthesis",
@@ -9091,14 +9624,19 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
         except Exception as e:
             logger.error(f"Error generating titles: {e}")
-            # Fallback titles
             return {
                 "main_title": f"Research Report: {user_message[:50]}",
                 "subtitle": "A Comprehensive Analysis and Synthesis",
             }
 
-    async def generate_abstract(self, user_message, comprehensive_answer, bibliography):
-        """Generate an abstract for the research report"""
+    async def generate_abstract(
+        self,
+        user_message: str,
+        comprehensive_answer: str,
+        bibliography: List[Any],
+        sections: Optional[Dict[str, str]] = None,
+    ):
+        """Generate an abstract for the research report."""
         abstract_prompt = {
             "role": "system",
             "content": """You are a post-grad research assistant writing an abstract for a comprehensive research report.
@@ -9121,27 +9659,48 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 	The abstract should follow scientific paper abstract structure but be accessible to an educated general audience.""",
         }
 
-        # Create a context with the full report and bibliography information
-        abstract_context = f"""Research Query: {user_message}
-
-	Research Report Full Content:
-	{comprehensive_answer}...
-
-	Generate a concise, substantive abstract focusing on substantive content and key insights rather than how the research was conducted. Please don't include any other text in your response but the abstract.
-	"""
-
         try:
-            # Get the synthesis model for abstract generation
             synthesis_model = self.get_synthesis_model()
 
-            # Generate abstract with 5-minute timeout
+            budget = await self._get_task_context_budget(
+                "abstract", synthesis_model, [abstract_prompt]
+            )
+            input_budget = budget["input_budget"]
+
+            if sections:
+                abstract_context = await self._build_abstract_context(
+                    user_message, sections, bibliography, input_budget
+                )
+            else:
+                raw_context = (
+                    f"Research Query: {user_message}\n\n"
+                    f"Research Report Full Content:\n{comprehensive_answer}"
+                )
+                raw_tokens = await self.count_tokens(raw_context)
+                if raw_tokens > input_budget:
+                    char_ratio = input_budget / raw_tokens
+                    raw_context = raw_context[: int(len(raw_context) * char_ratio)]
+                abstract_context = raw_context
+
+            abstract_context += "\n\nGenerate a concise, substantive abstract focusing on substantive content and key insights rather than how the research was conducted. Please don't include any other text in your response but the abstract."
+
+            logger.info(
+                f"[budget] abstract | model={synthesis_model} | "
+                f"ctx_window={budget['context_window']} | "
+                f"prompt_tokens={budget['prompt_tokens']} | "
+                f"output_reserve={budget['output_reserve']} | "
+                f"safety_margin={budget['safety_margin']} | "
+                f"input_budget={input_budget} | "
+                f"context_tokens={await self.count_tokens(abstract_context)}"
+            )
+
             response = await asyncio.wait_for(
                 self.generate_completion(
                     synthesis_model,
                     [abstract_prompt, {"role": "user", "content": abstract_context}],
                     temperature=self.valves.SYNTHESIS_TEMPERATURE,
                 ),
-                timeout=300,  # 5 minute timeout
+                timeout=300,
             )
 
             if response and "choices" in response and len(response["choices"]) > 0:
@@ -9149,20 +9708,17 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 await self.emit_message("*Abstract generation complete.*\n")
                 return abstract
             else:
-                # Fallback abstract
                 await self.emit_message("*Abstract generation fallback used.*\n")
                 return f"This research report addresses the query: '{user_message}'. It synthesizes information from {len(bibliography)} sources to provide a comprehensive analysis of the topic, examining key aspects and presenting relevant findings."
 
         except asyncio.TimeoutError:
             logger.error("Abstract generation timed out after 5 minutes")
-            # Provide a fallback abstract
             await self.emit_message(
                 "*Abstract generation timed out, using fallback.*\n"
             )
             return f"This research report addresses the query: '{user_message}'. It synthesizes information from {len(bibliography)} sources to provide a comprehensive analysis of the topic, examining key aspects and presenting relevant findings."
         except Exception as e:
             logger.error(f"Error generating abstract: {e}")
-            # Fallback abstract
             await self.emit_message("*Abstract generation error, using fallback.*\n")
             return f"This research report addresses the query: '{user_message}'. It synthesizes information from {len(bibliography)} sources to provide a comprehensive analysis of the topic, examining key aspects and presenting relevant findings."
 
@@ -10568,7 +11124,9 @@ Format your response as a valid JSON object with the following structure:
         # Generate titles for the report
         await self.emit_synthesis_status("Generating report titles...")
         titles = await self.generate_titles(
-            user_message, "".join(compiled_sections.values())
+            user_message,
+            "".join(compiled_sections.values()),
+            sections=compiled_sections,
         )
 
         # After all sections are generated, perform synthesis review
@@ -10596,6 +11154,7 @@ Format your response as a valid JSON object with the following structure:
             user_message,
             "".join(edited_sections.values()),
             bibliography_data["bibliography"],
+            sections=edited_sections,
         )
 
         # Build final answer
@@ -10610,7 +11169,7 @@ Format your response as a valid JSON object with the following structure:
         # Add abstract
         comprehensive_answer += f"## Abstract\n\n{abstract}\n\n"
 
-        # Add introduction with compression
+        # Add introduction — budget-first approach
         await self.emit_synthesis_status("Generating introduction...")
         intro_prompt = {
             "role": "system",
@@ -10632,26 +11191,29 @@ Format your response as a valid JSON object with the following structure:
                 Please only respond with your introduction - do not include any segue, commentary, explanation, etc.""",
         }
 
-        intro_context = f"Research Query: {user_message}\n\nResearch Outline:"
-        for section in edited_sections:
-            intro_context += f"\n- {section}"
-
-        # Add compressed section content for better context
-        section_context = "\n\nSection Content Summary:\n"
-        for section_title, content in edited_sections.items():
-            section_context += f"\n{section_title}: {content}...\n"
-
-        # Compress the combined context
-        combined_intro_context = intro_context + section_context
-        intro_embedding = await self.get_embedding(combined_intro_context)
-        compressed_intro_context = await self.compress_content_with_eigendecomposition(
-            combined_intro_context, intro_embedding, None, None
+        intro_budget = await self._get_task_context_budget(
+            "introduction", synthesis_model, [intro_prompt]
+        )
+        intro_context = await self._build_intro_context(
+            user_message,
+            synthesis_outline if synthesis_outline else [],
+            edited_sections,
+            intro_budget["input_budget"],
         )
 
-        intro_message = {"role": "user", "content": compressed_intro_context}
+        logger.info(
+            f"[budget] introduction | model={synthesis_model} | "
+            f"ctx_window={intro_budget['context_window']} | "
+            f"prompt_tokens={intro_budget['prompt_tokens']} | "
+            f"output_reserve={intro_budget['output_reserve']} | "
+            f"safety_margin={intro_budget['safety_margin']} | "
+            f"input_budget={intro_budget['input_budget']} | "
+            f"context_tokens={await self.count_tokens(intro_context)}"
+        )
+
+        intro_message = {"role": "user", "content": intro_context}
 
         try:
-            # Use synthesis model for intro
             intro_response = await self.generate_completion(
                 synthesis_model,
                 [intro_prompt, intro_message],
@@ -10699,7 +11261,7 @@ Format your response as a valid JSON object with the following structure:
 
             comprehensive_answer += f"## {section_title}\n\n{content}\n\n"
 
-        # Add conclusion with compression
+        # Add conclusion — budget-first approach
         await self.emit_synthesis_status("Generating conclusion...")
         concl_prompt = {
             "role": "system",
@@ -10724,32 +11286,26 @@ Format your response as a valid JSON object with the following structure:
                 Please only respond with your conclusion - do not include any segue, commentary, explanation, etc.""",
         }
 
-        concl_context = (
-            f"Research Query: {user_message}\n\nKey findings from each section:\n"
+        concl_budget = await self._get_task_context_budget(
+            "conclusion", synthesis_model, [concl_prompt]
+        )
+        concl_context = await self._build_conclusion_context(
+            user_message, edited_sections, concl_budget["input_budget"]
         )
 
-        # Use compression for each section based on the model's context window
-        full_content = ""
-        for section_title, content in edited_sections.items():
-            full_content += f"\n## {section_title}\n{content}\n\n"
-
-        # Get embedding for compression context
-        content_embedding = await self.get_embedding(full_content[:2000])
-
-        # Apply intelligent compression based on your existing logic
-        compressed_content = await self.compress_content_with_eigendecomposition(
-            full_content,
-            content_embedding,
-            None,  # No summary embedding needed
-            None,  # Let the compression function decide the ratio based on content
+        logger.info(
+            f"[budget] conclusion | model={synthesis_model} | "
+            f"ctx_window={concl_budget['context_window']} | "
+            f"prompt_tokens={concl_budget['prompt_tokens']} | "
+            f"output_reserve={concl_budget['output_reserve']} | "
+            f"safety_margin={concl_budget['safety_margin']} | "
+            f"input_budget={concl_budget['input_budget']} | "
+            f"context_tokens={await self.count_tokens(concl_context)}"
         )
-
-        concl_context += compressed_content
 
         concl_message = {"role": "user", "content": concl_context}
 
         try:
-            # Use synthesis model for conclusion
             concl_response = await self.generate_completion(
                 synthesis_model,
                 [concl_prompt, concl_message],
