@@ -10,9 +10,9 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
-import yarl
 import numpy as np
 import tiktoken
+import yarl
 from open_webui.constants import TASKS
 from open_webui.main import generate_chat_completions
 from open_webui.models.users import User
@@ -21,7 +21,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
 
-name = "Deep Research at Home"
+name = "Deep Research"
 
 
 def setup_logger():
@@ -727,7 +727,9 @@ class Pipe:
             url = "https://www.mit.edu/~ecprice/wordlist.10000"
             connector = aiohttp.TCPConnector(force_close=True)
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
                     if response.status == 200:
                         text = await response.text()
                         self.vocabulary_cache = [
@@ -795,7 +797,9 @@ class Pipe:
             logger.error("Open WebUI EMBEDDING_FUNCTION is not initialized")
             return {}
 
-        logger.info(f"Generating embeddings for {len(vocab)} vocabulary words (batched)")
+        logger.info(
+            f"Generating embeddings for {len(vocab)} vocabulary words (batched)"
+        )
         try:
             embeddings: Any = await embedding_fn(vocab, user=self.__user__)
         except Exception as e:
@@ -1494,7 +1498,7 @@ class Pipe:
         alone misses, plus a priming overhead for the assistant turn.
         """
         PER_MESSAGE_OVERHEAD = 10  # role + separator tokens approximation
-        PRIMING_OVERHEAD = 3       # <|start|>assistant\n priming
+        PRIMING_OVERHEAD = 3  # <|start|>assistant\n priming
 
         total = PRIMING_OVERHEAD
         for msg in messages:
@@ -1660,7 +1664,9 @@ class Pipe:
             for title in sections:
                 heading_tokens[title] = await self.count_tokens(f"## {title}\n")
 
-        total_heading_tokens = sum(heading_tokens.values()) if include_section_headings else 0
+        total_heading_tokens = (
+            sum(heading_tokens.values()) if include_section_headings else 0
+        )
         remaining_budget = input_budget - pinned_tokens - total_heading_tokens
         remaining_budget = max(50, remaining_budget)
 
@@ -1673,6 +1679,7 @@ class Pipe:
 
         # For each section pick the top min_chunks_per_section chunks
         from collections import defaultdict
+
         by_section: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for rec in chunk_records:
             by_section[rec["section_title"]].append(rec)
@@ -1693,7 +1700,11 @@ class Pipe:
         # Step 4 — Fill remaining budget with highest-scoring remaining chunks
         # ------------------------------------------------------------------ #
         remaining_records = sorted(
-            [r for r in chunk_records if (r["section_title"], r["chunk_index"]) not in selected_keys],
+            [
+                r
+                for r in chunk_records
+                if (r["section_title"], r["chunk_index"]) not in selected_keys
+            ],
             key=lambda r: r["score"],
             reverse=True,
         )
@@ -1783,7 +1794,9 @@ class Pipe:
         """Compact context for title generation: query + section titles + 1 key chunk each."""
         section_titles_line = "\n".join(f"- {t}" for t in sections)
         anchor = f"{user_message}\n{section_titles_line}"
-        pinned = f"Research Query: {user_message}\n\nSection Titles:\n{section_titles_line}"
+        pinned = (
+            f"Research Query: {user_message}\n\nSection Titles:\n{section_titles_line}"
+        )
         body = await self._pack_sections_to_budget(
             sections,
             input_budget=max(50, input_budget - await self.count_tokens(pinned) - 4),
@@ -1809,9 +1822,7 @@ class Pipe:
         section_titles_line = "\n".join(f"- {t}" for t in sections)
         anchor = f"{user_message}\n{section_titles_line}"
         source_line = f"\n\nTotal sources: {len(bibliography)}" if bibliography else ""
-        pinned = (
-            f"Research Query: {user_message}\n\nSections:\n{section_titles_line}{source_line}"
-        )
+        pinned = f"Research Query: {user_message}\n\nSections:\n{section_titles_line}{source_line}"
         body = await self._pack_sections_to_budget(
             sections,
             input_budget=max(50, input_budget - await self.count_tokens(pinned) - 4),
@@ -2425,7 +2436,11 @@ class Pipe:
                 return content  # Return original content if both methods fail
 
     async def handle_repeated_content(
-        self, content: str, url: str, query_embedding: Optional[List[float]], repeat_count: int
+        self,
+        content: str,
+        url: str,
+        query_embedding: Optional[List[float]],
+        repeat_count: int,
     ) -> str:
         """Process repeated content with improved sliding window and adaptive shrinkage"""
         state = self.get_state()
@@ -2810,7 +2825,11 @@ class Pipe:
                 )
 
             # Get accumulated trajectory
-            trajectory = self.trajectory_accumulator.get_trajectory() if self.trajectory_accumulator is not None else None
+            trajectory = (
+                self.trajectory_accumulator.get_trajectory()
+                if self.trajectory_accumulator is not None
+                else None
+            )
 
             # If trajectory exists and we have PDV, calculate alignment to track for adaptive fade-out
             if trajectory:
@@ -3355,7 +3374,11 @@ class Pipe:
             pca.fit(embedding_array)
 
             # Store the PCA model and progress trackers
-            assert pca.components_ is not None and pca.explained_variance_ is not None and pca.explained_variance_ratio_ is not None
+            assert (
+                pca.components_ is not None
+                and pca.explained_variance_ is not None
+                and pca.explained_variance_ratio_ is not None
+            )
             research_dimensions = {
                 "eigenvectors": pca.components_.tolist(),
                 "eigenvalues": pca.explained_variance_.tolist(),
@@ -4215,7 +4238,9 @@ class Pipe:
 
             try:
                 # First check if the URL is archived
-                async with session.get(wayback_api_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                async with session.get(
+                    wayback_api_url, timeout=aiohttp.ClientTimeout(total=15)
+                ) as response:
                     if response.status == 200:
                         data = await response.json()
                         # Check if there are archived snapshots
@@ -4992,7 +5017,9 @@ class Pipe:
             connector = aiohttp.TCPConnector(force_close=True)
             async with aiohttp.ClientSession(connector=connector) as session:
                 # Set a timeout for this request
-                async with session.get(search_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                async with session.get(
+                    search_url, timeout=aiohttp.ClientTimeout(total=15)
+                ) as response:
                     if response.status == 200:
                         # First try to parse as JSON
                         try:
@@ -8929,7 +8956,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Determine file path
         # Use OpenWebUI directory (or fallback to current directory)
         try:
-            from open_webui import get_app_dir  # pyright: ignore[reportAttributeAccessIssue]
+            from open_webui import (
+                get_app_dir,  # pyright: ignore[reportAttributeAccessIssue]
+            )
 
             export_dir = get_app_dir()
         except Exception:
@@ -9165,7 +9194,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
             logger.info(
                 f"[review] windowed into {len(windows)} windows "
-                f"(~{int(window_chars)} chars each, {int(overlap_ratio*100)}% overlap)"
+                f"(~{int(window_chars)} chars each, {int(overlap_ratio * 100)}% overlap)"
             )
 
             all_edits: List[Dict[str, str]] = []
@@ -9330,7 +9359,11 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         )
                         return []
 
-                    assert pca.components_ is not None and pca.explained_variance_ is not None and pca.explained_variance_ratio_ is not None
+                    assert (
+                        pca.components_ is not None
+                        and pca.explained_variance_ is not None
+                        and pca.explained_variance_ratio_ is not None
+                    )
                     eigen_data = {
                         "eigenvectors": pca.components_.tolist(),
                         "eigenvalues": pca.explained_variance_.tolist(),
@@ -10971,7 +11004,11 @@ Format your response as a valid JSON object with the following structure:
 
                 # Display dimensions without coverage percentages
                 for dim in sorted_dimensions[:10]:  # Limit to top 10
-                    dim_text = dim.get("words", "Dimension") if isinstance(dim, dict) else str(dim)
+                    dim_text = (
+                        dim.get("words", "Dimension")
+                        if isinstance(dim, dict)
+                        else str(dim)
+                    )
                     await self.emit_message(f"- {dim_text}\n")
 
                 await self.emit_message("\n")
