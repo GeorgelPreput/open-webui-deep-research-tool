@@ -797,17 +797,22 @@ class Pipe:
             logger.error("Open WebUI EMBEDDING_FUNCTION is not initialized")
             return {}
 
+        batch_size = 512
         logger.info(
-            f"Generating embeddings for {len(vocab)} vocabulary words (batched)"
+            f"Generating embeddings for {len(vocab)} vocabulary words (batch_size={batch_size})"
         )
+        all_embeddings = []
         try:
-            embeddings: Any = await embedding_fn(vocab, user=self.__user__)
+            for i in range(0, len(vocab), batch_size):
+                batch = vocab[i : i + batch_size]
+                batch_result: Any = await embedding_fn(batch, user=self.__user__)
+                all_embeddings.extend(batch_result)
         except Exception as e:
             logger.error(f"Failed to generate vocabulary embeddings: {e}")
             return {}
 
         self.vocabulary_embeddings = {
-            word: emb for word, emb in zip(vocab, embeddings) if emb
+            word: emb for word, emb in zip(vocab, all_embeddings) if emb
         }
         logger.info(
             f"Generated embeddings for {len(self.vocabulary_embeddings)} vocabulary words"
@@ -5861,6 +5866,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         messages: List[Dict[str, Any]],
         stream: bool = False,
         temperature: Optional[float] = None,
+        timeout: float = 600.0,
     ) -> dict[str, Any]:
         """Generate a completion from the specified model"""
         try:
@@ -5876,13 +5882,21 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 "keep_alive": "10m",
             }
 
-            response = await generate_chat_completions(
-                self.__request__,
-                form_data,
-                user=self.__user__,
+            response = await asyncio.wait_for(
+                generate_chat_completions(
+                    self.__request__,
+                    form_data,
+                    user=self.__user__,
+                ),
+                timeout=timeout,
             )
 
             return response
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Completion timed out after {timeout}s for model {model}"
+            )
+            raise
         except Exception as e:
             logger.error(f"Error generating completion with model {model}: {e}")
             # Return a minimal valid response structure
