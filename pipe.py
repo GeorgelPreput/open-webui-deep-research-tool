@@ -442,6 +442,34 @@ class Pipe:
             le=5,
         )
 
+        # --- Open WebUI primary extraction rollout ---
+        USE_OPENWEBUI_EXTRACTION: bool = Field(
+            default=True,
+            description="Globally enable Open WebUI's configured extraction facilities as the primary path; when False, only legacy extraction is used",
+        )
+        PRIMARY_WEB_EXTRACTION: bool = Field(
+            default=True,
+            description="For HTML/web URLs, try Open WebUI's configured Web Loader first (falls back to legacy HTML extraction on failure or poor quality)",
+        )
+        PRIMARY_DOCUMENT_EXTRACTION: bool = Field(
+            default=True,
+            description="For PDFs/document responses, try Open WebUI's configured document loader (CONTENT_EXTRACTION_ENGINE) first (falls back to PyPDF2/pdfplumber on failure)",
+        )
+        POST_CLEAN_PRIMARY_OUTPUT: bool = Field(
+            default=False,
+            description="After a successful primary extraction, optionally re-run legacy text cleanup (useful if the primary output is noisy)",
+        )
+        REQUIRE_EXTRACTION_QUALITY: bool = Field(
+            default=True,
+            description="Apply minimum quality checks (non-empty, non-error, minimum length) to primary extraction output before accepting it",
+        )
+        MIN_EXTRACTION_LENGTH: int = Field(
+            default=80,
+            description="Minimum character length for a primary extraction result to be accepted (otherwise falls back to legacy)",
+            ge=0,
+            le=10000,
+        )
+
     def __init__(self):
         self.type = "manifold"
         self.valves = self.Valves()
@@ -3482,8 +3510,484 @@ class Pipe:
             logger.error(f"Error identifying research gaps: {e}")
             return []
 
+    # ------------------------------------------------------------------
+    # Primary extraction layer (Open WebUI-backed) — see fetch_content().
+    # These helpers try Open WebUI's configured Web Loader / document
+    # extraction engine first; the legacy extract_text_from_html,
+    # extract_text_from_pdf, and fetch_from_archive methods below remain
+    # as fallback / rescue paths.
+    # ------------------------------------------------------------------
+
+    async def _openwebui_extraction_available(self, kind: str) -> bool:
+        """Lazy capability discovery for Open WebUI extraction facilities.
+
+        kind is "web" (Web Loader) or "doc" (document extraction Loader).
+        Result is cached per Pipe instance so repeated calls are cheap.
+        Import failures do not crash the pipe — they simply mark the
+        capability as unavailable, which forces fall-back to legacy.
+        """
+        if not hasattr(self, "_openwebui_ext_cap"):
+            self._openwebui_ext_cap = {}
+        if kind in self._openwebui_ext_cap:
+            return self._openwebui_ext_cap[kind]
+
+        available = False
+        try:
+            if kind == "web":
+                from open_webui.retrieval.web.utils import (  # noqa: F401
+                    get_web_loader,
+                )
+
+                available = True
+                logger.info(
+                    "Open WebUI Web Loader detected; primary web extraction available"
+                )
+            elif kind == "doc":
+                from open_webui.retrieval.loaders.main import Loader  # noqa: F401
+
+                available = True
+                logger.info(
+                    "Open WebUI document Loader detected; primary document extraction available"
+                )
+        except Exception as e:
+            logger.info(
+                f"Open WebUI {kind} extraction unavailable ({e}); legacy fallback will be used"
+            )
+            available = False
+
+        self._openwebui_ext_cap[kind] = available
+        return available
+
+    def _classify_url(self, url: str) -> str:
+        """Classify a URL for extraction routing.
+
+        Returns one of: "pdf", "html", "unknown". Content-type based PDF
+        detection (for URLs without a .pdf suffix that return
+        application/pdf) happens later in fetch_content's live-response
+        branch; this classifier only inspects the URL itself.
+        """
+        if not url or not isinstance(url, str):
+            return "unknown"
+        base = url.lower().split("?", 1)[0].split("#", 1)[0]
+        if base.endswith(".pdf"):
+            return "pdf"
+        return "html"
+
+    def _url_fallback_title(self, url: str) -> str:
+        """Derive a reasonable title from a URL path when no title was provided."""
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(url)
+            last = parsed.path.rsplit("/", 1)[-1]
+            if last:
+                return (
+                    last.replace(".pdf", "").replace("-", " ").replace("_", " ").strip()
+                    or url
+                )
+            return parsed.netloc or url
+        except Exception:
+            return url
+
+    def _check_extraction_quality(self, text: str) -> bool:
+        """Minimum-quality gate for accepting a primary-path extraction.
+
+        When REQUIRE_EXTRACTION_QUALITY is disabled we accept any
+        non-empty text. Otherwise reject obviously-empty, error-shaped,
+        too-short, or HTML-dominated output so we fall back to legacy.
+        """
+        if not self.valves.REQUIRE_EXTRACTION_QUALITY:
+            return bool(text and isinstance(text, str) and text.strip())
+        if not text or not isinstance(text, str):
+            return False
+        stripped = text.strip()
+        if len(stripped) < int(self.valves.MIN_EXTRACTION_LENGTH):
+            return False
+        lowered = stripped.lower()
+        if lowered.startswith("error") or lowered.startswith("could not extract"):
+            return False
+        # Reject HTML-tag-dominated output (primary path should return text)
+        if stripped.startswith("<") and stripped.count("<") > max(
+            20, len(stripped) // 20
+        ):
+            return False
+        return True
+
+    def _build_document_loader_kwargs(self) -> dict:
+        """Best-effort gather of Open WebUI document loader configuration.
+
+        The Loader class accepts an engine name plus a wide set of engine
+        -specific kwargs (Tika / Docling / Datalab / Document Intelligence
+        / MinerU / Mistral OCR / External). We pull whatever is present
+        on app.state.config and pass it along; missing attributes are
+        silently skipped so the Loader falls back to its default engine.
+        """
+        kwargs = {"_engine": ""}
+        try:
+            cfg = self.__request__.app.state.config
+        except Exception:
+            return kwargs
+
+        kwargs["_engine"] = getattr(cfg, "CONTENT_EXTRACTION_ENGINE", "") or ""
+
+        for attr in (
+            "DATALAB_MARKER_API_KEY",
+            "DATALAB_MARKER_API_BASE_URL",
+            "DATALAB_MARKER_ADDITIONAL_CONFIG",
+            "DATALAB_MARKER_SKIP_CACHE",
+            "DATALAB_MARKER_FORCE_OCR",
+            "DATALAB_MARKER_PAGINATE",
+            "DATALAB_MARKER_STRIP_EXISTING_OCR",
+            "DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION",
+            "DATALAB_MARKER_FORMAT_LINES",
+            "DATALAB_MARKER_USE_LLM",
+            "DATALAB_MARKER_OUTPUT_FORMAT",
+            "EXTERNAL_DOCUMENT_LOADER_URL",
+            "EXTERNAL_DOCUMENT_LOADER_API_KEY",
+            "TIKA_SERVER_URL",
+            "DOCLING_SERVER_URL",
+            "DOCLING_API_KEY",
+            "DOCLING_PARAMS",
+            "PDF_EXTRACT_IMAGES",
+            "PDF_LOADER_MODE",
+            "DOCUMENT_INTELLIGENCE_ENDPOINT",
+            "DOCUMENT_INTELLIGENCE_KEY",
+            "DOCUMENT_INTELLIGENCE_MODEL",
+            "MISTRAL_OCR_API_BASE_URL",
+            "MISTRAL_OCR_API_KEY",
+            "MINERU_API_MODE",
+            "MINERU_API_URL",
+            "MINERU_API_KEY",
+            "MINERU_API_TIMEOUT",
+            "MINERU_PARAMS",
+        ):
+            try:
+                kwargs[attr] = getattr(cfg, attr)
+            except Exception:
+                pass
+        return kwargs
+
+    async def _primary_web_extract(self, url: str) -> Optional[dict]:
+        """Run Open WebUI's configured Web Loader for a single URL.
+
+        Returns a normalized dict {"text", "title", "source_type",
+        "archived"} on success, or None if the loader is unavailable,
+        errors out, or returns nothing usable. Never mutates pipe state
+        directly — the caller is responsible for cache/source registration.
+        """
+        if not await self._openwebui_extraction_available("web"):
+            return None
+        try:
+            from open_webui.retrieval.web.utils import get_web_loader
+        except Exception:
+            return None
+
+        try:
+            cfg = self.__request__.app.state.config
+            verify_ssl = bool(getattr(cfg, "ENABLE_WEB_LOADER_SSL_VERIFICATION", True))
+            requests_per_second = int(
+                getattr(cfg, "WEB_LOADER_CONCURRENT_REQUESTS", 2) or 2
+            )
+            trust_env = bool(getattr(cfg, "WEB_SEARCH_TRUST_ENV", False))
+        except Exception:
+            verify_ssl, requests_per_second, trust_env = True, 2, False
+
+        try:
+            loader = get_web_loader(
+                url,
+                verify_ssl=verify_ssl,
+                requests_per_second=requests_per_second,
+                trust_env=trust_env,
+            )
+        except Exception as e:
+            logger.info(f"Open WebUI Web Loader construction failed for {url}: {e}")
+            return None
+
+        try:
+            if hasattr(loader, "aload"):
+                docs = await loader.aload()
+            else:
+                loop = asyncio.get_event_loop()
+                docs = await loop.run_in_executor(self.executor, loader.load)
+        except Exception as e:
+            logger.info(f"Open WebUI Web Loader aload failed for {url}: {e}")
+            return None
+
+        if not docs:
+            return None
+
+        text = "\n\n".join((getattr(d, "page_content", "") or "") for d in docs).strip()
+        if not text:
+            return None
+
+        title = None
+        for d in docs:
+            meta = getattr(d, "metadata", None) or {}
+            candidate = meta.get("title") or meta.get("name")
+            if candidate:
+                title = str(candidate).strip() or None
+                if title:
+                    break
+
+        return {
+            "text": text,
+            "title": title,
+            "source_type": "web",
+            "archived": False,
+        }
+
+    async def _primary_document_extract(
+        self,
+        content_bytes,
+        url: str,
+        content_type: str = "application/pdf",
+    ) -> Optional[str]:
+        """Run Open WebUI's configured document Loader on raw bytes.
+
+        Stages the bytes to a temp file (the Loader API expects a path),
+        calls Loader.load in an executor (it is synchronous), and returns
+        the joined page content. Returns None on any failure so the
+        caller can fall back to the legacy PDF extractor.
+        """
+        if not await self._openwebui_extraction_available("doc"):
+            return None
+        try:
+            from open_webui.retrieval.loaders.main import Loader
+        except Exception:
+            return None
+
+        import os
+        import tempfile
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url) if url else None
+        basename = ""
+        if parsed and parsed.path:
+            basename = parsed.path.rsplit("/", 1)[-1]
+        if not basename:
+            basename = "document"
+        if "." not in basename:
+            if "pdf" in (content_type or "").lower():
+                basename += ".pdf"
+            elif "html" in (content_type or "").lower():
+                basename += ".html"
+            else:
+                basename += ".bin"
+
+        if isinstance(content_bytes, str):
+            payload = content_bytes.encode("utf-8", errors="ignore")
+        else:
+            payload = content_bytes
+
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=f"_{basename}")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(payload)
+            except Exception:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                raise
+
+            loader_kwargs = self._build_document_loader_kwargs()
+            engine = loader_kwargs.pop("_engine", "") or ""
+
+            try:
+                loader = Loader(
+                    engine=engine,
+                    user=getattr(self, "__user__", None),
+                    **loader_kwargs,
+                )
+            except Exception as e:
+                logger.info(
+                    f"Open WebUI document Loader construction failed for {url}: {e}"
+                )
+                return None
+
+            def _run_load():
+                return loader.load(
+                    basename, content_type or "application/pdf", tmp_path
+                )
+
+            loop = asyncio.get_event_loop()
+            docs = await loop.run_in_executor(self.executor, _run_load)
+
+            if not docs:
+                return None
+            text = "\n\n".join(
+                (getattr(d, "page_content", "") or "") for d in docs
+            ).strip()
+            return text or None
+        except Exception as e:
+            logger.warning(f"Open WebUI document extraction failed for {url}: {e}")
+            return None
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    async def _extract_pdf_with_primary_fallback(
+        self,
+        pdf_content,
+        url: str,
+        content_type: str = "application/pdf",
+    ) -> str:
+        """PDF extraction with primary-then-fallback routing.
+
+        Tries Open WebUI's document Loader first (respecting valve flags
+        and quality gates); on failure or rejection, delegates to the
+        legacy extract_text_from_pdf rescue path which uses PyPDF2 /
+        pdfplumber and honours HANDLE_PDFS / PDF_MAX_PAGES.
+        """
+        if (
+            self.valves.USE_OPENWEBUI_EXTRACTION
+            and self.valves.PRIMARY_DOCUMENT_EXTRACTION
+            and self.valves.HANDLE_PDFS
+        ):
+            try:
+                primary_text = await self._primary_document_extract(
+                    pdf_content, url, content_type
+                )
+                if primary_text and self._check_extraction_quality(primary_text):
+                    logger.info(
+                        f"Primary document extraction succeeded for {url} "
+                        f"({len(primary_text)} chars)"
+                    )
+                    return primary_text
+                if primary_text is not None:
+                    logger.info(
+                        f"Primary document extraction rejected by quality gate "
+                        f"for {url}; using legacy PDF extractor"
+                    )
+                else:
+                    logger.info(
+                        f"Primary document extraction returned no result for {url}; "
+                        f"using legacy PDF extractor"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Primary document extraction error for {url}: {e}; "
+                    f"using legacy PDF extractor"
+                )
+        logger.info(f"Using legacy PDF extractor for {url}")
+        return await self.extract_text_from_pdf(pdf_content)
+
+    async def _register_primary_source(self, url: str, result: dict) -> None:
+        """Write a successful primary-path extraction into cache and source table.
+
+        This is the single shared registration point for the primary web
+        path. Legacy branches of fetch_content register sources inline
+        (unchanged); the primary path funnels through here so that the
+        extraction-path-agnostic state (url_results_cache,
+        master_source_table) stays consistent.
+        """
+        state = self.get_state()
+        url_results_cache = state.get("url_results_cache", {})
+        master_source_table = state.get("master_source_table", {})
+
+        text = result.get("text") or ""
+        title = result.get("title") or self._url_fallback_title(url)
+        source_type = result.get("source_type") or "web"
+        archived = bool(result.get("archived", False))
+
+        if isinstance(text, str) and text:
+            tokens = await self.count_tokens(text)
+            token_limit = self.valves.MAX_RESULT_TOKENS * 3
+            if tokens > token_limit:
+                char_limit = int(len(text) * (token_limit / tokens))
+                to_cache = text[:char_limit]
+                logger.info(
+                    f"Limiting cached primary content for URL {url} "
+                    f"from {tokens} to {token_limit} tokens"
+                )
+            else:
+                to_cache = text
+        else:
+            to_cache = text
+
+        url_results_cache[url] = to_cache
+        self.update_state("url_results_cache", url_results_cache)
+
+        if url not in master_source_table:
+            source_id = f"S{len(master_source_table) + 1}"
+            entry = {
+                "id": source_id,
+                "title": title,
+                "content_preview": text[:500] if isinstance(text, str) else "",
+                "source_type": source_type,
+                "accessed_date": self.research_date,
+                "cited_in_sections": set(),
+            }
+            if archived:
+                entry["archived"] = True
+            master_source_table[url] = entry
+            self.update_state("master_source_table", master_source_table)
+
+    async def _try_primary_web_flow(self, url: str) -> Optional[str]:
+        """Top-of-fetch_content entry point for the primary web path.
+
+        For HTML-classified URLs, tries Open WebUI's Web Loader; on
+        acceptance, optionally post-cleans with the legacy HTML
+        extractor, registers the source, writes the cache, updates
+        is_pdf_content, and returns the extracted text. Returns None to
+        signal "fall through to legacy fetch" in every other case
+        (unsupported URL shape, disabled by valves, capability missing,
+        loader error, or quality-gate rejection).
+        """
+        if not (
+            self.valves.USE_OPENWEBUI_EXTRACTION and self.valves.PRIMARY_WEB_EXTRACTION
+        ):
+            return None
+        if self._classify_url(url) != "html":
+            return None
+        if not await self._openwebui_extraction_available("web"):
+            return None
+
+        try:
+            result = await self._primary_web_extract(url)
+        except Exception as e:
+            logger.warning(f"Primary web extraction failed for {url}: {e}")
+            return None
+        if not result:
+            return None
+        text = result.get("text", "")
+        if not self._check_extraction_quality(text):
+            logger.info(
+                f"Primary web extraction rejected by quality gate for {url}; "
+                f"falling back to legacy fetch"
+            )
+            return None
+
+        if self.valves.POST_CLEAN_PRIMARY_OUTPUT:
+            try:
+                cleaned = await self.extract_text_from_html(text)
+                if cleaned and cleaned.strip():
+                    result["text"] = cleaned
+                    text = cleaned
+            except Exception:
+                pass
+
+        if not result.get("title"):
+            result["title"] = self._url_fallback_title(url)
+
+        self.is_pdf_content = False
+        await self._register_primary_source(url, result)
+        logger.info(f"Primary web extraction succeeded for {url} ({len(text)} chars)")
+        return text
+
     async def extract_text_from_html(self, html_content: str) -> str:
-        """Extract meaningful text content from HTML with proper character handling"""
+        """Fallback HTML text extractor (BeautifulSoup / regex).
+
+        This is the rescue path used when Open WebUI's Web Loader is
+        unavailable, errors out, or returns output that fails the
+        quality gate. It is also used as optional post-cleaning when
+        POST_CLEAN_PRIMARY_OUTPUT is enabled.
+        """
         try:
             # Try BeautifulSoup if available
             try:
@@ -3715,7 +4219,19 @@ class Pipe:
                 return html_content
 
     async def fetch_content(self, url: str) -> str:
-        """Fetch content from a URL with anti-blocking measures and domain-specific rate limiting"""
+        """Fetch and extract content for a URL.
+
+        Orchestrates three extraction planes:
+          1. cache short-circuit (url_results_cache),
+          2. primary path — Open WebUI's configured Web Loader / document
+             extraction engine (controlled by the USE_OPENWEBUI_EXTRACTION
+             and PRIMARY_* valves),
+          3. fallback path — the legacy aiohttp fetch with custom HTML
+             cleanup, custom PDF extraction, and archive.org rescue.
+        The legacy path also handles anti-blocking (fake UAs, EZproxy-like
+        headers, per-domain cookies and rate limiting) and content-type
+        based PDF detection that the primary Web Loader alone does not.
+        """
         try:
             state = self.get_state()
             url_considered_count = state.get("url_considered_count", {})
@@ -3731,6 +4247,15 @@ class Pipe:
             if url in url_results_cache:
                 logger.info(f"Using cached content for URL: {url}")
                 return url_results_cache[url]
+
+            # Primary extraction plane: for HTML-classified URLs, try Open
+            # WebUI's configured Web Loader first. PDF-classified URLs fall
+            # through and get routed through the primary document extractor
+            # inside _extract_pdf_with_primary_fallback once bytes are
+            # downloaded by the legacy fetch below.
+            primary_text = await self._try_primary_web_flow(url)
+            if primary_text is not None:
+                return primary_text
 
             logger.debug(f"Using direct fetch for URL: {url}")
 
@@ -3927,8 +4452,13 @@ class Pipe:
                             # Get PDF content as bytes
                             pdf_content = await response.read()
                             self.is_pdf_content = True  # Set the PDF flag
-                            extracted_content = await self.extract_text_from_pdf(
-                                pdf_content
+                            # Route through the primary-then-fallback PDF path:
+                            # Open WebUI's document Loader is tried first, then
+                            # the legacy PyPDF2/pdfplumber extractor.
+                            extracted_content = (
+                                await self._extract_pdf_with_primary_fallback(
+                                    pdf_content, url, "application/pdf"
+                                )
                             )
 
                             # Limit cached content to 3x MAX_RESULT_TOKENS
@@ -4023,8 +4553,13 @@ class Pipe:
                                 # This is a PDF even though the URL didn't end with .pdf
                                 pdf_content = await response.read()
                                 self.is_pdf_content = True  # Set the PDF flag
-                                extracted_content = await self.extract_text_from_pdf(
-                                    pdf_content
+                                # Route through the primary-then-fallback PDF path
+                                # (handles content-type-based PDF detection for
+                                # URLs without a .pdf suffix).
+                                extracted_content = (
+                                    await self._extract_pdf_with_primary_fallback(
+                                        pdf_content, url, "application/pdf"
+                                    )
                                 )
 
                                 # Limit cached content to 3x MAX_RESULT_TOKENS
@@ -4229,7 +4764,15 @@ class Pipe:
             return f"Error fetching content: {str(e)}"
 
     async def fetch_from_archive(self, url: str, session=None) -> str:
-        """Fetch content from the Internet Archive (archive.org)"""
+        """Fallback archive rescue path (Internet Archive / Wayback Machine).
+
+        Only invoked by fetch_content when a live request is blocked
+        (HTTP 403 / 271 etc.). Archived sources are marked with
+        ``archived=True`` in master_source_table. PDF content recovered
+        from the archive is routed through
+        _extract_pdf_with_primary_fallback so it still benefits from the
+        primary document extraction path when available.
+        """
         try:
             # Construct Wayback Machine URL
             wayback_api_url = f"https://archive.org/wayback/available?url={url}"
@@ -4265,13 +4808,14 @@ class Pipe:
                                     ).lower()
 
                                     if "application/pdf" in content_type:
-                                        # Handle PDF from archive
+                                        # Handle PDF from archive — route through the
+                                        # primary-then-fallback path so archived PDFs
+                                        # also benefit from Open WebUI's document
+                                        # extraction engine when available.
                                         pdf_content = await archive_response.read()
                                         self.is_pdf_content = True
-                                        extracted_content = (
-                                            await self.extract_text_from_pdf(
-                                                pdf_content
-                                            )
+                                        extracted_content = await self._extract_pdf_with_primary_fallback(
+                                            pdf_content, url, "application/pdf"
                                         )
 
                                         # Cache the archived content
@@ -4399,7 +4943,14 @@ class Pipe:
             return ""
 
     async def extract_text_from_pdf(self, pdf_content) -> str:
-        """Extract text from PDF content using PyPDF2 or pdfplumber"""
+        """Fallback PDF text extractor (PyPDF2 → pdfplumber).
+
+        Rescue path used by _extract_pdf_with_primary_fallback when
+        Open WebUI's document extraction Loader is unavailable or
+        returns unusable output. Honours HANDLE_PDFS and
+        PDF_MAX_PAGES and runs the CPU-bound work in the shared
+        thread-pool executor.
+        """
         if not self.valves.HANDLE_PDFS:
             return "PDF processing is disabled in settings."
 
@@ -5893,9 +6444,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
             return response
         except asyncio.TimeoutError:
-            logger.error(
-                f"Completion timed out after {timeout}s for model {model}"
-            )
+            logger.error(f"Completion timed out after {timeout}s for model {model}")
             raise
         except Exception as e:
             logger.error(f"Error generating completion with model {model}: {e}")
