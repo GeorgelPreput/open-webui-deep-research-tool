@@ -1,5 +1,7 @@
 import asyncio
 import concurrent.futures
+import hashlib
+import html
 import json
 import logging
 import math
@@ -168,6 +170,16 @@ class ResearchStateManager:
                 "cycle_summaries": [],
                 "completed_topics": set(),
                 "irrelevant_topics": set(),
+                "partial_topics": [],
+                "latest_new_topics": [],
+                "latest_completed_topics": [],
+                "latest_irrelevant_topics": [],
+                "all_topics": [],
+                "progress_cycle": 0,
+                "progress_embed_last_hash": "",
+                "progress_embed_revision": 0,
+                "progress_last_updated_at": "",
+                "current_cycle_queries": [],
             }
         return self.conversation_states[conversation_id]
 
@@ -469,6 +481,14 @@ class Pipe:
             ge=0,
             le=10000,
         )
+        QUIET_CHAT_MODE: bool = Field(
+            default=True,
+            description="Suppress intermediate research output in the chat transcript. Per-cycle status updates still fire, and the final report is returned as the assistant message.",
+        )
+        ENABLE_PROGRESS_EMBED: bool = Field(
+            default=True,
+            description="Emit a persisted HTML progress embed each cycle showing the topic checklist and token counters.",
+        )
 
     def __init__(self):
         self.type = "manifold"
@@ -555,6 +575,18 @@ class Pipe:
         self.update_state("irrelevant_topics", state.get("irrelevant_topics", set()))
         self.update_state("active_outline", all_topics.copy())
         self.update_state("cycle_summaries", state.get("cycle_summaries", []))
+
+        # Progress artifact state (reset per run so the embed starts fresh)
+        self.update_state("partial_topics", [])
+        self.update_state("latest_new_topics", [])
+        self.update_state("latest_completed_topics", [])
+        self.update_state("latest_irrelevant_topics", [])
+        self.update_state("all_topics", all_topics.copy())
+        self.update_state("progress_cycle", 0)
+        self.update_state("progress_embed_last_hash", "")
+        self.update_state("progress_embed_revision", 0)
+        self.update_state("progress_last_updated_at", "")
+        self.update_state("current_cycle_queries", [])
 
         # Results tracking
         results_history = state.get("results_history", [])
@@ -1754,9 +1786,11 @@ class Pipe:
         section_order = list(sections.keys())
         selected.sort(
             key=lambda r: (
-                section_order.index(r["section_title"])
-                if r["section_title"] in section_order
-                else 9999,
+                (
+                    section_order.index(r["section_title"])
+                    if r["section_title"] in section_order
+                    else 9999
+                ),
                 r["chunk_index"],
             )
         )
@@ -6146,7 +6180,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Get search results for the query
         search_results = await self.search_web(sanitized_query)
         if not search_results:
-            await self.emit_message(f"*No results found for query: {query}*\n\n")
+            if not self.valves.QUIET_CHAT_MODE:
+                await self.emit_message(f"*No results found for query: {query}*\n\n")
+            else:
+                await self.emit_quiet_status(
+                    "warning", f"No results found for query: {query}", False
+                )
             return []
 
         # Always select the most relevant results - this adds similarity scores
@@ -6176,9 +6215,16 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
             # Stop if we've had too many consecutive failures
             if failed_count >= self.valves.MAX_FAILED_RESULTS:
-                await self.emit_message(
-                    f"*Skipping remaining results for query: {query} after {failed_count} failures*\n\n"
-                )
+                if not self.valves.QUIET_CHAT_MODE:
+                    await self.emit_message(
+                        f"*Skipping remaining results for query: {query} after {failed_count} failures*\n\n"
+                    )
+                else:
+                    await self.emit_quiet_status(
+                        "warning",
+                        f"Skipping remaining results after {failed_count} failures",
+                        False,
+                    )
                 break
 
             try:
@@ -6290,45 +6336,46 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         )
 
                     # Display the result to the user with improved formatting
-                    if processed_result["url"]:
-                        # Show full URL in the result header
-                        url = processed_result["url"]
+                    if not self.valves.QUIET_CHAT_MODE:
+                        if processed_result["url"]:
+                            # Show full URL in the result header
+                            url = processed_result["url"]
 
-                        # Check if this is a PDF (either by extension or by content type detection)
-                        if (
-                            url.endswith(".pdf")
-                            or "application/pdf" in url
-                            or self.is_pdf_content
-                        ):
-                            prefix = "PDF: "
+                            # Check if this is a PDF (either by extension or by content type detection)
+                            if (
+                                url.endswith(".pdf")
+                                or "application/pdf" in url
+                                or self.is_pdf_content
+                            ):
+                                prefix = "PDF: "
+                            else:
+                                prefix = "Site: "
+
+                            result_text = (
+                                f"#### {prefix}{url}\n**Tokens:** {token_count}\n\n"
+                            )
                         else:
-                            prefix = "Site: "
+                            result_text = (
+                                f"#### {document_title} [{token_count} tokens]\n\n"
+                            )
 
-                        result_text = (
-                            f"#### {prefix}{url}\n**Tokens:** {token_count}\n\n"
+                        result_text += f"*Search query: {query}*\n\n"
+
+                        # Format content with short line merging
+                        content_to_display = processed_result["content"][
+                            : self.valves.MAX_RESULT_TOKENS
+                        ]
+                        formatted_content = await self.clean_text_formatting(
+                            content_to_display
                         )
-                    else:
-                        result_text = (
-                            f"#### {document_title} [{token_count} tokens]\n\n"
-                        )
+                        result_text += f"{formatted_content}...\n\n"
 
-                    result_text += f"*Search query: {query}*\n\n"
+                        # Add repeat indicator if this is a repeated URL
+                        repeat_count = processed_result.get("repeat_count", 0)
+                        if repeat_count > 1:
+                            result_text += f"*Note: This URL has been processed {repeat_count} times*\n\n"
 
-                    # Format content with short line merging
-                    content_to_display = processed_result["content"][
-                        : self.valves.MAX_RESULT_TOKENS
-                    ]
-                    formatted_content = await self.clean_text_formatting(
-                        content_to_display
-                    )
-                    result_text += f"{formatted_content}...\n\n"
-
-                    # Add repeat indicator if this is a repeated URL
-                    repeat_count = processed_result.get("repeat_count", 0)
-                    if repeat_count > 1:
-                        result_text += f"*Note: This URL has been processed {repeat_count} times*\n\n"
-
-                    await self.emit_message(result_text)
+                        await self.emit_message(result_text)
 
                     # Reset failed count on success
                     failed_count = 0
@@ -6343,9 +6390,16 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 # Count as a failure
                 failed_count += 1
                 logger.error(f"Error processing result for query '{query}': {e}")
-                await self.emit_message(
-                    f"*Error processing a result for query: {query}*\n\n"
-                )
+                if not self.valves.QUIET_CHAT_MODE:
+                    await self.emit_message(
+                        f"*Error processing a result for query: {query}*\n\n"
+                    )
+                else:
+                    await self.emit_quiet_status(
+                        "warning",
+                        f"Error processing a result for query: {query}",
+                        False,
+                    )
 
         # If we didn't get any successful results but had rejected ones, use the top rejected result
         if not successful_results and rejected_results:
@@ -6364,33 +6418,45 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 processed_result = top_rejected["processed_result"]
                 successful_results.append(processed_result)
 
-                # Display the result with a note that it might not be fully relevant
-                document_title = processed_result.get("title", f"Result for '{query}'")
-                token_count = processed_result.get(
-                    "tokens", 0
-                ) or await self.count_tokens(processed_result["content"])
-                url = processed_result.get("url", "")
+                if not self.valves.QUIET_CHAT_MODE:
+                    # Display the result with a note that it might not be fully relevant
+                    document_title = processed_result.get(
+                        "title", f"Result for '{query}'"
+                    )
+                    token_count = processed_result.get(
+                        "tokens", 0
+                    ) or await self.count_tokens(processed_result["content"])
+                    url = processed_result.get("url", "")
 
-                result_text = f"#### {document_title} [{token_count} tokens]\n\n"
-                if url:
-                    result_text = f"#### {'PDF: ' if url.endswith('.pdf') else 'Site: '}{url}\n**Tokens:** {token_count}\n\n"
+                    result_text = f"#### {document_title} [{token_count} tokens]\n\n"
+                    if url:
+                        result_text = f"#### {'PDF: ' if url.endswith('.pdf') else 'Site: '}{url}\n**Tokens:** {token_count}\n\n"
 
-                result_text += f"*Search query: {query}*\n\n"
-                result_text += "*Note: This result was initially filtered but is used as a fallback.*\n\n"
+                    result_text += f"*Search query: {query}*\n\n"
+                    result_text += "*Note: This result was initially filtered but is used as a fallback.*\n\n"
 
-                # Format content
-                content_to_display = processed_result["content"][
-                    : self.valves.MAX_RESULT_TOKENS
-                ]
-                formatted_content = await self.clean_text_formatting(content_to_display)
-                result_text += f"{formatted_content}...\n\n"
+                    # Format content
+                    content_to_display = processed_result["content"][
+                        : self.valves.MAX_RESULT_TOKENS
+                    ]
+                    formatted_content = await self.clean_text_formatting(
+                        content_to_display
+                    )
+                    result_text += f"{formatted_content}...\n\n"
 
-                await self.emit_message(result_text)
+                    await self.emit_message(result_text)
 
         # If we still didn't get any successful results, log this
         if not successful_results:
             logger.warning(f"No valid results obtained for query: {query}")
-            await self.emit_message(f"*No valid results found for query: {query}*\n\n")
+            if not self.valves.QUIET_CHAT_MODE:
+                await self.emit_message(
+                    f"*No valid results found for query: {query}*\n\n"
+                )
+            else:
+                await self.emit_quiet_status(
+                    "warning", f"No valid results found for query: {query}", False
+                )
 
         # Update token counts with new results
         await self.update_token_counts(successful_results)
@@ -6490,9 +6556,224 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             # Can't do much if this fails, but we don't want to crash
 
     async def emit_synthesis_status(self, message, is_done=False):
-        """Emit both a status update and a chat message for synthesis progress"""
+        """Emit a status update for synthesis progress (quiet: no chat text)."""
         await self.emit_status("info", message, is_done)
-        await self.emit_message(f"*{message}*\n")
+
+    async def emit_quiet_status(self, level: str, message: str, done: bool = False):
+        """Thin wrapper over emit_status for research progress updates."""
+        await self.emit_status(level, message, done)
+
+    def escape_html(self, value: Any) -> str:
+        """HTML-escape dynamic text for interpolation into the progress embed."""
+        return html.escape("" if value is None else str(value), quote=True)
+
+    async def emit_embed(self, html_content: str) -> None:
+        """Emit a persisted HTML embed event. Guarded by ENABLE_PROGRESS_EMBED."""
+        if not self.valves.ENABLE_PROGRESS_EMBED:
+            return
+        try:
+            await self.__current_event_emitter__(
+                {"type": "embeds", "data": {"embeds": [html_content]}}
+            )
+        except Exception as e:
+            logger.error(f"Error emitting embed: {e}")
+
+    def build_progress_snapshot(self, cycle: Optional[int] = None) -> Dict[str, Any]:
+        """Collect state into a normalized snapshot for the progress embed."""
+        state = self.get_state()
+        research_state = state.get("research_state") or {}
+        user_message = research_state.get("user_message", "")
+        max_cycles = getattr(self.valves, "MAX_CYCLES", 0)
+
+        memory_stats = state.get("memory_stats", {}) or {}
+        results_tokens = memory_stats.get("results_tokens", 0)
+        synthesis_tokens = memory_stats.get("synthesis_tokens", 0)
+        total_tokens = memory_stats.get("total_tokens", 0)
+
+        completed = state.get("completed_topics", set()) or set()
+        irrelevant = state.get("irrelevant_topics", set()) or set()
+        partial = state.get("partial_topics", []) or []
+        latest_new = state.get("latest_new_topics", []) or []
+        active_outline = state.get("active_outline", []) or []
+        all_topics = state.get("all_topics", []) or []
+
+        revision = state.get("progress_embed_revision", 0) + 1
+        current_cycle = cycle if cycle is not None else state.get("progress_cycle", 0)
+
+        return {
+            "query": user_message,
+            "cycle": current_cycle,
+            "max_cycles": max_cycles,
+            "completed_topics": list(completed),
+            "partial_topics": list(partial),
+            "new_topics": list(latest_new),
+            "irrelevant_topics": list(irrelevant),
+            "remaining_topics": list(active_outline),
+            "all_topics": list(all_topics),
+            "results_tokens": results_tokens,
+            "synthesis_tokens": synthesis_tokens,
+            "total_tokens": total_tokens,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "revision": revision,
+        }
+
+    def normalize_progress_categories(
+        self, snapshot: Dict[str, Any]
+    ) -> Dict[str, List[str]]:
+        """Apply precedence (irrelevant > completed > partial > remaining) and stable ordering."""
+        all_topics = list(snapshot.get("all_topics", []))
+        new_topics = [t for t in snapshot.get("new_topics", []) if t]
+
+        # Stable base order: original outline, then newly discovered topics in discovery order
+        base_order: List[str] = []
+        seen: Set[str] = set()
+        for t in all_topics + new_topics:
+            if t and t not in seen:
+                seen.add(t)
+                base_order.append(t)
+
+        irrelevant_set = {t for t in snapshot.get("irrelevant_topics", []) if t}
+        completed_set = {
+            t
+            for t in snapshot.get("completed_topics", [])
+            if t and t not in irrelevant_set
+        }
+        partial_set = {
+            t
+            for t in snapshot.get("partial_topics", [])
+            if t and t not in irrelevant_set and t not in completed_set
+        }
+        remaining_set = {
+            t
+            for t in snapshot.get("remaining_topics", [])
+            if t
+            and t not in irrelevant_set
+            and t not in completed_set
+            and t not in partial_set
+        }
+
+        def ordered(topics: Set[str]) -> List[str]:
+            known = [t for t in base_order if t in topics]
+            extras = [t for t in sorted(topics) if t not in set(known)]
+            return known + extras
+
+        return {
+            "completed": ordered(completed_set),
+            "partial": ordered(partial_set),
+            "new": [t for t in new_topics if t not in irrelevant_set],
+            "irrelevant": ordered(irrelevant_set),
+            "remaining": ordered(remaining_set),
+        }
+
+    def render_progress_embed_html(self, snapshot: Dict[str, Any]) -> str:
+        """Render a self-contained, sandbox-safe HTML panel for the progress artifact."""
+        categories = self.normalize_progress_categories(snapshot)
+        e = self.escape_html
+
+        query_text = snapshot.get("query", "") or ""
+        if len(query_text) > 240:
+            query_text = query_text[:237] + "..."
+
+        header = (
+            f'<div class="hdr">'
+            f'<div class="q"><span class="lbl">Query:</span> {e(query_text)}</div>'
+            f'<div class="meta">'
+            f"<span>Cycle {e(snapshot.get('cycle', 0))}/{e(snapshot.get('max_cycles', 0))}</span>"
+            f"<span>Revision {e(snapshot.get('revision', 0))}</span>"
+            f"<span>{e(snapshot.get('updated_at', ''))}</span>"
+            f"</div></div>"
+        )
+
+        tokens = (
+            f'<div class="tokens">'
+            f'<div><span class="lbl">Research Results</span><span class="num">{e(snapshot.get("results_tokens", 0))}</span></div>'
+            f'<div><span class="lbl">Synthesis</span><span class="num">{e(snapshot.get("synthesis_tokens", 0))}</span></div>'
+            f'<div><span class="lbl">Total</span><span class="num">{e(snapshot.get("total_tokens", 0))}</span></div>'
+            f"</div>"
+        )
+
+        def checklist(items: List[str], checked: bool) -> str:
+            if not items:
+                return '<div class="empty">—</div>'
+            attrs = " checked" if checked else ""
+            rows = [
+                f'<label class="row"><input type="checkbox" disabled{attrs}><span>{e(t)}</span></label>'
+                for t in items
+            ]
+            return "".join(rows)
+
+        def emoji_list(items: List[str], emoji: str) -> str:
+            if not items:
+                return '<div class="empty">—</div>'
+            rows = [
+                f'<div class="row"><span class="emo">{emoji}</span><span>{e(t)}</span></div>'
+                for t in items
+            ]
+            return "".join(rows)
+
+        sections = (
+            f'<section><h2><span class="emo">✅</span>Topics Completed <span class="count">({len(categories["completed"])})</span></h2>{checklist(categories["completed"], True)}</section>'
+            f'<section><h2><span class="emo">🟡</span>Topics Partially Addressed <span class="count">({len(categories["partial"])})</span></h2>{emoji_list(categories["partial"], "🟡")}</section>'
+            f'<section><h2><span class="emo">🟣</span>New Topics Discovered <span class="count">({len(categories["new"])})</span></h2>{emoji_list(categories["new"], "🟣")}</section>'
+            f'<section><h2><span class="emo">🔴</span>Irrelevant / Distraction Topics <span class="count">({len(categories["irrelevant"])})</span></h2>{emoji_list(categories["irrelevant"], "🔴")}</section>'
+            f'<section><h2><span class="emo">⚪</span>Remaining Topics <span class="count">({len(categories["remaining"])})</span></h2>{checklist(categories["remaining"], False)}</section>'
+        )
+
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 16px; color: #222; background: #fafafa; }}
+.panel {{ background: #fff; border: 1px solid #e3e3e3; border-radius: 12px; padding: 18px; }}
+.hdr {{ margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid #eee; }}
+.hdr .q {{ font-size: 0.95em; line-height: 1.4; margin-bottom: 6px; word-break: break-word; }}
+.hdr .q .lbl {{ color: #888; font-weight: 600; margin-right: 6px; }}
+.hdr .meta {{ display: flex; gap: 14px; flex-wrap: wrap; font-size: 0.8em; color: #777; }}
+.tokens {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }}
+.tokens > div {{ flex: 1; min-width: 140px; background: #f5f7fa; border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }}
+.tokens .lbl {{ font-size: 0.75em; color: #777; text-transform: uppercase; letter-spacing: 0.03em; }}
+.tokens .num {{ font-size: 1.2em; font-weight: 600; color: #222; }}
+section {{ margin-top: 14px; }}
+section h2 {{ font-size: 0.95em; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }}
+section h2 .count {{ color: #888; font-weight: 400; font-size: 0.85em; }}
+.row {{ display: flex; align-items: flex-start; gap: 8px; padding: 4px 0; font-size: 0.9em; line-height: 1.35; }}
+.row input[type=checkbox] {{ margin-top: 3px; }}
+.emo {{ display: inline-block; min-width: 1.2em; }}
+.empty {{ color: #bbb; font-size: 0.85em; padding: 4px 0; }}
+@media (prefers-color-scheme: dark) {{
+  body {{ background: #1f2023; color: #e6e6e6; }}
+  .panel {{ background: #2a2c30; border-color: #3a3d42; }}
+  .hdr {{ border-bottom-color: #3a3d42; }}
+  .hdr .q .lbl, .hdr .meta, section h2 .count, .tokens .lbl {{ color: #9aa0a6; }}
+  .tokens > div {{ background: #35383d; }}
+  .tokens .num {{ color: #f0f0f0; }}
+}}
+</style></head><body><div class="panel">{header}{tokens}{sections}</div>
+<script>
+function reportHeight() {{
+    const h = document.documentElement.scrollHeight;
+    parent.postMessage({{ type: 'iframe:height', height: h }}, '*');
+}}
+window.addEventListener('load', reportHeight);
+new ResizeObserver(reportHeight).observe(document.body);
+</script>
+</body></html>"""
+
+    async def refresh_progress_embed(
+        self, cycle: Optional[int] = None, force: bool = False
+    ) -> None:
+        """Build the latest progress snapshot and emit an embed if it changed."""
+        if not self.valves.ENABLE_PROGRESS_EMBED:
+            return
+        snapshot = self.build_progress_snapshot(cycle=cycle)
+        html_content = self.render_progress_embed_html(snapshot)
+        digest = hashlib.sha256(html_content.encode("utf-8")).hexdigest()
+        state = self.get_state()
+        if not force and state.get("progress_embed_last_hash") == digest:
+            return
+        self.update_state("progress_embed_last_hash", digest)
+        self.update_state("progress_embed_revision", snapshot.get("revision", 0))
+        self.update_state("progress_last_updated_at", snapshot.get("updated_at", ""))
+        await self.emit_embed(html_content)
 
     async def rank_topics_by_research_priority(
         self,
@@ -7515,9 +7796,16 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     query_embedding = await self.get_embedding(group_query)
 
                     # Execute search for this group
-                    await self.emit_message(
-                        f"**Researching topics:** {', '.join(group)}\n**Query:** {group_query}\n\n"
-                    )
+                    if not self.valves.QUIET_CHAT_MODE:
+                        await self.emit_message(
+                            f"**Researching topics:** {', '.join(group)}\n**Query:** {group_query}\n\n"
+                        )
+                    else:
+                        await self.emit_quiet_status(
+                            "info",
+                            f"Researching: {', '.join(group)}",
+                            False,
+                        )
                     results = await self.process_query(
                         group_query, query_embedding, outline_embedding
                     )
@@ -10301,21 +10589,27 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
             if response and "choices" in response and len(response["choices"]) > 0:
                 abstract = response["choices"][0]["message"]["content"]
-                await self.emit_message("*Abstract generation complete.*\n")
+                if not self.valves.QUIET_CHAT_MODE:
+                    await self.emit_message("*Abstract generation complete.*\n")
                 return abstract
             else:
-                await self.emit_message("*Abstract generation fallback used.*\n")
+                if not self.valves.QUIET_CHAT_MODE:
+                    await self.emit_message("*Abstract generation fallback used.*\n")
                 return f"This research report addresses the query: '{user_message}'. It synthesizes information from {len(bibliography)} sources to provide a comprehensive analysis of the topic, examining key aspects and presenting relevant findings."
 
         except asyncio.TimeoutError:
             logger.error("Abstract generation timed out after 5 minutes")
-            await self.emit_message(
-                "*Abstract generation timed out, using fallback.*\n"
-            )
+            if not self.valves.QUIET_CHAT_MODE:
+                await self.emit_message(
+                    "*Abstract generation timed out, using fallback.*\n"
+                )
             return f"This research report addresses the query: '{user_message}'. It synthesizes information from {len(bibliography)} sources to provide a comprehensive analysis of the topic, examining key aspects and presenting relevant findings."
         except Exception as e:
             logger.error(f"Error generating abstract: {e}")
-            await self.emit_message("*Abstract generation error, using fallback.*\n")
+            if not self.valves.QUIET_CHAT_MODE:
+                await self.emit_message(
+                    "*Abstract generation error, using fallback.*\n"
+                )
             return f"This research report addresses the query: '{user_message}'. It synthesizes information from {len(bibliography)} sources to provide a comprehensive analysis of the topic, examining key aspects and presenting relevant findings."
 
     async def pipe(
@@ -10468,28 +10762,39 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     summary_embedding = await self.get_embedding(
                         prev_comprehensive_summary
                     )
-                    await self.emit_message("## Deep Research Mode: Follow-up\n\n")
-                    await self.emit_message(
-                        "I'll continue researching based on your follow-up query while considering our previous findings.\n\n"
-                    )
+                    if not self.valves.QUIET_CHAT_MODE:
+                        await self.emit_message("## Deep Research Mode: Follow-up\n\n")
+                        await self.emit_message(
+                            "I'll continue researching based on your follow-up query while considering our previous findings.\n\n"
+                        )
+                    else:
+                        await self.emit_status(
+                            "info", "Deep research mode: follow-up", False
+                        )
                 except Exception as e:
                     logger.error(f"Error getting summary embedding: {e}")
                     # Continue without the summary embedding if there's an error
                     is_follow_up = False
                     self.update_state("follow_up_mode", False)
-                    await self.emit_message("## Deep Research Mode: Activated\n\n")
-                    await self.emit_message(
-                        "I'll search for comprehensive information about your query. This might take a moment...\n\n"
-                    )
+                    if not self.valves.QUIET_CHAT_MODE:
+                        await self.emit_message("## Deep Research Mode: Activated\n\n")
+                        await self.emit_message(
+                            "I'll search for comprehensive information about your query. This might take a moment...\n\n"
+                        )
+                    else:
+                        await self.emit_status(
+                            "info", "Deep research mode activated", False
+                        )
             else:
                 is_follow_up = False
                 self.update_state("follow_up_mode", False)
         else:
             await self.emit_status("info", "Starting deep research...", False)
-            await self.emit_message("## Deep Research Mode: Activated\n\n")
-            await self.emit_message(
-                "I'll search for comprehensive information about your query. This might take a moment...\n\n"
-            )
+            if not self.valves.QUIET_CHAT_MODE:
+                await self.emit_message("## Deep Research Mode: Activated\n\n")
+                await self.emit_message(
+                    "I'll search for comprehensive information about your query. This might take a moment...\n\n"
+                )
 
         # Check if we have research state from previous feedback
         research_state = state.get("research_state")
@@ -10566,9 +10871,18 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         initial_queries = ["Information about " + user_message]
 
                 # Display the queries to the user
-                await self.emit_message("### Initial Follow-up Research Queries\n\n")
-                for i, query in enumerate(initial_queries):
-                    await self.emit_message(f"**Query {i + 1}**: {query}\n\n")
+                if not self.valves.QUIET_CHAT_MODE:
+                    await self.emit_message(
+                        "### Initial Follow-up Research Queries\n\n"
+                    )
+                    for i, query in enumerate(initial_queries):
+                        await self.emit_message(f"**Query {i + 1}**: {query}\n\n")
+                else:
+                    await self.emit_quiet_status(
+                        "info",
+                        f"Generated {len(initial_queries)} initial follow-up queries",
+                        False,
+                    )
 
                 # Execute initial searches with the follow-up queries
                 # Use summary embedding for context relevance
@@ -10713,17 +11027,18 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 await self.initialize_research_dimensions(all_topics, user_message)
 
                 # Display the outline to the user
-                outline_text = "### Research Outline for Follow-up\n\n"
-                for topic in research_outline:
-                    outline_text += f"**{topic['topic']}**\n"
-                    for subtopic in topic.get("subtopics", []):
-                        outline_text += f"- {subtopic}\n"
-                    outline_text += "\n"
+                if not self.valves.QUIET_CHAT_MODE:
+                    outline_text = "### Research Outline for Follow-up\n\n"
+                    for topic in research_outline:
+                        outline_text += f"**{topic['topic']}**\n"
+                        for subtopic in topic.get("subtopics", []):
+                            outline_text += f"- {subtopic}\n"
+                        outline_text += "\n"
 
-                await self.emit_message(outline_text)
-                await self.emit_message(
-                    "\n*Continuing with research based on this outline and previous findings...*\n\n"
-                )
+                    await self.emit_message(outline_text)
+                    await self.emit_message(
+                        "\n*Continuing with research based on this outline and previous findings...*\n\n"
+                    )
 
             else:
                 # Regular new query - generate initial search queries
@@ -10781,9 +11096,16 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         initial_queries = ["Information about " + user_message]
 
                 # Display the queries to the user
-                await self.emit_message("### Initial Research Queries\n\n")
-                for i, query in enumerate(initial_queries):
-                    await self.emit_message(f"**Query {i + 1}**: {query}\n\n")
+                if not self.valves.QUIET_CHAT_MODE:
+                    await self.emit_message("### Initial Research Queries\n\n")
+                    for i, query in enumerate(initial_queries):
+                        await self.emit_message(f"**Query {i + 1}**: {query}\n\n")
+                else:
+                    await self.emit_quiet_status(
+                        "info",
+                        f"Generated {len(initial_queries)} initial queries",
+                        False,
+                    )
 
                 # Step 2: Execute initial searches and collect results
                 # Get outline embedding (placeholder - will be updated after outline is created)
@@ -10955,15 +11277,15 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         return ""
                 else:
                     # Regular display of outline if interactive research is disabled
-                    # Display the outline to the user
-                    outline_text = "### Research Outline\n\n"
-                    for topic in research_outline:
-                        outline_text += f"**{topic['topic']}**\n"
-                        for subtopic in topic.get("subtopics", []):
-                            outline_text += f"- {subtopic}\n"
-                        outline_text += "\n"
+                    if not self.valves.QUIET_CHAT_MODE:
+                        outline_text = "### Research Outline\n\n"
+                        for topic in research_outline:
+                            outline_text += f"**{topic['topic']}**\n"
+                            for subtopic in topic.get("subtopics", []):
+                                outline_text += f"- {subtopic}\n"
+                            outline_text += "\n"
 
-                    await self.emit_message(outline_text)
+                        await self.emit_message(outline_text)
 
                     # Initialize research state consistently
                     await self.initialize_research_state(
@@ -10977,10 +11299,14 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     # Update token counts
                     await self.update_token_counts(initial_results)
 
-                    # Display message about continuing
-                    await self.emit_message(
-                        "\n*Continuing with research outline...*\n\n"
-                    )
+                    # Emit initial progress embed now that outline state is ready
+                    await self.refresh_progress_embed(force=True)
+
+                    if not self.valves.QUIET_CHAT_MODE:
+                        # Display message about continuing
+                        await self.emit_message(
+                            "\n*Continuing with research outline...*\n\n"
+                        )
 
         # Update status to show we've moved beyond outline generation
         await self.emit_status(
@@ -11103,6 +11429,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
             # Extract query strings and topics
             current_cycle_queries = query_objects
+            self.update_state("current_cycle_queries", current_cycle_queries)
+            self.update_state("progress_cycle", cycle)
 
             # Track topics used for queries to apply dampening in future cycles
             used_topics = [
@@ -11113,12 +11441,21 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             await self.update_topic_usage_counts(used_topics)
 
             # Display the queries to the user
-            await self.emit_message(f"### Research Cycle {cycle}: Search Queries\n\n")
-            for i, query_obj in enumerate(current_cycle_queries):
-                query = query_obj.get("query", "")
-                topic = query_obj.get("topic", "")
+            if not self.valves.QUIET_CHAT_MODE:
                 await self.emit_message(
-                    f"**Query {i + 1}**: {query}\n**Topic**: {topic}\n\n"
+                    f"### Research Cycle {cycle}: Search Queries\n\n"
+                )
+                for i, query_obj in enumerate(current_cycle_queries):
+                    query = query_obj.get("query", "")
+                    topic = query_obj.get("topic", "")
+                    await self.emit_message(
+                        f"**Query {i + 1}**: {query}\n**Topic**: {topic}\n\n"
+                    )
+            else:
+                await self.emit_quiet_status(
+                    "info",
+                    f"Cycle {cycle}/{max_cycles}: generated {len(current_cycle_queries)} queries",
+                    False,
                 )
 
             # Extract query strings for search history
@@ -11308,47 +11645,19 @@ Format your response as a valid JSON object with the following structure:
                     )
                     self.update_state("cycle_summaries", cycle_summaries)
 
-                    # Display analysis to the user
-                    analysis_text = f"### Research Analysis (Cycle {cycle})\n\n"
-                    analysis_text += f"{analysis_data.get('analysis', 'Analysis not available.')}\n\n"
-
-                    if newly_completed:
-                        analysis_text += "**Topics Completed:**\n"
-                        for topic in newly_completed:
-                            analysis_text += f"✓ {topic}\n"
-                        analysis_text += "\n"
-
-                    if analysis_data.get("partial_topics"):
-                        partial_topics = analysis_data.get("partial_topics")
-                        analysis_text += "**Topics Partially Addressed:**\n"
-                        # Show only first 5 partial topics
-                        for topic in partial_topics[:5]:
-                            analysis_text += f"⚪ {topic}\n"
-                        # Add count of additional topics if there are more than 5
-                        if len(partial_topics) > 5:
-                            analysis_text += f"...and {len(partial_topics) - 5} more\n"
-                        analysis_text += "\n"
-
-                    # Add display for irrelevant topics
-                    if newly_irrelevant:
-                        analysis_text += "**Irrelevant/Distraction Topics:**\n"
-                        for topic in newly_irrelevant:
-                            analysis_text += f"✗ {topic}\n"
-                        analysis_text += "\n"
-
-                    if new_topics:
-                        analysis_text += "**New Topics Discovered:**\n"
-                        for topic in new_topics:
-                            analysis_text += f"+ {topic}\n"
-                        analysis_text += "\n"
-
-                    if active_outline:
-                        analysis_text += "**Remaining Topics:**\n"
-                        for topic in active_outline[:5]:  # Show just the first 5
-                            analysis_text += f"□ {topic}\n"
-                        if len(active_outline) > 5:
-                            analysis_text += f"...and {len(active_outline) - 5} more\n"
-                        analysis_text += "\n"
+                    # Persist per-cycle progress snapshot state
+                    partial_topics = analysis_data.get("partial_topics", []) or []
+                    self.update_state("partial_topics", list(partial_topics))
+                    self.update_state("latest_new_topics", list(new_topics))
+                    self.update_state("latest_completed_topics", list(newly_completed))
+                    self.update_state(
+                        "latest_irrelevant_topics", list(newly_irrelevant)
+                    )
+                    self.update_state("progress_cycle", cycle)
+                    self.update_state(
+                        "progress_last_updated_at",
+                        datetime.now().isoformat(timespec="seconds"),
+                    )
 
                     # Store dimension coverage in state but don't display it during cycles
                     research_dimensions = state.get("research_dimensions")
@@ -11365,7 +11674,55 @@ Format your response as a valid JSON object with the following structure:
                         except Exception as e:
                             logger.error(f"Error storing dimension coverage: {e}")
 
-                    await self.emit_message(analysis_text)
+                    if not self.valves.QUIET_CHAT_MODE:
+                        # Display analysis to the user
+                        analysis_text = f"### Research Analysis (Cycle {cycle})\n\n"
+                        analysis_text += f"{analysis_data.get('analysis', 'Analysis not available.')}\n\n"
+
+                        if newly_completed:
+                            analysis_text += "**Topics Completed:**\n"
+                            for topic in newly_completed:
+                                analysis_text += f"✓ {topic}\n"
+                            analysis_text += "\n"
+
+                        if partial_topics:
+                            analysis_text += "**Topics Partially Addressed:**\n"
+                            # Show only first 5 partial topics
+                            for topic in partial_topics[:5]:
+                                analysis_text += f"⚪ {topic}\n"
+                            # Add count of additional topics if there are more than 5
+                            if len(partial_topics) > 5:
+                                analysis_text += (
+                                    f"...and {len(partial_topics) - 5} more\n"
+                                )
+                            analysis_text += "\n"
+
+                        if newly_irrelevant:
+                            analysis_text += "**Irrelevant/Distraction Topics:**\n"
+                            for topic in newly_irrelevant:
+                                analysis_text += f"✗ {topic}\n"
+                            analysis_text += "\n"
+
+                        if new_topics:
+                            analysis_text += "**New Topics Discovered:**\n"
+                            for topic in new_topics:
+                                analysis_text += f"+ {topic}\n"
+                            analysis_text += "\n"
+
+                        if active_outline:
+                            analysis_text += "**Remaining Topics:**\n"
+                            for topic in active_outline[:5]:  # Show just the first 5
+                                analysis_text += f"□ {topic}\n"
+                            if len(active_outline) > 5:
+                                analysis_text += (
+                                    f"...and {len(active_outline) - 5} more\n"
+                                )
+                            analysis_text += "\n"
+
+                        await self.emit_message(analysis_text)
+
+                    # Refresh the persisted progress embed with the latest cycle data
+                    await self.refresh_progress_embed(cycle=cycle, force=True)
 
                     # Update dimension coverage for each result to improve tracking
                     for result in cycle_results:
@@ -11379,10 +11736,18 @@ Format your response as a valid JSON object with the following structure:
 
                 except Exception as e:
                     logger.error(f"Error analyzing results: {e}")
-                    await self.emit_message(
-                        f"### Research Progress (Cycle {cycle})\n\nContinuing research on remaining topics...\n\n"
-                    )
+                    if not self.valves.QUIET_CHAT_MODE:
+                        await self.emit_message(
+                            f"### Research Progress (Cycle {cycle})\n\nContinuing research on remaining topics...\n\n"
+                        )
+                    else:
+                        await self.emit_quiet_status(
+                            "warning",
+                            f"Cycle {cycle}: continuing after analysis fallback",
+                            False,
+                        )
                     # Mark one topic as completed to ensure progress
+                    completed_topic = None
                     if active_outline:
                         # Find the most covered topic based on similarities to gathered results
                         topic_scores = {}
@@ -11433,12 +11798,28 @@ Format your response as a valid JSON object with the following structure:
                         active_outline.remove(completed_topic)
                         self.update_state("active_outline", active_outline)
 
-                        await self.emit_message(
-                            f"**Topic Addressed:** {completed_topic}\n\n"
-                        )
+                        if not self.valves.QUIET_CHAT_MODE:
+                            await self.emit_message(
+                                f"**Topic Addressed:** {completed_topic}\n\n"
+                            )
                         # Add minimal analysis to cycle summaries
                         cycle_summaries.append(f"Completed topic: {completed_topic}")
                         self.update_state("cycle_summaries", cycle_summaries)
+
+                    # Persist minimal per-cycle progress snapshot state for fallback path
+                    self.update_state("partial_topics", [])
+                    self.update_state("latest_new_topics", [])
+                    self.update_state(
+                        "latest_completed_topics",
+                        [completed_topic] if completed_topic else [],
+                    )
+                    self.update_state("latest_irrelevant_topics", [])
+                    self.update_state("progress_cycle", cycle)
+                    self.update_state(
+                        "progress_last_updated_at",
+                        datetime.now().isoformat(timespec="seconds"),
+                    )
+                    await self.refresh_progress_embed(cycle=cycle, force=True)
 
             # Check termination criteria
             if not active_outline or active_outline == []:
@@ -11526,61 +11907,67 @@ Format your response as a valid JSON object with the following structure:
         await self.emit_synthesis_status(
             "Synthesizing comprehensive answer from research results..."
         )
-        await self.emit_message("\n\n---\n\n### Research Complete\n\n")
 
         # Make sure dimensions data is up-to-date
         await self.update_research_dimensions_display()
 
-        # Display the final research outline first
-        await self.emit_message("### Final Research Outline\n\n")
-        for topic_item in synthesis_outline:
-            topic = topic_item["topic"]
-            subtopics = topic_item.get("subtopics", [])
+        if not self.valves.QUIET_CHAT_MODE:
+            await self.emit_message("\n\n---\n\n### Research Complete\n\n")
 
-            await self.emit_message(f"**{topic}**\n")
-            for subtopic in subtopics:
-                await self.emit_message(f"- {subtopic}\n")
-            await self.emit_message("\n")
+            # Display the final research outline first
+            await self.emit_message("### Final Research Outline\n\n")
+            for topic_item in synthesis_outline:
+                topic = topic_item["topic"]
+                subtopics = topic_item.get("subtopics", [])
 
-        # Display research dimensions after the outline
-        await self.emit_status(
-            "info", "Displaying research dimensions coverage...", False
-        )
-        await self.emit_message("### Research Dimensions (Ordered)\n\n")
-
-        research_dimensions = state.get("research_dimensions")
-        latest_coverage = state.get("latest_dimension_coverage")
-
-        if latest_coverage and research_dimensions:
-            try:
-                # Translate dimensions to words
-                dimension_labels = await self.translate_dimensions_to_words(
-                    research_dimensions, latest_coverage
-                )
-
-                # Sort dimensions by coverage (highest to lowest)
-                sorted_dimensions = sorted(
-                    dimension_labels,
-                    key=lambda x: x.get("coverage", 0) if isinstance(x, dict) else 0,
-                    reverse=True,
-                )
-
-                # Display dimensions without coverage percentages
-                for dim in sorted_dimensions[:10]:  # Limit to top 10
-                    dim_text = (
-                        dim.get("words", "Dimension")
-                        if isinstance(dim, dict)
-                        else str(dim)
-                    )
-                    await self.emit_message(f"- {dim_text}\n")
-
+                await self.emit_message(f"**{topic}**\n")
+                for subtopic in subtopics:
+                    await self.emit_message(f"- {subtopic}\n")
                 await self.emit_message("\n")
-            except Exception as e:
-                logger.error(f"Error displaying final dimension coverage: {e}")
-                await self.emit_message("*Error displaying research dimensions*\n\n")
-        else:
-            logger.warning("No research dimensions data available for display")
-            await self.emit_message("*No research dimension data available*\n\n")
+
+            # Display research dimensions after the outline
+            await self.emit_status(
+                "info", "Displaying research dimensions coverage...", False
+            )
+            await self.emit_message("### Research Dimensions (Ordered)\n\n")
+
+            research_dimensions = state.get("research_dimensions")
+            latest_coverage = state.get("latest_dimension_coverage")
+
+            if latest_coverage and research_dimensions:
+                try:
+                    # Translate dimensions to words
+                    dimension_labels = await self.translate_dimensions_to_words(
+                        research_dimensions, latest_coverage
+                    )
+
+                    # Sort dimensions by coverage (highest to lowest)
+                    sorted_dimensions = sorted(
+                        dimension_labels,
+                        key=lambda x: (
+                            x.get("coverage", 0) if isinstance(x, dict) else 0
+                        ),
+                        reverse=True,
+                    )
+
+                    # Display dimensions without coverage percentages
+                    for dim in sorted_dimensions[:10]:  # Limit to top 10
+                        dim_text = (
+                            dim.get("words", "Dimension")
+                            if isinstance(dim, dict)
+                            else str(dim)
+                        )
+                        await self.emit_message(f"- {dim_text}\n")
+
+                    await self.emit_message("\n")
+                except Exception as e:
+                    logger.error(f"Error displaying final dimension coverage: {e}")
+                    await self.emit_message(
+                        "*Error displaying research dimensions*\n\n"
+                    )
+            else:
+                logger.warning("No research dimensions data available for display")
+                await self.emit_message("*No research dimension data available*\n\n")
 
         # Determine which model to use for synthesis
         synthesis_model = self.get_synthesis_model()
@@ -11956,20 +12343,24 @@ Format your response as a valid JSON object with the following structure:
         await self.emit_synthesis_status("Final synthesis complete!", True)
 
         # Output the complete integrated synthesis
-        await self.emit_message("\n\n## Comprehensive Answer\n\n")
-        await self.emit_message(comprehensive_answer)
+        if not self.valves.QUIET_CHAT_MODE:
+            await self.emit_message("\n\n## Comprehensive Answer\n\n")
+            await self.emit_message(comprehensive_answer)
 
-        # Add token usage statistics
-        token_stats = (
-            f"\n\n---\n\n**Token Usage Statistics**\n\n"
-            f"- Research Results: {results_tokens} tokens\n"
-            f"- Final Synthesis: {synthesis_tokens} tokens\n"
-            f"- Total: {total_tokens} tokens\n"
-        )
-        await self.emit_message(token_stats)
+            # Add token usage statistics
+            token_stats = (
+                f"\n\n---\n\n**Token Usage Statistics**\n\n"
+                f"- Research Results: {results_tokens} tokens\n"
+                f"- Final Synthesis: {synthesis_tokens} tokens\n"
+                f"- Total: {total_tokens} tokens\n"
+            )
+            await self.emit_message(token_stats)
 
         # Store the comprehensive answer for potential follow-up queries
         self.update_state("prev_comprehensive_summary", comprehensive_answer)
+
+        # Refresh the progress embed with final token totals
+        await self.refresh_progress_embed(force=True)
 
         # Share embedding cache stats
         cache_stats = self.embedding_cache.stats()
@@ -11985,23 +12376,40 @@ Format your response as a valid JSON object with the following structure:
                 txt_filepath = export_result.get("txt_filepath", "")
                 # json_filepath = export_result.get("json_filepath", "")
 
-                export_message = (
-                    f"\n\n---\n\n**Research Data Exported**\n\n"
-                    f"Research data has been exported to:\n"
-                    f"- Text file: `{txt_filepath}`\n\n"
-                    f"This file contain all research results, queries, timestamps, and content for future reference."
-                )
-
-                await self.emit_message(export_message)
+                if not self.valves.QUIET_CHAT_MODE:
+                    export_message = (
+                        f"\n\n---\n\n**Research Data Exported**\n\n"
+                        f"Research data has been exported to:\n"
+                        f"- Text file: `{txt_filepath}`\n\n"
+                        f"This file contain all research results, queries, timestamps, and content for future reference."
+                    )
+                    await self.emit_message(export_message)
+                else:
+                    await self.emit_quiet_status(
+                        "info", f"Research data exported to: {txt_filepath}", False
+                    )
 
             except Exception as e:
                 logger.error(f"Error exporting research data: {e}")
-                await self.emit_message(
-                    "*There was an error exporting the research data.*\n"
-                )
+                if not self.valves.QUIET_CHAT_MODE:
+                    await self.emit_message(
+                        "*There was an error exporting the research data.*\n"
+                    )
+                else:
+                    await self.emit_quiet_status(
+                        "warning",
+                        "There was an error exporting the research data.",
+                        False,
+                    )
 
         # Complete the process
         await self.emit_status("success", "Deep research complete!", True)
+
+        # Return the final research report as the assistant message content.
+        # Open WebUI pipes should return content rather than rely on "message"
+        # events, which the frontend may overwrite on final save.
+        if self.valves.QUIET_CHAT_MODE:
+            return comprehensive_answer
         return ""
 
 
