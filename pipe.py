@@ -504,6 +504,7 @@ class Pipe:
         # Use state manager to isolate conversation states
         self.state_manager = ResearchStateManager()
         self.conversation_id = None  # Will be set during pipe method
+        self.chat_id: Optional[str] = None  # OWUI chat record id (for persistence)
 
         # Shared resources (not conversation-specific)
         self.embedding_cache = EmbeddingCache(max_size=10000000)
@@ -683,6 +684,794 @@ class Pipe:
             self.trajectory_accumulator = None
             self.is_pdf_content = False
             logger.info(f"Full state reset for conversation: {self.conversation_id}")
+
+    # ------------------------------------------------------------------
+    # Knowledge-backed Deep Research: persistence + KB write-through
+    # ------------------------------------------------------------------
+
+    DR_STATE_VERSION = 2
+
+    def _new_dr_state(self, *, user_request: str = "") -> Dict[str, Any]:
+        """Build a fresh deepResearch checkpoint object."""
+        now_iso = datetime.now().isoformat()
+        return {
+            "version": self.DR_STATE_VERSION,
+            "mode": "research",
+            "status": "discovering",
+            "kb_id": None,
+            "kb_name": None,
+            "created_at": now_iso,
+            "last_checkpoint_at": now_iso,
+            "conversation_title_snapshot": "",
+            "source_manifest": {},
+            "report_file_id": None,
+            "report_completed": False,
+            "section_plan": [],
+            "completed_sections": [],
+            "pending_sections": [],
+            "resume_cursor": {
+                "phase": "init",
+                "current_section": "",
+                "current_url": "",
+            },
+            "token_usage": {
+                "research_model": {"prompt": 0, "completion": 0, "total": 0},
+                "report_writer": {"prompt": 0, "completion": 0, "total": 0},
+                "synthesis_time_kb_qa": {"prompt": 0, "completion": 0, "total": 0},
+                "grand_total": {"prompt": 0, "completion": 0, "total": 0},
+            },
+            "user_request_summary": user_request[:1000] if user_request else "",
+            "followup_constraints_summary": "",
+        }
+
+    def _get_dr_state(self) -> Optional[Dict[str, Any]]:
+        return self.get_state().get("dr_state")
+
+    def _set_dr_state(self, dr_state: Dict[str, Any]) -> None:
+        dr_state["last_checkpoint_at"] = datetime.now().isoformat()
+        self.update_state("dr_state", dr_state)
+
+    @staticmethod
+    def _resolve_chat_id(body: Dict[str, Any]) -> Optional[str]:
+        """Pull the OWUI chat_id from body or its metadata."""
+        md = body.get("metadata") or {}
+        return md.get("chat_id") or body.get("chat_id")
+
+    async def _load_persisted_dr_state(
+        self, chat_id: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Read deepResearch checkpoint from the chat record."""
+        if not chat_id:
+            return None
+        try:
+            from open_webui.models.chats import Chats
+
+            chat = await Chats.get_chat_by_id_and_user_id(chat_id, self.__user__.id)
+            if not chat or not chat.chat:
+                return None
+            dr = chat.chat.get("deepResearch")
+            return dr if isinstance(dr, dict) else None
+        except Exception as e:
+            logger.warning(
+                f"Failed to load deepResearch checkpoint for chat {chat_id}: {e}"
+            )
+            return None
+
+    async def _save_persisted_dr_state(
+        self, chat_id: Optional[str], dr_state: Dict[str, Any]
+    ) -> None:
+        """Read-merge-write the deepResearch checkpoint into chat JSON.
+
+        Open WebUI's update_chat_by_id REPLACES the entire chat dict, so we
+        fetch the current chat, merge our branch in, and write it back.
+        """
+        if not chat_id:
+            return
+        try:
+            from open_webui.models.chats import Chats
+
+            chat = await Chats.get_chat_by_id_and_user_id(chat_id, self.__user__.id)
+            if not chat:
+                return
+            merged = dict(chat.chat or {})
+            dr_state["last_checkpoint_at"] = datetime.now().isoformat()
+            merged["deepResearch"] = dr_state
+            await Chats.update_chat_by_id(chat_id, merged)
+        except Exception as e:
+            logger.warning(
+                f"Failed to persist deepResearch checkpoint for chat {chat_id}: {e}"
+            )
+
+    async def _checkpoint(self) -> None:
+        """Persist the current in-memory dr_state to the chat record."""
+        dr = self._get_dr_state()
+        if not dr:
+            return
+        await self._save_persisted_dr_state(getattr(self, "chat_id", None), dr)
+
+    async def _attach_collection_to_chat(
+        self, chat_id: Optional[str], kb_id: str, kb_name: str
+    ) -> None:
+        """Append the research KB as a collection entry on the chat's files list.
+
+        This makes future user messages re-send the collection automatically,
+        so OWUI middleware retrieves from it before the pipe even runs.
+        """
+        if not chat_id or not kb_id:
+            return
+        try:
+            from open_webui.models.chats import Chats
+
+            chat = await Chats.get_chat_by_id_and_user_id(chat_id, self.__user__.id)
+            if not chat:
+                return
+            merged = dict(chat.chat or {})
+            files = list(merged.get("files") or [])
+            already = any(
+                isinstance(f, dict)
+                and f.get("type") == "collection"
+                and f.get("id") == kb_id
+                for f in files
+            )
+            if not already:
+                files.append(
+                    {
+                        "type": "collection",
+                        "id": kb_id,
+                        "name": kb_name,
+                        "status": "processed",
+                    }
+                )
+            merged["files"] = files
+            await Chats.update_chat_by_id(chat_id, merged)
+        except Exception as e:
+            logger.warning(
+                f"Failed to attach collection {kb_id} to chat {chat_id}: {e}"
+            )
+
+    @staticmethod
+    def _slugify_research_title(title: str) -> str:
+        """Collapse a user title to lowercase alphanumeric for KB naming."""
+        if not title:
+            return "research"
+        s = re.sub(r"[^a-z0-9]+", "", title.lower())
+        return s[:48] or "research"
+
+    @classmethod
+    def _build_kb_name(cls, title: str, now_dt: datetime) -> str:
+        timestamp = now_dt.strftime("%Y%m%d%H%M%S")
+        slug = cls._slugify_research_title(title or "")
+        return f"dr-{timestamp}-{slug}"
+
+    async def _ensure_research_kb(self, title_hint: str) -> Optional[tuple[str, str]]:
+        """Create (or return existing) private research KB. Returns (id, name)."""
+        dr = self._get_dr_state()
+        if dr and dr.get("kb_id") and dr.get("kb_name"):
+            return dr["kb_id"], dr["kb_name"]
+        try:
+            from open_webui.models.knowledge import KnowledgeForm, Knowledges
+        except Exception as e:
+            logger.error(f"Open WebUI knowledge module unavailable: {e}")
+            return None
+        try:
+            now = datetime.now()
+            kb_name = self._build_kb_name(title_hint, now)
+            description = (
+                f"Deep Research run for: {(title_hint or '')[:200]}"
+                if title_hint
+                else "Deep Research run"
+            )
+            form = KnowledgeForm(name=kb_name, description=description)
+            knowledge = await Knowledges.insert_new_knowledge(self.__user__.id, form)
+            if knowledge is None:
+                # Retry once with a numeric suffix if name collided
+                kb_name_alt = f"{kb_name}-{int(time.time()) % 10000:04d}"
+                form = KnowledgeForm(name=kb_name_alt, description=description)
+                knowledge = await Knowledges.insert_new_knowledge(
+                    self.__user__.id, form
+                )
+                if knowledge is None:
+                    logger.warning(f"Failed to create research KB '{kb_name}'")
+                    return None
+                kb_name = kb_name_alt
+            kb_id = knowledge.id
+            if dr is None:
+                dr = self._new_dr_state()
+            dr["kb_id"] = kb_id
+            dr["kb_name"] = kb_name
+            dr["status"] = "discovering"
+            self._set_dr_state(dr)
+            await self._checkpoint()
+            logger.info(f"Created research KB id={kb_id} name={kb_name}")
+            return kb_id, kb_name
+        except Exception as e:
+            logger.error(f"Error creating research KB: {e}")
+            return None
+
+    @staticmethod
+    def _build_source_markdown(
+        url: str,
+        title: str,
+        exact_text: str,
+        meta: Dict[str, Any],
+    ) -> str:
+        """Wrap exact extractor output with a deterministic metadata preamble.
+
+        The metadata preamble is programmatically generated; the extracted
+        body below the '## Extracted Content' header is preserved verbatim
+        (no summarization, no reflow, no truncation).
+        """
+        accessed = meta.get("accessed") or datetime.now().isoformat()
+        source_id = meta.get("source_id") or ""
+        search_query = meta.get("search_query") or ""
+        archived = "true" if meta.get("archived") else "false"
+        head_lines = [
+            f"# {title or url}",
+            "",
+            f"- URL: {url}",
+            f"- Accessed: {accessed}",
+        ]
+        if source_id:
+            head_lines.append(f"- Source ID: {source_id}")
+        if search_query:
+            head_lines.append(f"- Search Query: {search_query}")
+        head_lines.append(f"- Archived: {archived}")
+        head_lines.extend(["", "## Extracted Content", ""])
+        return "\n".join(head_lines) + (exact_text or "")
+
+    @staticmethod
+    def _safe_filename_from_url(url: str, suffix: str = ".md") -> str:
+        """Build a deterministic, filesystem-safe filename from a URL."""
+        digest = hashlib.sha1(url.encode("utf-8", errors="replace")).hexdigest()[:12]
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(url)
+            base = (parsed.path.rsplit("/", 1)[-1] or parsed.netloc or "source").lower()
+            base = re.sub(r"[^a-z0-9._-]+", "-", base).strip("-_.") or "source"
+            base = base[:64]
+        except Exception:
+            base = "source"
+        return f"{base}-{digest}{suffix}"
+
+    async def _upload_markdown_to_kb(
+        self,
+        kb_id: str,
+        filename: str,
+        markdown_text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Upload synthetic markdown, process inline, add to the KB.
+
+        Returns the OWUI file_id on success, or None on failure. The upload
+        is forced synchronous (background_tasks=None, process_in_background
+        =False) so embedding completes before we add to the collection.
+        """
+        try:
+            from io import BytesIO
+
+            from fastapi import UploadFile
+            from open_webui.internal.db import get_async_db_context
+            from open_webui.models.knowledge import Knowledges
+            from open_webui.routers.files import upload_file_handler
+            from open_webui.routers.retrieval import ProcessFileForm, process_file
+        except Exception as e:
+            logger.error(f"Open WebUI file/knowledge modules unavailable: {e}")
+            return None
+
+        try:
+            payload = markdown_text.encode("utf-8", errors="replace")
+            uf = UploadFile(filename=filename, file=BytesIO(payload))
+            try:
+                uf.headers["content-type"] = "text/markdown"
+            except Exception:
+                pass
+
+            upload_meta = dict(metadata or {})
+            upload_meta.setdefault("name", filename)
+            upload_meta.setdefault("content_type", "text/markdown")
+            upload_meta.setdefault("size", len(payload))
+
+            result = await upload_file_handler(
+                request=self.__request__,
+                file=uf,
+                metadata=upload_meta,
+                process=True,
+                process_in_background=False,
+                user=self.__user__,
+                background_tasks=None,
+                db=None,
+            )
+            if not result:
+                return None
+            file_id = (
+                result.get("id")
+                if isinstance(result, dict)
+                else getattr(result, "id", None)
+            )
+            if not file_id:
+                logger.warning(f"upload_file_handler returned no id for {filename}")
+                return None
+
+            # Re-embed the file into the KB collection (kb_id == collection name)
+            # and link it via the junction table. process_file does not open
+            # its own session (it expects FastAPI to inject one via Depends),
+            # so we open one ourselves and share it with the junction add.
+            async with get_async_db_context() as db:
+                try:
+                    await process_file(
+                        request=self.__request__,
+                        form_data=ProcessFileForm(
+                            file_id=file_id, collection_name=kb_id
+                        ),
+                        user=self.__user__,
+                        db=db,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"process_file(collection_name={kb_id}) failed for "
+                        f"{file_id}: {e}; will still attempt junction add"
+                    )
+
+                try:
+                    await Knowledges.add_file_to_knowledge_by_id(
+                        knowledge_id=kb_id,
+                        file_id=file_id,
+                        user_id=self.__user__.id,
+                        db=db,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Knowledges.add_file_to_knowledge_by_id failed "
+                        f"(kb={kb_id}, file={file_id}): {e}"
+                    )
+                    return None
+
+            return file_id
+        except Exception as e:
+            logger.error(f"Failed to upload markdown to KB {kb_id} ({filename}): {e}")
+            return None
+
+    async def _persist_selected_source(
+        self,
+        url: str,
+        full_text: str,
+        title: str,
+        source_type: str = "web",
+        archived: bool = False,
+        search_query: str = "",
+    ) -> Optional[str]:
+        """Write a selected source through to the research KB.
+
+        Idempotent per URL: if the URL is already in the source_manifest with
+        the same content hash, returns the existing file_id without
+        re-uploading. If the content changed, uploads a new version and
+        retains the older file_id under a 'versions' list.
+        """
+        if not url or not isinstance(full_text, str) or not full_text.strip():
+            return None
+        dr = self._get_dr_state()
+        if dr is None:
+            dr = self._new_dr_state()
+            self._set_dr_state(dr)
+
+        if not dr.get("kb_id"):
+            ensured = await self._ensure_research_kb(
+                dr.get("user_request_summary") or title or url
+            )
+            if not ensured:
+                return None
+            kb_id, _kb_name = ensured
+        else:
+            kb_id = dr["kb_id"]
+
+        content_hash = hashlib.sha256(
+            full_text.encode("utf-8", errors="replace")
+        ).hexdigest()
+        manifest = dr.setdefault("source_manifest", {})
+        existing = manifest.get(url)
+        if (
+            existing
+            and existing.get("hash") == content_hash
+            and existing.get("file_id")
+        ):
+            return existing.get("file_id")
+
+        master = self.get_state().get("master_source_table", {})
+        source_id = ""
+        if url in master:
+            source_id = master[url].get("id", "")
+        meta_for_md = {
+            "accessed": datetime.now().isoformat(),
+            "source_id": source_id,
+            "search_query": search_query,
+            "archived": archived,
+        }
+        body_md = self._build_source_markdown(url, title, full_text, meta_for_md)
+        filename = self._safe_filename_from_url(url, ".md")
+
+        file_id = await self._upload_markdown_to_kb(
+            kb_id=kb_id,
+            filename=filename,
+            markdown_text=body_md,
+            metadata={
+                "name": filename,
+                "content_type": "text/markdown",
+                "source_url": url,
+                "source_title": title,
+                "source_type": source_type,
+                "archived": archived,
+                "research_kb_id": kb_id,
+            },
+        )
+        if not file_id:
+            return None
+
+        entry = {
+            "title": title or url,
+            "file_id": file_id,
+            "hash": content_hash,
+            "source_type": source_type,
+            "archived": archived,
+            "citation_id": source_id,
+            "persisted_at": datetime.now().isoformat(),
+            "search_query": search_query,
+        }
+        if existing and existing.get("file_id") and existing.get("file_id") != file_id:
+            versions = list(existing.get("versions") or [])
+            versions.append(
+                {
+                    "file_id": existing.get("file_id"),
+                    "hash": existing.get("hash"),
+                    "persisted_at": existing.get("persisted_at"),
+                }
+            )
+            entry["versions"] = versions
+        manifest[url] = entry
+        self._set_dr_state(dr)
+        await self._checkpoint()
+        logger.info(f"Persisted source url={url} file_id={file_id}")
+        return file_id
+
+    async def _persist_final_report(
+        self, report_md: str, report_title: str
+    ) -> Optional[str]:
+        """Persist the finalized report markdown into the research KB."""
+        dr = self._get_dr_state()
+        if not dr or not dr.get("kb_id"):
+            return None
+        kb_id = dr["kb_id"]
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = f"deep-research-report-{ts}.md"
+        meta = {
+            "name": filename,
+            "content_type": "text/markdown",
+            "report_title": report_title,
+            "research_kb_id": kb_id,
+            "is_final_report": True,
+        }
+        file_id = await self._upload_markdown_to_kb(
+            kb_id=kb_id,
+            filename=filename,
+            markdown_text=report_md,
+            metadata=meta,
+        )
+        if file_id:
+            dr["report_file_id"] = file_id
+            dr["report_completed"] = True
+            dr["status"] = "completed"
+            dr["mode"] = "post_report_user_qa"
+            self._set_dr_state(dr)
+            await self._checkpoint()
+            logger.info(f"Persisted final report file_id={file_id}")
+        return file_id
+
+    def _record_token_usage(self, bucket: str, prompt: int, completion: int) -> None:
+        """Increment a named token bucket on the dr_state checkpoint."""
+        dr = self._get_dr_state()
+        if not dr:
+            return
+        usage = dr.setdefault(
+            "token_usage",
+            {
+                "research_model": {"prompt": 0, "completion": 0, "total": 0},
+                "report_writer": {"prompt": 0, "completion": 0, "total": 0},
+                "synthesis_time_kb_qa": {"prompt": 0, "completion": 0, "total": 0},
+                "grand_total": {"prompt": 0, "completion": 0, "total": 0},
+            },
+        )
+        b = usage.setdefault(bucket, {"prompt": 0, "completion": 0, "total": 0})
+        b["prompt"] = int(b.get("prompt", 0)) + max(0, int(prompt or 0))
+        b["completion"] = int(b.get("completion", 0)) + max(0, int(completion or 0))
+        b["total"] = b["prompt"] + b["completion"]
+        gt = usage.setdefault("grand_total", {"prompt": 0, "completion": 0, "total": 0})
+        gt["prompt"] = int(gt.get("prompt", 0)) + max(0, int(prompt or 0))
+        gt["completion"] = int(gt.get("completion", 0)) + max(0, int(completion or 0))
+        gt["total"] = gt["prompt"] + gt["completion"]
+        self._set_dr_state(dr)
+
+    @staticmethod
+    def _extract_token_counts(response: Dict[str, Any]) -> tuple[int, int]:
+        """Best-effort extraction of (prompt_tokens, completion_tokens) from
+        an OWUI completion response. Returns (0, 0) if unavailable."""
+        try:
+            usage = response.get("usage") if isinstance(response, dict) else None
+            if isinstance(usage, dict):
+                p = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+                c = int(
+                    usage.get("completion_tokens") or usage.get("output_tokens") or 0
+                )
+                return p, c
+        except Exception:
+            pass
+        return 0, 0
+
+    async def _rehydrate_working_corpus_from_kb(self) -> Dict[str, str]:
+        """Rebuild url_results_cache from persisted KB file content.
+
+        Returns the rehydrated cache (and also installs it into in-memory
+        state). Used on resume after process restart, where the in-memory
+        ephemeral corpus has been lost but the KB still has the sources.
+        """
+        dr = self._get_dr_state()
+        if not dr:
+            return {}
+        manifest = dr.get("source_manifest") or {}
+        if not manifest:
+            return {}
+        try:
+            from open_webui.models.files import Files
+        except Exception as e:
+            logger.warning(f"Cannot rehydrate corpus, Files model unavailable: {e}")
+            return {}
+
+        rehydrated: Dict[str, str] = {}
+        for url, entry in manifest.items():
+            file_id = entry.get("file_id")
+            if not file_id:
+                continue
+            try:
+                f = await Files.get_file_by_id_and_user_id(file_id, self.__user__.id)
+                if not f or not f.data:
+                    continue
+                content = f.data.get("content")
+                if isinstance(content, str) and content:
+                    rehydrated[url] = content
+            except Exception as e:
+                logger.debug(f"Rehydrate skipped for {url} (file {file_id}): {e}")
+                continue
+        if rehydrated:
+            state = self.get_state()
+            cache = dict(state.get("url_results_cache") or {})
+            for k, v in rehydrated.items():
+                cache.setdefault(k, v)
+            self.update_state("url_results_cache", cache)
+            logger.info(
+                f"Rehydrated {len(rehydrated)} sources from KB into working corpus"
+            )
+        return rehydrated
+
+    async def _kb_search(
+        self, kb_id: str, query: str, k: int = 6
+    ) -> List[Dict[str, Any]]:
+        """Run a vector search against the research KB collection.
+
+        Uses Open WebUI's configured EMBEDDING_FUNCTION + VECTOR_DB_CLIENT.
+        Returns a list of {text, source, distance} dicts.
+        """
+        if not kb_id or not query:
+            return []
+        try:
+            embedding = await self.get_embedding(query)
+            if not embedding:
+                return []
+            vdb = getattr(self.__request__.app.state, "VECTOR_DB_CLIENT", None)
+            if vdb is None:
+                logger.warning("VECTOR_DB_CLIENT is not initialized")
+                return []
+            loop = asyncio.get_event_loop()
+            res = await loop.run_in_executor(
+                self.executor,
+                lambda: vdb.search(
+                    collection_name=kb_id,
+                    vectors=[embedding],
+                    limit=int(k),
+                ),
+            )
+            if not res:
+                return []
+            documents = getattr(res, "documents", None) or []
+            metadatas = getattr(res, "metadatas", None) or []
+            distances = getattr(res, "distances", None) or []
+            docs0 = documents[0] if documents and len(documents) > 0 else []
+            metas0 = metadatas[0] if metadatas and len(metadatas) > 0 else []
+            dists0 = distances[0] if distances and len(distances) > 0 else []
+            out: List[Dict[str, Any]] = []
+            for i, txt in enumerate(docs0):
+                meta = metas0[i] if i < len(metas0) else {}
+                dist = dists0[i] if i < len(dists0) else None
+                out.append({"text": txt or "", "source": meta, "distance": dist})
+            return out
+        except Exception as e:
+            logger.warning(
+                f"KB vector search failed (kb={kb_id}, q={query[:60]!r}): {e}"
+            )
+            return []
+
+    async def _run_synthesis_time_kb_qa(
+        self,
+        qa_prompt: str,
+        *,
+        k: int = 6,
+        model: Optional[str] = None,
+    ) -> str:
+        """Targeted KB-grounded QA call used during report synthesis.
+
+        Retrieves chunks from the research KB for the given prompt, then
+        asks the model for a grounded answer. Token usage is recorded under
+        the dedicated 'synthesis_time_kb_qa' bucket — distinct from
+        ordinary report-writer token counts.
+        """
+        dr = self._get_dr_state()
+        if not dr or not dr.get("kb_id"):
+            return ""
+        kb_id = dr["kb_id"]
+        chunks = await self._kb_search(kb_id, qa_prompt, k=k)
+        if not chunks:
+            return ""
+        ctx_lines: List[str] = []
+        for i, c in enumerate(chunks, start=1):
+            src = c.get("source") or {}
+            origin = (
+                src.get("source_url")
+                or src.get("name")
+                or src.get("file_id")
+                or "kb-chunk"
+            )
+            text = (c.get("text") or "").strip()
+            if not text:
+                continue
+            ctx_lines.append(f"[KB:{i}] ({origin})\n{text}")
+        if not ctx_lines:
+            return ""
+        context_block = "\n\n---\n\n".join(ctx_lines)
+        system = {
+            "role": "system",
+            "content": (
+                "You are answering a precise verification question about a "
+                "research corpus. Use ONLY the provided KB excerpts as evidence. "
+                "If the excerpts do not support an answer, say so explicitly."
+            ),
+        }
+        user = {
+            "role": "user",
+            "content": (
+                f"Question: {qa_prompt}\n\n"
+                f"KB excerpts:\n\n{context_block}\n\n"
+                "Answer the question using only these excerpts. Cite by [KB:i]."
+            ),
+        }
+        chosen_model = model or self.get_research_model()
+        try:
+            response = await self.generate_completion(
+                chosen_model,
+                [system, user],
+                stream=False,
+                temperature=min(self.valves.TEMPERATURE, 0.3),
+            )
+            content = ""
+            if response and response.get("choices"):
+                content = response["choices"][0].get("message", {}).get("content") or ""
+            p, c = self._extract_token_counts(response)
+            self._record_token_usage("synthesis_time_kb_qa", p, c)
+            await self._checkpoint()
+            return content
+        except Exception as e:
+            logger.warning(f"synthesis_time_kb_qa failed: {e}")
+            return ""
+
+    POST_REPORT_SYSTEM_PROMPT = (
+        "You are answering questions about a completed Deep Research corpus.\n\n"
+        "Primary source of truth:\n"
+        "- The attached knowledge collection for this chat.\n"
+        "- The final markdown report stored in that same collection.\n"
+        "- The original source documents stored in that same collection.\n\n"
+        "Behavior:\n"
+        "- Answer using the attached knowledge collection as the primary "
+        "evidence base.\n"
+        "- Prefer grounded answers over speculation.\n"
+        "- If the answer is not supported by the attached knowledge, say so "
+        "clearly.\n"
+        "- Do not restart or continue the original deep-research crawl in "
+        "this chat.\n"
+        "- If the user asks for a retry, a broader/narrower report, different "
+        "source-selection rules, a different synthesis style, or a new "
+        "research attempt, tell them a new research run must start in a new "
+        "chat.\n"
+        "- In that case, offer to produce a short handoff summary that "
+        "includes:\n"
+        "  - the original research request,\n"
+        "  - any follow-up refinements already made,\n"
+        "  - any additional constraints the user has added,\n"
+        "  so the user can copy-paste that summary into a new chat."
+    )
+
+    async def _answer_post_report_user_qa(self, body: Dict[str, Any]) -> str:
+        """Post-report QA path: skip deep-research orchestration entirely
+        and answer the user's latest message using the persisted KB."""
+        dr = self._get_dr_state()
+        if not dr or not dr.get("kb_id"):
+            return (
+                "The research knowledge base for this chat is not available. "
+                "Please start a new research run in a new chat."
+            )
+        kb_id = dr["kb_id"]
+        kb_name = dr.get("kb_name") or kb_id
+
+        messages = body.get("messages") or []
+        user_message = (messages[-1].get("content") or "").strip() if messages else ""
+        if not user_message:
+            return ""
+
+        # Make sure the collection is attached on the chat for future turns,
+        # and re-attach defensively in case it was stripped.
+        await self._attach_collection_to_chat(self.chat_id, kb_id, kb_name)
+
+        await self.emit_status(
+            "info", "Post-report mode: answering from research KB...", False
+        )
+        chunks = await self._kb_search(kb_id, user_message, k=8)
+        if not chunks:
+            await self.emit_status(
+                "warning",
+                "No KB matches found; answering from system prompt only.",
+                False,
+            )
+        ctx_lines: List[str] = []
+        for i, c in enumerate(chunks, start=1):
+            src = c.get("source") or {}
+            origin = (
+                src.get("source_url")
+                or src.get("name")
+                or src.get("file_id")
+                or "kb-chunk"
+            )
+            text = (c.get("text") or "").strip()
+            if text:
+                ctx_lines.append(f"[KB:{i}] ({origin})\n{text}")
+        context_block = "\n\n---\n\n".join(ctx_lines) if ctx_lines else "(none)"
+
+        system = {"role": "system", "content": self.POST_REPORT_SYSTEM_PROMPT}
+        user = {
+            "role": "user",
+            "content": (
+                f"User question:\n{user_message}\n\n"
+                f"Knowledge collection excerpts:\n\n{context_block}\n\n"
+                "Answer using these excerpts and the rules in the system "
+                "prompt. Cite excerpts by [KB:i] when relevant."
+            ),
+        }
+
+        chosen_model = self.get_synthesis_model()
+        try:
+            response = await self.generate_completion(
+                chosen_model,
+                [system, user],
+                stream=False,
+                temperature=self.valves.SYNTHESIS_TEMPERATURE,
+            )
+            content = ""
+            if response and response.get("choices"):
+                content = response["choices"][0].get("message", {}).get("content") or ""
+            p, c = self._extract_token_counts(response)
+            self._record_token_usage("synthesis_time_kb_qa", p, c)
+            await self._checkpoint()
+            return content or ""
+        except Exception as e:
+            logger.error(f"Post-report QA generation failed: {e}")
+            return (
+                f"I couldn't generate an answer from the research knowledge base ({e})."
+            )
 
     def pipes(self) -> list[dict[str, str]]:
         return [{"id": f"{name}-pipe", "name": f"{name} Pipe"}]
@@ -3962,6 +4751,20 @@ class Pipe:
             master_source_table[url] = entry
             self.update_state("master_source_table", master_source_table)
 
+        # Write-through to the per-run knowledge base with the FULL extractor
+        # output (no truncation). Idempotent on URL+content-hash.
+        if isinstance(text, str) and text.strip():
+            try:
+                await self._persist_selected_source(
+                    url=url,
+                    full_text=text,
+                    title=title,
+                    source_type=source_type,
+                    archived=archived,
+                )
+            except Exception as e:
+                logger.warning(f"KB persistence failed for {url}: {e}")
+
     async def _try_primary_web_flow(self, url: str) -> Optional[str]:
         """Top-of-fetch_content entry point for the primary web path.
 
@@ -4539,6 +5342,25 @@ class Pipe:
                                     "master_source_table", master_source_table
                                 )
 
+                            if (
+                                isinstance(extracted_content, str)
+                                and extracted_content.strip()
+                            ):
+                                try:
+                                    await self._persist_selected_source(
+                                        url=url,
+                                        full_text=extracted_content,
+                                        title=master_source_table.get(url, {}).get(
+                                            "title", url
+                                        ),
+                                        source_type="pdf",
+                                        archived=False,
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"KB persistence failed for {url}: {e}"
+                                    )
+
                             return extracted_content
                         elif response.status == 403 or response.status == 271:
                             # Try archive.org for 403 errors
@@ -4642,6 +5464,25 @@ class Pipe:
                                         "master_source_table", master_source_table
                                     )
 
+                                if (
+                                    isinstance(extracted_content, str)
+                                    and extracted_content.strip()
+                                ):
+                                    try:
+                                        await self._persist_selected_source(
+                                            url=url,
+                                            full_text=extracted_content,
+                                            title=master_source_table.get(url, {}).get(
+                                                "title", url
+                                            ),
+                                            source_type="pdf",
+                                            archived=False,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"KB persistence failed for {url}: {e}"
+                                        )
+
                                 return extracted_content
 
                             # Handle as normal HTML/text
@@ -4705,6 +5546,22 @@ class Pipe:
                                         "master_source_table", master_source_table
                                     )
 
+                                if isinstance(extracted, str) and extracted.strip():
+                                    try:
+                                        await self._persist_selected_source(
+                                            url=url,
+                                            full_text=extracted,
+                                            title=master_source_table.get(url, {}).get(
+                                                "title", url
+                                            ),
+                                            source_type="web",
+                                            archived=False,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"KB persistence failed for {url}: {e}"
+                                        )
+
                                 return extracted
 
                             # Limit cached content to 3x MAX_RESULT_TOKENS
@@ -4756,6 +5613,22 @@ class Pipe:
                                 self.update_state(
                                     "master_source_table", master_source_table
                                 )
+
+                            if isinstance(content, str) and content.strip():
+                                try:
+                                    await self._persist_selected_source(
+                                        url=url,
+                                        full_text=content,
+                                        title=master_source_table.get(url, {}).get(
+                                            "title", url
+                                        ),
+                                        source_type="web",
+                                        archived=False,
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"KB persistence failed for {url}: {e}"
+                                    )
 
                             return content
                         elif response.status == 403 or response.status == 271:
@@ -4887,6 +5760,25 @@ class Pipe:
                                                 master_source_table,
                                             )
 
+                                        if (
+                                            isinstance(extracted_content, str)
+                                            and extracted_content.strip()
+                                        ):
+                                            try:
+                                                await self._persist_selected_source(
+                                                    url=url,
+                                                    full_text=extracted_content,
+                                                    title=master_source_table.get(
+                                                        url, {}
+                                                    ).get("title", url),
+                                                    source_type="pdf",
+                                                    archived=True,
+                                                )
+                                            except Exception as e:
+                                                logger.warning(
+                                                    f"KB persistence failed for {url}: {e}"
+                                                )
+
                                         return extracted_content
                                     else:
                                         # Handle HTML/text from archive
@@ -4944,6 +5836,25 @@ class Pipe:
                                                     "master_source_table",
                                                     master_source_table,
                                                 )
+
+                                            if (
+                                                isinstance(extracted, str)
+                                                and extracted.strip()
+                                            ):
+                                                try:
+                                                    await self._persist_selected_source(
+                                                        url=url,
+                                                        full_text=extracted,
+                                                        title=master_source_table.get(
+                                                            url, {}
+                                                        ).get("title", url),
+                                                        source_type="web",
+                                                        archived=True,
+                                                    )
+                                                except Exception as e:
+                                                    logger.warning(
+                                                        f"KB persistence failed for {url}: {e}"
+                                                    )
 
                                             return extracted
                                         else:
@@ -5396,6 +6307,25 @@ class Pipe:
                                 "%Y-%m-%d %H:%M:%S"
                             )
 
+                            # Write-through to research KB with the FULL snippet
+                            # (not the truncated_content). Idempotent on hash.
+                            if isinstance(snippet, str) and snippet.strip():
+                                try:
+                                    await self._persist_selected_source(
+                                        url=url,
+                                        full_text=snippet,
+                                        title=title,
+                                        source_type=source_type,
+                                        archived=master_source_table.get(url, {}).get(
+                                            "archived", False
+                                        ),
+                                        search_query=query,
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"KB persistence failed for {url}: {e}"
+                                    )
+
                         return {
                             "title": title,
                             "url": url,
@@ -5451,6 +6381,25 @@ class Pipe:
                 }
                 self.update_state("master_source_table", master_source_table)
 
+            # Write-through to research KB with the FULL snippet. Idempotent
+            # on hash. Cheap when fetch_content already persisted upstream.
+            if isinstance(snippet, str) and snippet.strip():
+                try:
+                    await self._persist_selected_source(
+                        url=url,
+                        full_text=snippet,
+                        title=title,
+                        source_type=master_source_table.get(url, {}).get(
+                            "source_type", "web"
+                        ),
+                        archived=master_source_table.get(url, {}).get(
+                            "archived", False
+                        ),
+                        search_query=query,
+                    )
+                except Exception as e:
+                    logger.warning(f"KB persistence failed for {url}: {e}")
+
             # If over token limit, truncate
             if content_tokens > max_tokens:
                 # Estimate character position based on token limit
@@ -5493,79 +6442,97 @@ class Pipe:
             }
 
     async def _try_openwebui_search(self, query: str) -> List[Dict[str, Any]]:
-        """Try to use Open WebUI's built-in search functionality"""
+        """Try to use Open WebUI's built-in search functionality.
+
+        OWUI's SearchForm now requires `queries: List[str]` (plural) and
+        process_web_search returns either:
+          - bypass branch: {"docs": [{"content","metadata"}...], "filenames":[urls], "items":[...]}
+          - default branch: {"collection_names":[name], "filenames":[urls], "items":[...]}
+        We normalize both into the {title,url,snippet} shape the pipe expects.
+        """
         try:
             from open_webui.routers.retrieval import SearchForm, process_web_search
 
-            # Create a search form with the query
-            search_form = SearchForm(query=query)  # pyright: ignore[reportCallIssue]
+            search_form = SearchForm(queries=[query])
 
-            # Call the search function
             logger.debug(f"Executing built-in search with query: {query}")
 
-            # Set a timeout for this operation
             search_task = asyncio.create_task(
                 process_web_search(self.__request__, search_form, user=self.__user__)
             )
             search_results = await asyncio.wait_for(search_task, timeout=15.0)
 
             logger.debug(f"Search results received: {type(search_results)}")
-            results = []
+            results: List[Dict[str, Any]] = []
 
-            # Get state for URL tracking
             state = self.get_state()
             url_selected_count = state.get("url_selected_count", {})
 
-            # Calculate additional results to fetch based on repeat counts
             repeat_count = 0
             for url, count in url_selected_count.items():
                 if count >= self.valves.REPEATS_BEFORE_EXPANSION:
                     repeat_count += 1
 
-            # Calculate total results to fetch
             base_results = self.valves.SEARCH_RESULTS_PER_QUERY
             additional_results = min(repeat_count, self.valves.EXTRA_RESULTS_PER_QUERY)
             total_results = (
                 base_results + self.valves.EXTRA_RESULTS_PER_QUERY + additional_results
             )
 
-            # Process the results
-            if search_results:
-                sr: dict[str, Any] = search_results  # type: ignore[assignment]
-                if "docs" in sr:
-                    # Extract information from search results
-                    docs: list[Any] = sr.get("docs", [])
-                    urls: list[Any] = sr.get("filenames", [])
+            if not search_results:
+                return results
+            sr: dict[str, Any] = search_results  # type: ignore[assignment]
 
-                    logger.debug(f"Found {len(docs)} documents in search results")
+            urls = sr.get("filenames") or []
+            docs = sr.get("docs") or []
+            items = sr.get("items") or []
+            collection_names = sr.get("collection_names") or (
+                [sr["collection_name"]] if sr.get("collection_name") else []
+            )
 
-                    # Create a result object for each document
-                    for i, doc in enumerate(docs[:total_results]):
-                        url = urls[i] if i < len(urls) else ""
-                        results.append(
-                            {
-                                "title": f"'{query}'",
-                                "url": url,
-                                "snippet": doc,
-                            }
-                        )
-                elif "collection_name" in sr:
-                    # For collection-based results
-                    collection_name = sr.get("collection_name")
-                    urls = sr.get("filenames", [])
-
-                    logger.debug(
-                        f"Found collection {collection_name} with {len(urls)} documents"
+            # Preferred path: structured `items` if present (cleanest).
+            if items:
+                for i, it in enumerate(items[:total_results]):
+                    if not isinstance(it, dict):
+                        continue
+                    url = (
+                        it.get("url")
+                        or it.get("link")
+                        or (urls[i] if i < len(urls) else "")
                     )
-
-                    for i, url in enumerate(urls[:total_results]):
-                        results.append(
-                            {
-                                "title": f"Search Result {i + 1} from {collection_name}",
-                                "url": url,
-                                "snippet": f"Result from collection: {collection_name}",
-                            }
-                        )
+                    snippet = (
+                        it.get("snippet")
+                        or it.get("content")
+                        or it.get("description")
+                        or ""
+                    )
+                    title = it.get("title") or f"'{query}'"
+                    results.append({"title": title, "url": url, "snippet": snippet})
+            elif docs:
+                # Bypass branch: docs is a list of {content, metadata} dicts.
+                for i, doc in enumerate(docs[:total_results]):
+                    url = urls[i] if i < len(urls) else ""
+                    if isinstance(doc, dict):
+                        snippet = doc.get("content") or ""
+                        meta = doc.get("metadata") or {}
+                        title = meta.get("title") or meta.get("name") or f"'{query}'"
+                        if not url:
+                            url = meta.get("source") or meta.get("url") or ""
+                    else:
+                        snippet = str(doc) if doc is not None else ""
+                        title = f"'{query}'"
+                    results.append({"title": title, "url": url, "snippet": snippet})
+            elif collection_names:
+                # Embedding branch with no inline docs: just surface URLs;
+                # downstream fetch_content will populate snippets.
+                for i, url in enumerate(urls[:total_results]):
+                    results.append(
+                        {
+                            "title": f"Search Result {i + 1}",
+                            "url": url,
+                            "snippet": "",
+                        }
+                    )
 
             return results
 
@@ -6496,7 +7463,6 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 "messages": messages,
                 "stream": stream,
                 "temperature": temperature,
-                "keep_alive": "10m",
             }
 
             response = await asyncio.wait_for(
@@ -10633,6 +11599,10 @@ new ResizeObserver(reportHeight).observe(document.body);
         if not messages:
             return ""
 
+        # Resolve OWUI chat record id (used for the persisted deepResearch
+        # checkpoint). Falls back to None when running outside a chat context.
+        self.chat_id = self._resolve_chat_id(body)
+
         # First message ID in the conversation serves as our conversation identifier
         first_message = messages[0] if messages else {}
         conversation_id = f"{__user__['id']}_{first_message.get('id', 'default')}"
@@ -10646,6 +11616,53 @@ new ResizeObserver(reportHeight).observe(document.body);
         ):  # Check we're not waiting for feedback
             logger.info(f"New conversation detected with ID: {conversation_id}")
             self.reset_state()  # Reset all state for this conversation
+
+        # Rehydrate persisted deepResearch state (chat-record JSON) into
+        # in-memory state when a checkpoint exists. This lets the pipe
+        # survive process restarts and continue from where it left off.
+        persisted_dr = await self._load_persisted_dr_state(self.chat_id)
+        if persisted_dr and not self._get_dr_state():
+            self.update_state("dr_state", persisted_dr)
+            logger.info(
+                f"Rehydrated deepResearch checkpoint for chat={self.chat_id} "
+                f"mode={persisted_dr.get('mode')} status={persisted_dr.get('status')} "
+                f"sources={len(persisted_dr.get('source_manifest') or {})}"
+            )
+            # Ensure the working corpus is populated from KB-stored content.
+            try:
+                await self._rehydrate_working_corpus_from_kb()
+            except Exception as e:
+                logger.warning(f"Working corpus rehydration failed: {e}")
+
+        # Post-report user QA mode: a completed run was previously persisted
+        # to this chat. Skip the entire deep-research orchestration and
+        # answer using the research KB as the evidence base.
+        dr_now = self._get_dr_state()
+        if (
+            dr_now
+            and dr_now.get("mode") == "post_report_user_qa"
+            and dr_now.get("kb_id")
+            and not waiting_for_outline_feedback
+        ):
+            return await self._answer_post_report_user_qa(body)
+
+        # Fresh research run: initialize the deepResearch checkpoint and
+        # provision the per-run private knowledge base up-front, so source
+        # write-through has a target from the very first selection. The
+        # request-summary uses the latest user message as a title hint.
+        if dr_now is None:
+            user_request_for_init = (
+                messages[-1].get("content") if messages else ""
+            ) or ""
+            dr_init = self._new_dr_state(user_request=user_request_for_init)
+            self._set_dr_state(dr_init)
+            try:
+                await self._ensure_research_kb(user_request_for_init)
+            except Exception as e:
+                logger.warning(
+                    f"Initial KB provisioning failed (will retry on first source): {e}"
+                )
+            await self._checkpoint()
 
         # Initialize master source table if not exists
         state = self.get_state()
@@ -12338,6 +13355,30 @@ Format your response as a valid JSON object with the following structure:
 
         # Mark research as completed
         self.update_state("research_completed", True)
+
+        # Persist the finalized report into the research KB, attach the
+        # collection to the chat record so subsequent user messages re-send
+        # it for RAG, and flip the run into post-report user QA mode. All
+        # failures here are non-fatal — the user still receives the report.
+        try:
+            report_title = (
+                titles.get("main_title") if isinstance(titles, dict) else None
+            ) or f"Deep Research Report: {user_message[:80]}"
+            report_file_id = await self._persist_final_report(
+                comprehensive_answer, report_title
+            )
+            dr_after = self._get_dr_state()
+            if dr_after and dr_after.get("kb_id"):
+                await self._attach_collection_to_chat(
+                    self.chat_id,
+                    dr_after["kb_id"],
+                    dr_after.get("kb_name") or dr_after["kb_id"],
+                )
+            await self._checkpoint()
+            if report_file_id:
+                logger.info(f"Final report persisted to KB file_id={report_file_id}")
+        except Exception as e:
+            logger.warning(f"Final-report persistence/attach failed: {e}")
 
         # Output the final compiled and edited synthesis
         await self.emit_synthesis_status("Final synthesis complete!", True)
