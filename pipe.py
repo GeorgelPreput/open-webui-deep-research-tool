@@ -1572,6 +1572,21 @@ class Pipe:
         if self.vocabulary_cache is not None:
             return self.vocabulary_cache
 
+        disk_path = "/app/backend/data/deep_research_vocabulary.txt"
+        try:
+            with open(disk_path, "r") as f:
+                words = [w.strip() for w in f.readlines() if w.strip()]
+            if words:
+                self.vocabulary_cache = words
+                logger.info(
+                    f"Loaded {len(self.vocabulary_cache)} words vocabulary from disk cache"
+                )
+                return self.vocabulary_cache
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"Could not read vocabulary from disk cache: {e}")
+
         try:
             url = "https://www.mit.edu/~ecprice/wordlist.10000"
             connector = aiohttp.TCPConnector(force_close=True)
@@ -1587,6 +1602,14 @@ class Pipe:
                         logger.info(
                             f"Loaded {len(self.vocabulary_cache)} words vocabulary"
                         )
+                        try:
+                            with open(disk_path, "w") as f:
+                                f.write(text)
+                            logger.info(f"Saved vocabulary to disk cache: {disk_path}")
+                        except Exception as e:
+                            logger.warning(
+                                f"Could not save vocabulary to disk cache: {e}"
+                            )
                         return self.vocabulary_cache
         except Exception as e:
             logger.error(f"Error loading vocabulary: {e}")
@@ -1622,10 +1645,35 @@ class Pipe:
             self.vocabulary_cache = await self.create_context_vocabulary(context_text)
             return self.vocabulary_cache
 
+    def _vocab_embeddings_disk_path(self) -> str:
+        """Return a model-specific path for caching vocabulary embeddings on disk."""
+        try:
+            cfg = self.__request__.app.state.config
+            model_name = getattr(cfg, "RAG_EMBEDDING_MODEL", "") or "default"
+        except Exception:
+            model_name = "default"
+        safe_model = re.sub(r"[^a-zA-Z0-9_-]", "_", model_name)[:64]
+        return f"/app/backend/data/deep_research_vocab_emb_{safe_model}.npz"
+
     async def load_vocabulary_embeddings(self):
         """Generate vocabulary embeddings on demand using Open WebUI's configured embedding function."""
         if self.vocabulary_embeddings is not None:
             return self.vocabulary_embeddings
+
+        disk_path = self._vocab_embeddings_disk_path()
+        try:
+            data = np.load(disk_path)
+            words = data["words"].tolist()
+            embeddings = data["embeddings"].tolist()
+            self.vocabulary_embeddings = {w: e for w, e in zip(words, embeddings)}
+            logger.info(
+                f"Loaded {len(self.vocabulary_embeddings)} vocabulary embeddings from disk cache"
+            )
+            return self.vocabulary_embeddings
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"Could not load vocabulary embeddings from disk cache: {e}")
 
         state = self.get_state()
         cached_embeddings = state.get("vocabulary_embeddings")
@@ -1666,6 +1714,17 @@ class Pipe:
         logger.info(
             f"Generated embeddings for {len(self.vocabulary_embeddings)} vocabulary words"
         )
+        try:
+            valid_words = list(self.vocabulary_embeddings.keys())
+            valid_embs = list(self.vocabulary_embeddings.values())
+            np.savez_compressed(
+                disk_path,
+                words=np.array(valid_words, dtype="U64"),
+                embeddings=np.array(valid_embs, dtype=np.float32),
+            )
+            logger.info(f"Saved vocabulary embeddings to disk cache: {disk_path}")
+        except Exception as e:
+            logger.warning(f"Could not save vocabulary embeddings to disk cache: {e}")
         self.update_state("vocabulary_embeddings", self.vocabulary_embeddings)
         return self.vocabulary_embeddings
 
@@ -7453,35 +7512,47 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         timeout: float = 600.0,
     ) -> dict[str, Any]:
         """Generate a completion from the specified model"""
-        try:
-            # Use provided temperature or default from valves
-            if temperature is None:
-                temperature = self.valves.TEMPERATURE
+        if temperature is None:
+            temperature = self.valves.TEMPERATURE
 
-            form_data = {
-                "model": model,
-                "messages": messages,
-                "stream": stream,
-                "temperature": temperature,
-            }
+        form_data = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "temperature": temperature,
+        }
 
-            response = await asyncio.wait_for(
-                generate_chat_completions(
-                    self.__request__,
-                    form_data,
-                    user=self.__user__,
-                ),
-                timeout=timeout,
-            )
+        max_retries = 3
+        retry_delay = 5.0
+        _transient_phrases = ("server disconnected", "server connection error", "connection reset", "connection refused")
 
-            return response
-        except asyncio.TimeoutError:
-            logger.error(f"Completion timed out after {timeout}s for model {model}")
-            raise
-        except Exception as e:
-            logger.error(f"Error generating completion with model {model}: {e}")
-            # Return a minimal valid response structure
-            return {"choices": [{"message": {"content": f"Error: {str(e)}"}}]}
+        for attempt in range(max_retries):
+            try:
+                response = await asyncio.wait_for(
+                    generate_chat_completions(
+                        self.__request__,
+                        form_data,
+                        user=self.__user__,
+                    ),
+                    timeout=timeout,
+                )
+                return response
+            except asyncio.TimeoutError:
+                logger.error(f"Completion timed out after {timeout}s for model {model}")
+                raise
+            except Exception as e:
+                err_str = str(e).lower()
+                is_transient = any(phrase in err_str for phrase in _transient_phrases)
+                if is_transient and attempt < max_retries - 1:
+                    wait = retry_delay * (2 ** attempt)
+                    logger.warning(
+                        f"Transient connection error for model {model} (attempt {attempt + 1}/{max_retries}): {e}. "
+                        f"Retrying in {wait:.0f}s..."
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"Error generating completion with model {model}: {e}")
+                    return {"choices": [{"message": {"content": f"Error: {str(e)}"}}]}
 
     async def emit_message(self, message: str):
         """Emit a message to the client"""
