@@ -53,9 +53,13 @@ deep_research_pipeline.py
 │   └── list_models
 ├── _BridgeSink                        # Thread-safe async→sync bridge (~L562–588)
 ├── _ReasoningBlock                    # <details type="reasoning"> builder (~L591–632)
+├── EmbeddingCache / TransformationCache / ResearchStateManager  # shared (~L635–782)
+├── _PipelineCallLocal                 # threading.local subclass; defines per-call slots (~L785)
+├── _tls_prop                          # module helper: builds threadlocal-backed property (~L815)
 ├── Pipeline                           # Pipelines plugin shell
 │   ├── Valves (BaseModel)             # ~60 valves from pipe.py + 9 new ones
-│   ├── __init__                       # type="manifold", pipelines list, client=None
+│   ├── client/_sink/_reasoning/...    # 15 property descriptors → self._tls.<name>
+│   ├── __init__                       # type="manifold", pipelines list, self._tls=_PipelineCallLocal()
 │   ├── on_startup                     # Creates DATA_DIR only — NO client (wrong loop)
 │   ├── on_shutdown                    # Shuts down executor
 │   ├── on_valves_updated              # No-op (client is per-call)

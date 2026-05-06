@@ -782,6 +782,53 @@ class ResearchStateManager:
             del self.conversation_states[conversation_id]
 
 
+class _PipelineCallLocal(threading.local):
+    """Per-thread storage for Pipeline's per-call attributes.
+
+    Each pipe() invocation runs in its own daemon worker thread (see
+    Pipeline._runner). threading.local.__init__ runs once per thread on
+    first attribute access, so each worker thread gets fresh defaults —
+    natural per-call isolation without method-signature changes anywhere
+    in the engine. Mutable defaults (set()) are correctly per-thread:
+    self._seen_subtopics.add(...) mutates THIS thread's slot.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.client: Optional[OWUIClient] = None
+        self._sink: Optional[_BridgeSink] = None
+        self._reasoning: Optional[_ReasoningBlock] = None
+        self.__current_event_emitter__: Any = None
+        self.__current_event_call__: Any = None
+        self.__user__: Any = None
+        self.__model__: Any = None
+        self.__request__: Any = None
+        self.conversation_id: Optional[str] = None
+        self.chat_id: Optional[str] = None
+        self.is_pdf_content: bool = False
+        self.research_date: Optional[str] = None
+        self.trajectory_accumulator: Optional["TrajectoryAccumulator"] = None
+        self._seen_subtopics: set[str] = set()
+        self._seen_sections: set[str] = set()
+
+
+def _tls_prop(name: str):
+    """Build a property that proxies attribute access to self._tls.<name>.
+
+    Used in Pipeline's class body so the ~200 lifted engine methods can
+    keep reading `self.<attr>` while storage actually lives in a
+    per-thread local. This is what makes overlapping pipe() calls safe:
+    each worker thread sees its own slot, with no shared mutable state.
+    """
+    def fget(self):
+        return getattr(self._tls, name)
+
+    def fset(self, value):
+        setattr(self._tls, name, value)
+
+    return property(fget, fset)
+
+
 class Pipeline:
     class Valves(BaseModel):
         ENABLED: bool = Field(
@@ -1124,6 +1171,26 @@ class Pipeline:
             le=60.0,
         )
 
+    # ----- Per-call state, isolated by thread via self._tls -----
+    # The 15 attributes below are bare property aliases that proxy to
+    # self._tls.<name>. Each pipe() call runs in its own worker thread,
+    # so reads/writes never cross calls. See _PipelineCallLocal above.
+    client = _tls_prop("client")
+    _sink = _tls_prop("_sink")
+    _reasoning = _tls_prop("_reasoning")
+    __current_event_emitter__ = _tls_prop("__current_event_emitter__")
+    __current_event_call__ = _tls_prop("__current_event_call__")
+    __user__ = _tls_prop("__user__")
+    __model__ = _tls_prop("__model__")
+    __request__ = _tls_prop("__request__")
+    conversation_id = _tls_prop("conversation_id")
+    chat_id = _tls_prop("chat_id")
+    is_pdf_content = _tls_prop("is_pdf_content")
+    research_date = _tls_prop("research_date")
+    trajectory_accumulator = _tls_prop("trajectory_accumulator")
+    _seen_subtopics = _tls_prop("_seen_subtopics")
+    _seen_sections = _tls_prop("_seen_sections")
+
     def __init__(self):
         # ----- Pipelines plugin shell -----
         self.type = "manifold"
@@ -1143,40 +1210,25 @@ class Pipeline:
         )
         self.pipelines = [{"id": "deep-research", "name": "Deep Research"}]
 
-        # OWUI REST client; built in on_startup, closed in on_shutdown.
-        self.client: Optional[OWUIClient] = None
-
-        # Bridge sink for the current pipe() invocation (set per-call).
-        self._sink: Optional[_BridgeSink] = None
-        # Stack of open reasoning blocks for status routing.
-        self._reasoning: Optional[_ReasoningBlock] = None
-
-        # ----- Compat shims for code lifted from pipe.py -----
-        # The original Function relied on these dunder fields being injected
-        # by OWUI; we set them per-call from `body` and from the sink.
-        self.__current_event_emitter__: Any = None
-        self.__current_event_call__: Any = None
-        self.__user__: Any = None
-        self.__model__: Any = None
-        self.__request__: Any = None  # No FastAPI request in Pipelines.
+        # All per-call state (client, sink, reasoning blocks, compat
+        # shims, conversation_id, chat_id, deduplication sets, etc.) is
+        # exposed via descriptors at class scope and stored here, in a
+        # threading.local subclass. Each pipe() call runs in its own
+        # worker thread, so concurrent calls cannot stomp on each
+        # other's state. See _PipelineCallLocal above for the slot list.
+        self._tls = _PipelineCallLocal()
 
         # Use state manager to isolate conversation states
         self.state_manager = ResearchStateManager()
-        self.conversation_id = None  # Will be set during pipe method
-        self.chat_id: Optional[str] = None  # OWUI chat record id (for persistence)
 
-        # Shared resources (not conversation-specific)
+        # Shared resources (not conversation-specific). Vocabulary
+        # cache/embeddings are keyed by EMBEDDING_MODEL on disk and are
+        # read-only after construction, so safe to share across calls.
         self.embedding_cache = EmbeddingCache(max_size=10000000)
         self.transformation_cache = TransformationCache(max_size=2500000)
         self.vocabulary_cache = None
         self.vocabulary_embeddings = None
-        self.is_pdf_content = False
-        self.research_date = None
-        self.trajectory_accumulator: Optional["TrajectoryAccumulator"] = None
-        self._seen_subtopics: set[str] = set()
-        self._seen_sections: set[str] = set()
 
-        self.research_date = datetime.now().strftime("%Y-%m-%d")
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.valves.THREAD_WORKERS
         )
@@ -1356,12 +1408,17 @@ class Pipeline:
                 self._sink_put(result)
         except Exception:
             logger.exception("Deep research run failed")
+            # Flush any in-progress reasoning block FIRST so its buffered
+            # status lines appear before the failure notice. Otherwise the
+            # block (which may hold up to REASONING_FLUSH_SECONDS of work
+            # done just prior to the exception) gets rendered after the
+            # failure message and looks like the run kept going.
+            self._flush_reasoning(done=True)
             self._sink_put(
                 "\n\n**Deep Research run failed.** See pipeline logs for details.\n"
             )
         finally:
-            # Final flush in case the report path raised after opening
-            # a fresh reasoning block.
+            # Defensive: no-op if already flushed in the except branch.
             self._flush_reasoning(done=True)
             # Close the per-call client; its session is bound to this loop
             # and must not outlive the loop that's about to be torn down.
@@ -10307,7 +10364,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         # Add the research outline for context
         subtopic_context += "## Research Outline Context:\n"
         state = self.get_state()
-        synthesis_outline = state.get("research_state", {}).get("research_outline", [])
+        synthesis_outline = (state.get("research_state") or {}).get("research_outline", [])
         if synthesis_outline:
             for topic_item in synthesis_outline:
                 topic = topic_item.get("topic", "")
@@ -10901,7 +10958,7 @@ new ResizeObserver(reportHeight).observe(document.body);
 
         # Add the research outline for better context
         state = self.get_state()
-        research_outline = state.get("research_state", {}).get("research_outline", [])
+        research_outline = (state.get("research_state") or {}).get("research_outline", [])
         if research_outline:
             smoothing_context += "## Full Research Outline:\n"
             for topic_item in research_outline:
@@ -11428,7 +11485,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         export_data: dict[str, Any] = {
             "export_timestamp": export_timestamp,
             "research_date": self.research_date,
-            "original_query": state.get("research_state", {}).get(
+            "original_query": (state.get("research_state") or {}).get(
                 "user_message", "Unknown query"
             ),
             "results_count": len(results_history),
@@ -11464,7 +11521,7 @@ new ResizeObserver(reportHeight).observe(document.body);
             export_results.append(export_result)
 
         # Generate filename based on the research query (sanitized) and timestamp
-        query_text = state.get("research_state", {}).get("user_message", "research")
+        query_text = (state.get("research_state") or {}).get("user_message", "research")
         # Sanitize the query for a filename (first 30 chars, remove unsafe chars)
         query_for_filename = (
             "".join(c if c.isalnum() or c in " -_" else "_" for c in query_text[:30])
