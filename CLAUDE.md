@@ -86,6 +86,21 @@ deep_research_pipeline.py
 
 `DOMAIN_PRIORITY`, `CONTENT_PRIORITY`, `OWUI_API_KEY`, `EMBEDDING_MODEL` are `Optional[str]` in the Pipelines version (not `str`). OWUI admin UI sends empty fields as JSON `null`; Pydantic rejects bare `str` for null but accepts `Optional[str]`.
 
+### Valve model ID format
+
+Model IDs for `RESEARCH_MODEL`, `SYNTHESIS_MODEL`, and `EMBEDDING_MODEL` must match **exactly** what is registered in `app.state.MODELS` — the main OWUI models registry, NOT the RAG embedding config.
+
+**How IDs are formed:**
+- If the OpenAI-compatible connection has a `prefix_id` set (e.g., `myprefix`), models are stored as `{prefix_id}.{model_id}` (dot separator), e.g., `myprefix.my-llm-model`.
+- If no prefix is configured, models are stored by their raw ID from the API, e.g., `my-llm-model`.
+- Some providers (Infinity Embedding, HuggingFace) return model IDs with slashes, e.g., `org/embedding-model` — these are stored with the slash as-is.
+
+**Common error**: copying the embedding model ID from Admin Panel > Documents. That panel shows the RAG config format (`{engine}/{model}`, e.g., `openai/embedding-model`) which is **not** the model's registered ID. Use the ID from Settings > Models instead.
+
+**"Model not found" on `/api/embeddings`**: means the model ID is not in `app.state.MODELS`. Check that:
+1. The model is **enabled** in OWUI Admin > Models (disabled models are excluded from `app.state.MODELS`).
+2. The model ID matches exactly — call `GET /api/models` to list all registered IDs.
+
 ---
 
 ## Critical implementation patterns
@@ -308,6 +323,8 @@ kubectl get pod <owui-pod> -n <ns> -w
 7. **OWUI REST response shapes differ from what you'd guess** — always verify against the installed source in `.venv/lib/python3.11/site-packages/open_webui/routers/`. The shapes in the plan doc and comments can be wrong; the source is authoritative.
 8. **Chat persistence requires API key ownership** — there is no admin bypass for `get_chat_by_id_and_user_id`. The `OWUI_API_KEY` user must own the chat.
 9. **QUIET_CHAT_MODE return values must be explicitly pushed to the sink** — Pipelines discards `pipe()` return values; only yielded strings reach OWUI.
+10. **`/api/embeddings` uses the chat models registry, not the RAG config** — `app.state.MODELS` is checked; the embedding model must be enabled in Admin > Models and its ID must match exactly. Disabled models are invisible to this endpoint even if configured in Documents settings.
+11. **"Model not found" on `/api/chat/completions` or `/api/embeddings`** — check two things: (a) the model ID in the valve uses the correct prefix format for this OWUI instance, and (b) the model is enabled in Admin > Models.
 
 ---
 
