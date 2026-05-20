@@ -1,5 +1,15 @@
 # Deep Research pipe — investigation notes
 
+## Minimum supported Open WebUI version
+
+`pipe.py` targets **Open WebUI >= 0.9.2** (the async-ORM line). Every
+`await Chats.*` / `await Knowledges.*` / `await Files.*` / `await
+upload_file_handler` / `await process_file` site, and the
+`open_webui.internal.db.get_async_db_context` import, only resolve on
+OWUI 0.9.0+. Running the pipe against 0.8.x will raise `TypeError:
+object ... can't be used in 'await' expression` or `ImportError` on
+the first persistence/KB call.
+
 ## What this repo is
 
 Two-file repo. Both files implement the same deep research engine (multi-cycle web research with semantic compression, eigendecomposition-based dimension tracking, KB persistence, and citation verification) but target different OWUI deployment environments:
@@ -314,9 +324,11 @@ In `routers/openai.py::generate_chat_completion`, the bottom-level `except Excep
 
 ### Fetching / extraction implementation details
 
-- `fake_useragent.UserAgent()` is initialized once at module import time, with a static fallback UA list if import or provider construction fails. Do not move that work back into `fetch_content`.
-- Domain cookie state used by `fetch_content` is treated as mapping-shaped data; the old alternate conversion path is gone because `SimpleCookie` already behaves like a `dict` for the relevant usage here.
-- Same-domain session reuse in `fetch_content` depends on the existing `domain_session_map` entry being initialized before cookie reuse. Preserve that control-flow assumption if you refactor the method.
+- `fetch_content` now routes HTML URLs only through `_try_primary_web_flow`. If Open WebUI extraction is unavailable/fails/quality-rejected, `fetch_content` returns the OWUI extraction failure string (`Error fetching content: OWUI extraction failed for <url>`); there is no legacy HTML direct-fetch fallback path.
+- The retained legacy web-fetch machinery (fake UA, spoofed headers/cookies, per-domain rate limiting via `domain_session_map`) is now scoped to `_fetch_pdf_via_legacy_download` for PDF-classified URLs.
+- `fake_useragent.UserAgent()` is initialized once at module import time, with a static fallback UA list if import or provider construction fails. Do not move that work into per-request paths.
+- Domain cookie state used by `_fetch_pdf_via_legacy_download` is treated as mapping-shaped data; the old alternate conversion path is gone because `SimpleCookie` already behaves like a `dict` for the relevant usage here.
+- Same-domain session reuse in `_fetch_pdf_via_legacy_download` depends on the existing `domain_session_map` entry being initialized before cookie reuse. Preserve that control-flow assumption if you refactor the method.
 
 ### Small but meaningful code-shape rules
 
@@ -336,7 +348,8 @@ In `routers/openai.py::generate_chat_completion`, the bottom-level `except Excep
 
 - All LLM calls funnel through `Pipe.generate_completion` (~L7506). 25+ call sites; mix of critical (synthesis, query generation, outline) and fail-soft (citation verify, group titles, smoothing, abstract).
 - Pipe accesses OWUI internals via `self.__request__.app.state` — see `_openwebui_extraction_available` (~L4403), `load_vocabulary_embeddings` (~L1651), `_build_document_loader_kwargs` (~L4498).
-- Direct aiohttp usage: `fetch_content` (~L5117), `_fallback_search` (~L6605).
+- Direct aiohttp usage: `fetch_content` (~L5117).
+- Web search path is OWUI-only: `search_web` computes the result budget once and passes `total_results` to `_try_openwebui_search`, which returns `(results, failure_reason)` so logs distinguish no-results from OWUI search failure.
 - State persistence: `_load_persisted_dr_state` / `_save_persisted_dr_state` / `_checkpoint` (~L740–790).
 - Entry point: `async def pipe(self, body, __user__, __event_emitter__, ...)` at ~L11652. Returns `comprehensive_answer` string in QUIET mode (auto-appended as assistant message by OWUI).
 

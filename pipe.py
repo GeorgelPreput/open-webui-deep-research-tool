@@ -11,7 +11,7 @@ import random
 import re
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, TypedDict
 
 import aiohttp
 import numpy as np
@@ -66,6 +66,20 @@ def setup_logger():
 
 logger = setup_logger()
 
+EventEmitter = Callable[[Dict[str, Any]], Awaitable[Any]]
+
+
+class BibliographyEntry(TypedDict):
+    id: int
+    title: str
+    url: str
+
+
+class BibliographyData(TypedDict):
+    bibliography: List[BibliographyEntry]
+    title_to_global_id: Dict[str, int]
+    url_to_global_id: Dict[str, int]
+
 
 # ---------------------------------------------------------------------------
 # Per-call state isolation
@@ -82,45 +96,45 @@ logger = setup_logger()
 # are written exactly once at the top of `pipe()`.
 # ---------------------------------------------------------------------------
 
-_ev_emitter_var: contextvars.ContextVar = contextvars.ContextVar(
+_ev_emitter_var: contextvars.ContextVar[Optional[EventEmitter]] = contextvars.ContextVar(
     "deep_research_ev_emitter", default=None
 )
-_ev_call_var: contextvars.ContextVar = contextvars.ContextVar(
+_ev_call_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
     "deep_research_ev_call", default=None
 )
-_user_var: contextvars.ContextVar = contextvars.ContextVar(
+_user_var: contextvars.ContextVar[Optional[User]] = contextvars.ContextVar(
     "deep_research_user", default=None
 )
-_model_var: contextvars.ContextVar = contextvars.ContextVar(
+_model_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
     "deep_research_model", default=None
 )
-_request_var: contextvars.ContextVar = contextvars.ContextVar(
+_request_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
     "deep_research_request", default=None
 )
-_conv_id_var: contextvars.ContextVar = contextvars.ContextVar(
+_conv_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "deep_research_conv_id", default=None
 )
-_chat_id_var: contextvars.ContextVar = contextvars.ContextVar(
+_chat_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "deep_research_chat_id", default=None
 )
-_is_pdf_var: contextvars.ContextVar = contextvars.ContextVar(
+_is_pdf_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "deep_research_is_pdf", default=False
 )
-_research_date_var: contextvars.ContextVar = contextvars.ContextVar(
+_research_date_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "deep_research_date", default=None
 )
-_trajectory_var: contextvars.ContextVar = contextvars.ContextVar(
+_trajectory_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
     "deep_research_trajectory", default=None
 )
-_seen_subtopics_var: contextvars.ContextVar = contextvars.ContextVar(
+_seen_subtopics_var: contextvars.ContextVar[Optional[Set[str]]] = contextvars.ContextVar(
     "deep_research_seen_subtopics", default=None
 )
-_seen_sections_var: contextvars.ContextVar = contextvars.ContextVar(
+_seen_sections_var: contextvars.ContextVar[Optional[Set[str]]] = contextvars.ContextVar(
     "deep_research_seen_sections", default=None
 )
 
 
-def _ctxvar_prop(var: contextvars.ContextVar) -> property:
+def _ctxvar_prop(var: contextvars.ContextVar[Any]) -> property:
     """Build a property descriptor that reads/writes a module-level ContextVar.
 
     This preserves `self.foo` access patterns across ~150 method bodies while
@@ -297,7 +311,7 @@ class _LRUBytesBoundedCache:
     _PER_ENTRY_OVERHEAD = 512
 
     def __init__(self, max_bytes: int, max_entries: int = 50_000):
-        self._od: collections.OrderedDict = collections.OrderedDict()
+        self._od: collections.OrderedDict[str, np.ndarray] = collections.OrderedDict()
         self._max_bytes = int(max_bytes)
         self._max_entries = int(max_entries)
         self._bytes = 0
@@ -337,7 +351,7 @@ class _LRUBytesBoundedCache:
                 self._bytes -= self._entry_bytes(evicted)
                 self.eviction_count += 1
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict[str, float | int]:
         total = self.hit_count + self.miss_count
         return {
             "entries": len(self._od),
@@ -576,10 +590,6 @@ class Pipe:
         )
         SYNTHESIS_TEMPERATURE: float = Field(
             default=0.6, description="Temperature for final synthesis", ge=0.0, le=2.0
-        )
-        SEARCH_URL: str = Field(
-            default="http://192.168.1.1:8888/search?q=",
-            description="URL for web search API",
         )
         MAX_FAILED_RESULTS: int = Field(
             default=6,
@@ -833,6 +843,17 @@ class Pipe:
         # conversation ids, is_pdf, research_date, trajectory accumulator,
         # _seen_{subtopics,sections}) lives in module-level ContextVars and
         # is set at the top of pipe().
+
+    def _require_request(self, context: str) -> Optional[Any]:
+        """Return the per-call OWUI Request object or log a clear failure."""
+        req = self.__request__
+        if req is None:
+            logger.error(
+                f"Missing __request__ context in {context}; "
+                "this path requires an OWUI chat invocation"
+            )
+            return None
+        return req
 
     async def initialize_research_state(
         self,
@@ -1261,17 +1282,28 @@ class Pipe:
         """
         try:
             from io import BytesIO
+            from importlib import import_module
 
             from fastapi import UploadFile
-            from open_webui.internal.db import get_async_db_context
             from open_webui.models.knowledge import Knowledges
             from open_webui.routers.files import upload_file_handler
             from open_webui.routers.retrieval import ProcessFileForm, process_file
+            db_mod = import_module("open_webui.internal.db")
+            get_async_db_context = getattr(db_mod, "get_async_db_context", None)
+            if get_async_db_context is None:
+                logger.error(
+                    "Open WebUI get_async_db_context is unavailable; "
+                    "cannot process uploaded markdown into knowledge base"
+                )
+                return None
         except Exception as e:
             logger.error(f"Open WebUI file/knowledge modules unavailable: {e}")
             return None
 
         try:
+            req = self._require_request("_upload_markdown_to_kb")
+            if req is None:
+                return None
             payload = markdown_text.encode("utf-8", errors="replace")
             uf = UploadFile(filename=filename, file=BytesIO(payload))
             try:
@@ -1285,7 +1317,7 @@ class Pipe:
             upload_meta.setdefault("size", len(payload))
 
             result = await upload_file_handler(
-                request=self.__request__,
+                request=req,
                 file=uf,
                 metadata=upload_meta,
                 process=True,
@@ -1312,7 +1344,7 @@ class Pipe:
             async with get_async_db_context() as db:
                 try:
                     await process_file(
-                        request=self.__request__,
+                        request=req,
                         form_data=ProcessFileForm(
                             file_id=file_id, collection_name=kb_id
                         ),
@@ -2941,7 +2973,7 @@ class Pipe:
         # ------------------------------------------------------------------ #
         selected: List[Dict[str, Any]] = []
         used_tokens = 0
-        covered_sections: set = set()
+        covered_sections: Set[str] = set()
 
         # For each section pick the top min_chunks_per_section chunks
         from collections import defaultdict
@@ -3083,7 +3115,7 @@ class Pipe:
         self,
         user_message: str,
         sections: Dict[str, str],
-        bibliography: List[Any],
+        bibliography: List[BibliographyEntry],
         input_budget: int,
     ) -> str:
         """Context for abstract: query + section coverage + source count."""
@@ -4747,10 +4779,12 @@ class Pipe:
 
     # ------------------------------------------------------------------
     # Primary extraction layer (Open WebUI-backed) — see fetch_content().
-    # These helpers try Open WebUI's configured Web Loader / document
-    # extraction engine first; the legacy extract_text_from_html,
-    # extract_text_from_pdf, and fetch_from_archive methods below remain
-    # as fallback / rescue paths.
+    # HTML URLs go exclusively through Open WebUI's Web Loader; there is
+    # no HTML fallback. extract_text_from_pdf and fetch_from_archive
+    # remain as non-web rescue paths (PDF text extraction backup +
+    # archived-page recovery). extract_text_from_html is retained because
+    # it is used by POST_CLEAN_PRIMARY_OUTPUT and by fetch_from_archive
+    # for HTML archive content.
     # ------------------------------------------------------------------
 
     async def _openwebui_extraction_available(self, kind: str) -> bool:
@@ -4848,7 +4882,7 @@ class Pipe:
             return False
         return True
 
-    def _build_document_loader_kwargs(self) -> dict:
+    def _build_document_loader_kwargs(self) -> Dict[str, Any]:
         """Best-effort gather of Open WebUI document loader configuration.
 
         The Loader class accepts an engine name plus a wide set of engine
@@ -4902,7 +4936,7 @@ class Pipe:
                 pass
         return kwargs
 
-    async def _primary_web_extract(self, url: str) -> Optional[dict]:
+    async def _primary_web_extract(self, url: str) -> Optional[Dict[str, Any]]:
         """Run Open WebUI's configured Web Loader for a single URL.
 
         Returns a normalized dict {"text", "title", "source_type",
@@ -5112,7 +5146,7 @@ class Pipe:
         logger.info(f"Using legacy PDF extractor for {url}")
         return await self.extract_text_from_pdf(pdf_content)
 
-    async def _register_primary_source(self, url: str, result: dict) -> None:
+    async def _register_primary_source(self, url: str, result: Dict[str, Any]) -> None:
         """Write a successful primary-path extraction into cache and source table.
 
         This is the single shared registration point for the primary web
@@ -5178,15 +5212,15 @@ class Pipe:
                 logger.warning(f"KB persistence failed for {url}: {e}")
 
     async def _try_primary_web_flow(self, url: str) -> Optional[str]:
-        """Top-of-fetch_content entry point for the primary web path.
+        """Try Open WebUI's Web Loader for an HTML URL.
 
-        For HTML-classified URLs, tries Open WebUI's Web Loader; on
-        acceptance, optionally post-cleans with the legacy HTML
-        extractor, registers the source, writes the cache, updates
-        is_pdf_content, and returns the extracted text. Returns None to
-        signal "fall through to legacy fetch" in every other case
-        (unsupported URL shape, disabled by valves, capability missing,
-        loader error, or quality-gate rejection).
+        Returns the extracted text on success (cache + master_source_table +
+        KB persistence handled via _register_primary_source). Returns None
+        when the URL is not HTML-classified, the primary path is disabled
+        by valves, the Web Loader capability is unavailable, the loader
+        errors out, or the result fails the quality gate. fetch_content
+        treats a None return as a hard failure for HTML URLs and surfaces
+        an error string to its caller — no legacy HTML fetch is attempted.
         """
         if not (
             self.valves.USE_OPENWEBUI_EXTRACTION and self.valves.PRIMARY_WEB_EXTRACTION
@@ -5208,7 +5242,7 @@ class Pipe:
         if not self._check_extraction_quality(text):
             logger.info(
                 f"Primary web extraction rejected by quality gate for {url}; "
-                f"falling back to legacy fetch"
+                f"returning no usable content"
             )
             return None
 
@@ -5230,12 +5264,14 @@ class Pipe:
         return text
 
     async def extract_text_from_html(self, html_content: str) -> str:
-        """Fallback HTML text extractor (BeautifulSoup / regex).
+        """HTML->text extractor used by retained code paths.
 
-        This is the rescue path used when Open WebUI's Web Loader is
-        unavailable, errors out, or returns output that fails the
-        quality gate. It is also used as optional post-cleaning when
-        POST_CLEAN_PRIMARY_OUTPUT is enabled.
+        After the legacy HTML fetch was removed from fetch_content, this
+        method is only invoked from:
+          - _try_primary_web_flow when POST_CLEAN_PRIMARY_OUTPUT is enabled,
+          - fetch_from_archive for archived HTML pages.
+        It remains a BeautifulSoup-then-regex extractor; it is not a fallback
+        for live HTML fetching.
         """
         try:
             # Try BeautifulSoup if available
@@ -5458,46 +5494,20 @@ class Pipe:
             except Exception:
                 return html_content
 
-    async def fetch_content(self, url: str) -> str:
-        """Fetch and extract content for a URL.
+    async def _fetch_pdf_via_legacy_download(self, url: str) -> str:
+        """Download and extract PDF content using the retained legacy path.
 
-        Orchestrates three extraction planes:
-          1. cache short-circuit (url_results_cache),
-          2. primary path — Open WebUI's configured Web Loader / document
-             extraction engine (controlled by the USE_OPENWEBUI_EXTRACTION
-             and PRIMARY_* valves),
-          3. fallback path — the legacy aiohttp fetch with custom HTML
-             cleanup, custom PDF extraction, and archive.org rescue.
-        The legacy path also handles anti-blocking (fake UAs, EZproxy-like
-        headers, per-domain cookies and rate limiting) and content-type
-        based PDF detection that the primary Web Loader alone does not.
+        This helper is used only for PDF-classified URLs. It keeps the
+        anti-blocking machinery (rate limiting, randomized user-agent,
+        spoofed headers/cookies/referrers), supports archive rescue on
+        HTTP 403/271, and routes bytes through
+        _extract_pdf_with_primary_fallback.
         """
         try:
             state = self.get_state()
-            url_considered_count = state.get("url_considered_count", {})
             url_results_cache = state.get("url_results_cache", {})
             master_source_table = state.get("master_source_table", {})
             domain_session_map = state.get("domain_session_map", {})
-
-            # Add to considered URLs counter
-            url_considered_count[url] = url_considered_count.get(url, 0) + 1
-            self.update_state("url_considered_count", url_considered_count)
-
-            # Check if URL is in cache and use that if available
-            if url in url_results_cache:
-                logger.info(f"Using cached content for URL: {url}")
-                return url_results_cache[url]
-
-            # Primary extraction plane: for HTML-classified URLs, try Open
-            # WebUI's configured Web Loader first. PDF-classified URLs fall
-            # through and get routed through the primary document extractor
-            # inside _extract_pdf_with_primary_fallback once bytes are
-            # downloaded by the legacy fetch below.
-            primary_text = await self._try_primary_web_flow(url)
-            if primary_text is not None:
-                return primary_text
-
-            logger.debug(f"Using direct fetch for URL: {url}")
 
             # Extract domain for session management and tracking
             from urllib.parse import urlparse
@@ -5635,9 +5645,6 @@ class Pipe:
             # Create connector with SSL verification disabled and keep session open
             connector = aiohttp.TCPConnector(verify_ssl=False, force_close=True)
 
-            # Check if URL appears to be a PDF
-            is_pdf = url.lower().endswith(".pdf")
-
             # Stored cookies are always a dict — either the spoofed-cookie
             # literal set above or a SimpleCookie returned by
             # session.cookie_jar.filter_cookies, which subclasses dict.
@@ -5647,389 +5654,105 @@ class Pipe:
             async with aiohttp.ClientSession(
                 connector=connector, cookies=cookie_dict
             ) as session:
-                if is_pdf:
-                    # Use binary mode for PDFs
-                    async with session.get(
-                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)
-                    ) as response:
-                        # Store cookies for future requests
-                        if domain in domain_session_map:
-                            domain_session_map[domain]["cookies"] = (
-                                session.cookie_jar.filter_cookies(yarl.URL(url))
-                            )
-                            self.update_state("domain_session_map", domain_session_map)
+                # Use binary mode for PDFs
+                async with session.get(
+                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)
+                ) as response:
+                    # Store cookies for future requests
+                    if domain in domain_session_map:
+                        domain_session_map[domain]["cookies"] = (
+                            session.cookie_jar.filter_cookies(yarl.URL(url))
+                        )
+                        self.update_state("domain_session_map", domain_session_map)
 
-                        if response.status == 200:
-                            # Get PDF content as bytes
-                            pdf_content = await response.read()
-                            self.is_pdf_content = True  # Set the PDF flag
-                            # Route through the primary-then-fallback PDF path:
-                            # Open WebUI's document Loader is tried first, then
-                            # the legacy PyPDF2/pdfplumber extractor.
-                            extracted_content = (
-                                await self._extract_pdf_with_primary_fallback(
-                                    pdf_content, url, "application/pdf"
+                    if response.status == 200:
+                        # Get PDF content as bytes
+                        pdf_content = await response.read()
+                        self.is_pdf_content = True  # Set the PDF flag
+                        # Route through the primary-then-fallback PDF path:
+                        # Open WebUI's document Loader is tried first, then
+                        # the legacy PyPDF2/pdfplumber extractor.
+                        extracted_content = await self._extract_pdf_with_primary_fallback(
+                            pdf_content, url, "application/pdf"
+                        )
+
+                        # Limit cached content to 3x MAX_RESULT_TOKENS
+                        if extracted_content:
+                            tokens = await self.count_tokens(extracted_content)
+                            token_limit = self.valves.MAX_RESULT_TOKENS * 3
+                            if tokens > token_limit:
+                                char_limit = int(
+                                    len(extracted_content) * (token_limit / tokens)
                                 )
-                            )
-
-                            # Limit cached content to 3x MAX_RESULT_TOKENS
-                            if extracted_content:
-                                tokens = await self.count_tokens(extracted_content)
-                                token_limit = self.valves.MAX_RESULT_TOKENS * 3
-                                if tokens > token_limit:
-                                    char_limit = int(
-                                        len(extracted_content) * (token_limit / tokens)
-                                    )
-                                    extracted_content_to_cache = extracted_content[
-                                        :char_limit
-                                    ]
-                                    logger.info(
-                                        f"Limiting cached PDF content for URL {url} from {tokens} to {token_limit} tokens"
-                                    )
-                                else:
-                                    extracted_content_to_cache = extracted_content
-
-                                url_results_cache[url] = extracted_content_to_cache
+                                extracted_content_to_cache = extracted_content[
+                                    :char_limit
+                                ]
+                                logger.info(
+                                    f"Limiting cached PDF content for URL {url} from {tokens} to {token_limit} tokens"
+                                )
                             else:
-                                url_results_cache[url] = extracted_content
+                                extracted_content_to_cache = extracted_content
 
-                            self.update_state("url_results_cache", url_results_cache)
-
-                            # Add to master source table
-                            if url not in master_source_table:
-                                title = (
-                                    url.split("/")[-1]
-                                    .replace(".pdf", "")
-                                    .replace("-", " ")
-                                    .replace("_", " ")
-                                )
-                                source_id = f"S{len(master_source_table) + 1}"
-                                master_source_table[url] = {
-                                    "id": source_id,
-                                    "title": title,
-                                    "content_preview": extracted_content[:500],
-                                    "source_type": "pdf",
-                                    "accessed_date": self.research_date,
-                                    "cited_in_sections": set(),
-                                }
-                                self.update_state(
-                                    "master_source_table", master_source_table
-                                )
-
-                            if (
-                                isinstance(extracted_content, str)
-                                and extracted_content.strip()
-                            ):
-                                try:
-                                    await self._persist_selected_source(
-                                        url=url,
-                                        full_text=extracted_content,
-                                        title=master_source_table.get(url, {}).get(
-                                            "title", url
-                                        ),
-                                        source_type="pdf",
-                                        archived=False,
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        f"KB persistence failed for {url}: {e}"
-                                    )
-
-                            return extracted_content
-                        elif response.status == 403 or response.status == 271:
-                            # Try archive.org for 403 errors
-                            logger.info(
-                                f"Received 403 for PDF {url}, trying archive.org"
-                            )
-                            archive_content = await self.fetch_from_archive(
-                                url, session
-                            )
-                            if archive_content:
-                                return archive_content
-
-                            # If archive fallback fails, return original error
-                            logger.error(
-                                f"Error fetching URL {url}: HTTP {response.status} (archive fallback failed)"
-                            )
-                            return (
-                                f"Error fetching content: HTTP status {response.status}"
-                            )
+                            url_results_cache[url] = extracted_content_to_cache
                         else:
-                            logger.error(
-                                f"Error fetching URL {url}: HTTP {response.status}"
-                            )
-                            return (
-                                f"Error fetching content: HTTP status {response.status}"
-                            )
-                else:
-                    # Normal text/HTML mode
-                    async with session.get(
-                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)
-                    ) as response:
-                        # Store cookies for future requests
-                        if domain in domain_session_map:
-                            domain_session_map[domain]["cookies"] = (
-                                session.cookie_jar.filter_cookies(yarl.URL(url))
-                            )
-                            self.update_state("domain_session_map", domain_session_map)
+                            url_results_cache[url] = extracted_content
 
-                        if response.status == 200:
-                            # Check content type in response headers
-                            content_type = response.headers.get(
-                                "Content-Type", ""
-                            ).lower()
+                        self.update_state("url_results_cache", url_results_cache)
 
-                            if "application/pdf" in content_type:
-                                # This is a PDF even though the URL didn't end with .pdf
-                                pdf_content = await response.read()
-                                self.is_pdf_content = True  # Set the PDF flag
-                                # Route through the primary-then-fallback PDF path
-                                # (handles content-type-based PDF detection for
-                                # URLs without a .pdf suffix).
-                                extracted_content = (
-                                    await self._extract_pdf_with_primary_fallback(
-                                        pdf_content, url, "application/pdf"
-                                    )
+                        # Add to master source table
+                        if url not in master_source_table:
+                            title = (
+                                url.split("/")[-1]
+                                .replace(".pdf", "")
+                                .replace("-", " ")
+                                .replace("_", " ")
+                            )
+                            source_id = f"S{len(master_source_table) + 1}"
+                            master_source_table[url] = {
+                                "id": source_id,
+                                "title": title,
+                                "content_preview": extracted_content[:500],
+                                "source_type": "pdf",
+                                "accessed_date": self.research_date,
+                                "cited_in_sections": set(),
+                            }
+                            self.update_state(
+                                "master_source_table", master_source_table
+                            )
+
+                        if isinstance(extracted_content, str) and extracted_content.strip():
+                            try:
+                                await self._persist_selected_source(
+                                    url=url,
+                                    full_text=extracted_content,
+                                    title=master_source_table.get(url, {}).get(
+                                        "title", url
+                                    ),
+                                    source_type="pdf",
+                                    archived=False,
                                 )
+                            except Exception as e:
+                                logger.warning(f"KB persistence failed for {url}: {e}")
 
-                                # Limit cached content to 3x MAX_RESULT_TOKENS
-                                if extracted_content:
-                                    tokens = await self.count_tokens(extracted_content)
-                                    token_limit = self.valves.MAX_RESULT_TOKENS * 3
-                                    if tokens > token_limit:
-                                        char_limit = int(
-                                            len(extracted_content)
-                                            * (token_limit / tokens)
-                                        )
-                                        extracted_content_to_cache = extracted_content[
-                                            :char_limit
-                                        ]
-                                        logger.info(
-                                            f"Limiting cached PDF content for URL {url} from {tokens} to {token_limit} tokens"
-                                        )
-                                    else:
-                                        extracted_content_to_cache = extracted_content
+                        return extracted_content
+                    elif response.status == 403 or response.status == 271:
+                        # Try archive.org for 403 errors
+                        logger.info(f"Received 403 for PDF {url}, trying archive.org")
+                        archive_content = await self.fetch_from_archive(url, session)
+                        if archive_content:
+                            return archive_content
 
-                                    url_results_cache[url] = extracted_content_to_cache
-                                else:
-                                    url_results_cache[url] = extracted_content
-
-                                self.update_state(
-                                    "url_results_cache", url_results_cache
-                                )
-
-                                # Add to master source table
-                                if url not in master_source_table:
-                                    title = url.split("/")[-1]
-                                    if not title or title == "/":
-                                        parsed_url = urlparse(url)
-                                        title = f"PDF from {parsed_url.netloc}"
-
-                                    source_id = f"S{len(master_source_table) + 1}"
-                                    master_source_table[url] = {
-                                        "id": source_id,
-                                        "title": title,
-                                        "content_preview": extracted_content[:500],
-                                        "source_type": "pdf",
-                                        "accessed_date": self.research_date,
-                                        "cited_in_sections": set(),
-                                    }
-                                    self.update_state(
-                                        "master_source_table", master_source_table
-                                    )
-
-                                if (
-                                    isinstance(extracted_content, str)
-                                    and extracted_content.strip()
-                                ):
-                                    try:
-                                        await self._persist_selected_source(
-                                            url=url,
-                                            full_text=extracted_content,
-                                            title=master_source_table.get(url, {}).get(
-                                                "title", url
-                                            ),
-                                            source_type="pdf",
-                                            archived=False,
-                                        )
-                                    except Exception as e:
-                                        logger.warning(
-                                            f"KB persistence failed for {url}: {e}"
-                                        )
-
-                                return extracted_content
-
-                            # Handle as normal HTML/text
-                            content = await response.text()
-                            self.is_pdf_content = False  # Clear the PDF flag
-                            if (
-                                self.valves.EXTRACT_CONTENT_ONLY
-                                and content.strip().startswith("<")
-                            ):
-                                extracted = await self.extract_text_from_html(content)
-
-                                # Limit cached content to 3x MAX_RESULT_TOKENS
-                                if extracted:
-                                    tokens = await self.count_tokens(extracted)
-                                    token_limit = self.valves.MAX_RESULT_TOKENS * 3
-                                    if tokens > token_limit:
-                                        char_limit = int(
-                                            len(extracted) * (token_limit / tokens)
-                                        )
-                                        extracted_to_cache = extracted[:char_limit]
-                                        logger.info(
-                                            f"Limiting cached HTML content for URL {url} from {tokens} to {token_limit} tokens"
-                                        )
-                                    else:
-                                        extracted_to_cache = extracted
-
-                                    url_results_cache[url] = extracted_to_cache
-                                else:
-                                    url_results_cache[url] = extracted
-
-                                self.update_state(
-                                    "url_results_cache", url_results_cache
-                                )
-
-                                # Add to master source table
-                                if url not in master_source_table:
-                                    # Try to extract title
-                                    title = url
-                                    title_match = re.search(
-                                        r"<title>(.*?)</title>",
-                                        content,
-                                        re.IGNORECASE | re.DOTALL,
-                                    )
-                                    if title_match:
-                                        title = title_match.group(1).strip()
-                                    else:
-                                        # Use domain as title
-                                        parsed_url = urlparse(url)
-                                        title = parsed_url.netloc
-
-                                    source_id = f"S{len(master_source_table) + 1}"
-                                    master_source_table[url] = {
-                                        "id": source_id,
-                                        "title": title,
-                                        "content_preview": extracted[:500],
-                                        "source_type": "web",
-                                        "accessed_date": self.research_date,
-                                        "cited_in_sections": set(),
-                                    }
-                                    self.update_state(
-                                        "master_source_table", master_source_table
-                                    )
-
-                                if isinstance(extracted, str) and extracted.strip():
-                                    try:
-                                        await self._persist_selected_source(
-                                            url=url,
-                                            full_text=extracted,
-                                            title=master_source_table.get(url, {}).get(
-                                                "title", url
-                                            ),
-                                            source_type="web",
-                                            archived=False,
-                                        )
-                                    except Exception as e:
-                                        logger.warning(
-                                            f"KB persistence failed for {url}: {e}"
-                                        )
-
-                                return extracted
-
-                            # Limit cached content to 3x MAX_RESULT_TOKENS
-                            if isinstance(content, str):
-                                tokens = await self.count_tokens(content)
-                                token_limit = self.valves.MAX_RESULT_TOKENS * 3
-                                if tokens > token_limit:
-                                    char_limit = int(
-                                        len(content) * (token_limit / tokens)
-                                    )
-                                    content_to_cache = content[:char_limit]
-                                    logger.info(
-                                        f"Limiting cached content for URL {url} from {tokens} to {token_limit} tokens"
-                                    )
-                                else:
-                                    content_to_cache = content
-
-                                url_results_cache[url] = content_to_cache
-                            else:
-                                url_results_cache[url] = content
-
-                            self.update_state("url_results_cache", url_results_cache)
-
-                            # Add to master source table
-                            if url not in master_source_table:
-                                # Try to extract title
-                                title = url
-                                title_match = re.search(
-                                    r"<title>(.*?)</title>",
-                                    content,
-                                    re.IGNORECASE | re.DOTALL,
-                                )
-                                if title_match:
-                                    title = title_match.group(1).strip()
-                                else:
-                                    # Use domain as title
-                                    parsed_url = urlparse(url)
-                                    title = parsed_url.netloc
-
-                                source_id = f"S{len(master_source_table) + 1}"
-                                master_source_table[url] = {
-                                    "id": source_id,
-                                    "title": title,
-                                    "content_preview": content[:500],
-                                    "source_type": "web",
-                                    "accessed_date": self.research_date,
-                                    "cited_in_sections": set(),
-                                }
-                                self.update_state(
-                                    "master_source_table", master_source_table
-                                )
-
-                            if isinstance(content, str) and content.strip():
-                                try:
-                                    await self._persist_selected_source(
-                                        url=url,
-                                        full_text=content,
-                                        title=master_source_table.get(url, {}).get(
-                                            "title", url
-                                        ),
-                                        source_type="web",
-                                        archived=False,
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        f"KB persistence failed for {url}: {e}"
-                                    )
-
-                            return content
-                        elif response.status == 403 or response.status == 271:
-                            # Try archive.org for 403 errors
-                            logger.info(
-                                f"Received 403 for URL {url}, trying archive.org"
-                            )
-                            archive_content = await self.fetch_from_archive(
-                                url, session
-                            )
-                            if archive_content:
-                                return archive_content
-
-                            # If archive fallback fails, return original error
-                            logger.error(
-                                f"Error fetching URL {url}: HTTP {response.status} (archive fallback failed)"
-                            )
-                            return (
-                                f"Error fetching content: HTTP status {response.status}"
-                            )
-                        else:
-                            logger.error(
-                                f"Error fetching URL {url}: HTTP {response.status}"
-                            )
-                            return (
-                                f"Error fetching content: HTTP status {response.status}"
-                            )
+                        # If archive fallback fails, return original error
+                        logger.error(
+                            f"Error fetching URL {url}: HTTP {response.status} (archive fallback failed)"
+                        )
+                        return (
+                            f"Error fetching content: HTTP status {response.status} "
+                            f"(archive fallback failed)"
+                        )
+                    else:
+                        logger.error(f"Error fetching URL {url}: HTTP {response.status}")
+                        return f"Error fetching content: HTTP status {response.status}"
 
         except asyncio.TimeoutError:
             logger.error(f"Timeout fetching content from {url}")
@@ -6044,15 +5767,62 @@ class Pipe:
             logger.error(f"Error fetching content from {url}: {e}")
             return f"Error fetching content: {str(e)}"
 
-    async def fetch_from_archive(self, url: str, session=None) -> str:
-        """Fallback archive rescue path (Internet Archive / Wayback Machine).
+    async def fetch_content(self, url: str) -> str:
+        """Fetch and extract content for a URL.
 
-        Only invoked by fetch_content when a live request is blocked
-        (HTTP 403 / 271 etc.). Archived sources are marked with
-        ``archived=True`` in master_source_table. PDF content recovered
-        from the archive is routed through
-        _extract_pdf_with_primary_fallback so it still benefits from the
-        primary document extraction path when available.
+        Routing planes:
+          1. cache short-circuit (url_results_cache),
+          2. HTML URLs go through Open WebUI's configured Web Loader via
+             _try_primary_web_flow. There is no HTML fallback path — if
+             OWUI extraction returns nothing usable, this method returns
+             an error string so callers can skip the result,
+          3. PDF URLs (suffix-based classification) go through
+             _fetch_pdf_via_legacy_download, which retains the per-domain
+             anti-blocking machinery and routes the downloaded bytes
+             through Open WebUI's document Loader (with PyPDF2/pdfplumber
+             as a non-web rescue) and supports 403/271 archive rescue.
+        """
+        try:
+            state = self.get_state()
+            url_considered_count = state.get("url_considered_count", {})
+            url_results_cache = state.get("url_results_cache", {})
+
+            # Add to considered URLs counter
+            url_considered_count[url] = url_considered_count.get(url, 0) + 1
+            self.update_state("url_considered_count", url_considered_count)
+
+            # Check if URL is in cache and use that if available
+            if url in url_results_cache:
+                logger.info(f"Using cached content for URL: {url}")
+                return url_results_cache[url]
+
+            url_kind = self._classify_url(url)
+            if url_kind == "html":
+                primary_text = await self._try_primary_web_flow(url)
+                if primary_text is not None:
+                    return primary_text
+                logger.warning(
+                    f"OWUI Web Loader returned no usable content for {url}; "
+                    f"no HTML fallback configured"
+                )
+                return f"Error fetching content: OWUI extraction failed for {url}"
+
+            # PDF (or anything else _classify_url labels non-HTML): keep the
+            # download + extraction path that powers archive rescue too.
+            return await self._fetch_pdf_via_legacy_download(url)
+
+        except Exception as e:
+            logger.error(f"Error fetching content from {url}: {e}")
+            return f"Error fetching content: {str(e)}"
+
+    async def fetch_from_archive(self, url: str, session=None) -> str:
+        """Wayback Machine rescue for non-HTML URL fetches.
+
+        After the legacy HTML fetch was removed, this is reachable only from
+        _fetch_pdf_via_legacy_download when the PDF host returns HTTP 403 or
+        271. Archived PDFs are routed through _extract_pdf_with_primary_fallback;
+        archived HTML pages (rare here since HTML extraction goes through
+        OWUI Web Loader) still use extract_text_from_html.
         """
         try:
             # Construct Wayback Machine URL
@@ -6815,14 +6585,13 @@ class Pipe:
                 "valid": False,
             }
 
-    async def _try_openwebui_search(self, query: str) -> List[Dict[str, Any]]:
-        """Try to use Open WebUI's built-in search functionality.
+    async def _try_openwebui_search(
+        self, query: str, total_results: int
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Call Open WebUI's integrated web search.
 
-        OWUI's SearchForm now requires `queries: List[str]` (plural) and
-        process_web_search returns either:
-          - bypass branch: {"docs": [{"content","metadata"}...], "filenames":[urls], "items":[...]}
-          - default branch: {"collection_names":[name], "filenames":[urls], "items":[...]}
-        We normalize both into the {title,url,snippet} shape the pipe expects.
+        Returns (results, failure_reason), where None means the call completed
+        and a string means the OWUI search call failed.
         """
         try:
             from open_webui.routers.retrieval import SearchForm, process_web_search
@@ -6830,31 +6599,20 @@ class Pipe:
             search_form = SearchForm(queries=[query])
 
             logger.debug(f"Executing built-in search with query: {query}")
+            req = self._require_request("_try_openwebui_search")
+            if req is None:
+                return [], "missing_request_context"
 
             search_task = asyncio.create_task(
-                process_web_search(self.__request__, search_form, user=self.__user__)
+                process_web_search(req, search_form, user=self.__user__)
             )
             search_results = await asyncio.wait_for(search_task, timeout=15.0)
 
             logger.debug(f"Search results received: {type(search_results)}")
             results: List[Dict[str, Any]] = []
 
-            state = self.get_state()
-            url_selected_count = state.get("url_selected_count", {})
-
-            repeat_count = 0
-            for url, count in url_selected_count.items():
-                if count >= self.valves.REPEATS_BEFORE_EXPANSION:
-                    repeat_count += 1
-
-            base_results = self.valves.SEARCH_RESULTS_PER_QUERY
-            additional_results = min(repeat_count, self.valves.EXTRA_RESULTS_PER_QUERY)
-            total_results = (
-                base_results + self.valves.EXTRA_RESULTS_PER_QUERY + additional_results
-            )
-
             if not search_results:
-                return results
+                return results, None
             sr: dict[str, Any] = search_results  # type: ignore[assignment]
 
             urls = sr.get("filenames") or []
@@ -6908,176 +6666,31 @@ class Pipe:
                         }
                     )
 
-            return results
+            return results, None
 
         except asyncio.TimeoutError:
             logger.error(f"OpenWebUI search timed out for query: {query}")
-            return []
+            return [], "timeout"
         except Exception as e:
             logger.error(f"Error in _try_openwebui_search: {str(e)}")
-            return []
-
-    async def _fallback_search(self, query: str) -> List[Dict[str, Any]]:
-        """Fallback search method using direct HTTP request to search API with HTML parsing support"""
-        try:
-            # URL encode the query for safer search
-            from urllib.parse import quote
-
-            encoded_query = quote(query)
-            search_url = f"{self.valves.SEARCH_URL}{encoded_query}"
-
-            logger.debug(f"Using fallback search with URL: {search_url}")
-
-            # Get state for URL tracking
-            state = self.get_state()
-            url_selected_count = state.get("url_selected_count", {})
-
-            # Calculate additional results to fetch based on repeat counts
-            repeat_count = 0
-            for url, count in url_selected_count.items():
-                if count >= self.valves.REPEATS_BEFORE_EXPANSION:
-                    repeat_count += 1
-
-            # Calculate total results to fetch
-            base_results = self.valves.SEARCH_RESULTS_PER_QUERY
-            additional_results = min(repeat_count, self.valves.EXTRA_RESULTS_PER_QUERY)
-            total_results = (
-                base_results + self.valves.EXTRA_RESULTS_PER_QUERY + additional_results
-            )
-
-            connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                # Set a timeout for this request
-                async with session.get(
-                    search_url, timeout=aiohttp.ClientTimeout(total=15)
-                ) as response:
-                    if response.status == 200:
-                        # First try to parse as JSON
-                        try:
-                            search_json = await response.json()
-                            results = []
-
-                            if isinstance(search_json, list):
-                                for i, item in enumerate(search_json[:total_results]):
-                                    results.append(
-                                        {
-                                            "title": item.get(
-                                                "title", f"Result {i + 1}"
-                                            ),
-                                            "url": item.get("url", ""),
-                                            "snippet": item.get("snippet", ""),
-                                        }
-                                    )
-                                return results
-                            elif (
-                                isinstance(search_json, dict)
-                                and "results" in search_json
-                            ):
-                                for i, item in enumerate(
-                                    search_json["results"][:total_results]
-                                ):
-                                    results.append(
-                                        {
-                                            "title": item.get(
-                                                "title", f"Result {i + 1}"
-                                            ),
-                                            "url": item.get("url", ""),
-                                            "snippet": item.get("snippet", ""),
-                                        }
-                                    )
-                                return results
-                        except (json.JSONDecodeError, aiohttp.ContentTypeError):
-                            # If JSON parsing fails, try HTML parsing with BeautifulSoup
-                            logger.info(
-                                "JSON parsing failed, trying HTML parsing for search results"
-                            )
-                            try:
-                                from bs4 import BeautifulSoup
-
-                                html_content = await response.text()
-                                soup = BeautifulSoup(html_content, "html.parser")
-
-                                results = []
-                                # Parse SearXNG result elements
-                                result_elements = soup.select("article.result")
-
-                                for i, element in enumerate(
-                                    result_elements[:total_results]
-                                ):
-                                    try:
-                                        title_element = element.select_one("h3 a")
-                                        url_element = element.select_one("h3 a")
-                                        snippet_element = element.select_one(
-                                            "p.content"
-                                        )
-
-                                        title = (
-                                            title_element.get_text()
-                                            if title_element
-                                            else f"Result {i + 1}"
-                                        )
-                                        url = (
-                                            url_element.get("href")
-                                            if url_element
-                                            else ""
-                                        )
-                                        snippet = (
-                                            snippet_element.get_text()
-                                            if snippet_element
-                                            else ""
-                                        )
-
-                                        results.append(
-                                            {
-                                                "title": title,
-                                                "url": url,
-                                                "snippet": snippet,
-                                            }
-                                        )
-                                    except Exception as e:
-                                        logger.warning(
-                                            f"Error parsing search result {i}: {e}"
-                                        )
-
-                                if results:
-                                    return results
-                                else:
-                                    logger.warning("No results found in HTML parsing")
-                            except ImportError:
-                                logger.warning(
-                                    "BeautifulSoup not available for HTML parsing"
-                                )
-                            except Exception as e:
-                                logger.error(f"Error in HTML parsing: {e}")
-
-                    # If we got this far, the response couldn't be parsed
-                    logger.error(
-                        f"Fallback search returned status code {response.status} but couldn't parse content"
-                    )
-                    return []
-        except asyncio.TimeoutError:
-            logger.error(f"Fallback search timed out for query: {query}")
-            return []
-        except Exception as e:
-            logger.error(f"Error in fallback search: {e}")
-            return []
+            return [], f"error: {e}"
 
     async def search_web(self, query: str) -> List[Dict[str, Any]]:
-        """Perform web search with fallbacks"""
+        """Perform an Open WebUI integrated web search.
+
+        Returns normalized {title, url, snippet} results, or one synthetic
+        "No results" placeholder so downstream processing degrades gracefully.
+        """
         logger.debug(f"Starting web search for query: {query}")
 
-        # Get state for URL tracking
         state = self.get_state()
         url_selected_count = state.get("url_selected_count", {})
 
-        # Calculate additional results to fetch based on repeat counts
-        # Count URLs that have been shown multiple times
         repeat_count = 0
         for url, count in url_selected_count.items():
             if count >= self.valves.REPEATS_BEFORE_EXPANSION:
                 repeat_count += 1
 
-        # Calculate total results to fetch
         base_results = self.valves.SEARCH_RESULTS_PER_QUERY
         additional_results = min(repeat_count, self.valves.EXTRA_RESULTS_PER_QUERY)
         total_results = (
@@ -7088,25 +6701,22 @@ class Pipe:
             f"Requesting {total_results} search results (added {additional_results} due to repeats)"
         )
 
-        # First try OpenWebUI search
-        results = await self._try_openwebui_search(query)
+        results, failure_reason = await self._try_openwebui_search(query, total_results)
 
-        # If that failed, try fallback search
-        if not results:
-            logger.debug(
-                f"OpenWebUI search returned no results, trying fallback search for: {query}"
-            )
-            results = await self._fallback_search(query)
-
-        # If we got results, return them
         if results:
             logger.debug(
                 f"Search successful, found {len(results)} results for: {query}"
             )
             return results
 
-        # No results - create a minimal result to continue
-        logger.warning(f"No search results found for query: {query}")
+        if failure_reason is not None:
+            logger.warning(
+                f"OpenWebUI search failed ({failure_reason}) for query: {query}; returning synthetic placeholder"
+            )
+        else:
+            logger.info(
+                f"OpenWebUI search returned no results for query: {query}; returning synthetic placeholder"
+            )
         return [
             {
                 "title": f"No results for '{query}'",
@@ -7834,12 +7444,22 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
         max_retries = 3
         retry_delay = 5.0
+        req = self._require_request("generate_completion")
+        if req is None:
+            raise CompletionError(
+                model=model,
+                original=RuntimeError(
+                    "Missing __request__ context for generate_chat_completions"
+                ),
+                attempts=0,
+                transient_reason=None,
+            )
 
         for attempt in range(max_retries):
             try:
                 response = await asyncio.wait_for(
                     generate_chat_completions(
-                        self.__request__,
+                        req,
                         form_data,
                         user=self.__user__,
                     ),
@@ -7880,7 +7500,10 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
     async def emit_message(self, message: str):
         """Emit a message to the client"""
         try:
-            await self.__current_event_emitter__(
+            emitter = self.__current_event_emitter__
+            if emitter is None:
+                return
+            await emitter(
                 {"type": "message", "data": {"content": message}}
             )
         except Exception as e:
@@ -7891,7 +7514,10 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         """Emit a status message to the client"""
         try:
             status = "complete" if done else "in_progress"
-            await self.__current_event_emitter__(
+            emitter = self.__current_event_emitter__
+            if emitter is None:
+                return
+            await emitter(
                 {
                     "type": "status",
                     "data": {
@@ -7923,7 +7549,10 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         if not self.valves.ENABLE_PROGRESS_EMBED:
             return
         try:
-            await self.__current_event_emitter__(
+            emitter = self.__current_event_emitter__
+            if emitter is None:
+                return
+            await emitter(
                 {"type": "embeds", "data": {"embeds": [html_content]}}
             )
         except Exception as e:
@@ -10616,7 +10245,11 @@ new ResizeObserver(reportHeight).observe(document.body);
             # Return original content on error
             return combined_content
 
-    async def generate_bibliography(self, master_source_table, global_citation_map):
+    async def generate_bibliography(
+        self,
+        master_source_table: Dict[str, Dict[str, Any]],
+        global_citation_map: Dict[str, int],
+    ) -> BibliographyData:
         """Generate a bibliography using sequential numbering based on actual citations in the report"""
         if not master_source_table:
             return {
@@ -10647,9 +10280,9 @@ new ResizeObserver(reportHeight).observe(document.body);
         sorted_urls = sorted(cited_urls.items(), key=lambda x: x[1])
 
         # Create bibliography entries based on cited sources only
-        bibliography = []
-        url_to_global_id = {}
-        title_to_global_id = {}
+        bibliography: List[BibliographyEntry] = []
+        url_to_global_id: Dict[str, int] = {}
+        title_to_global_id: Dict[str, int] = {}
 
         # Use the sequential numbers already assigned in global_citation_map
         for url, global_id in sorted_urls:
@@ -10688,7 +10321,7 @@ new ResizeObserver(reportHeight).observe(document.body);
             "url_to_global_id": url_to_global_id,
         }
 
-    async def format_bibliography_list(self, bibliography):
+    async def format_bibliography_list(self, bibliography: List[BibliographyEntry]) -> str:
         """Format the bibliography as a numbered list"""
         if not bibliography:
             return "No sources were referenced in this research."
@@ -11388,7 +11021,7 @@ new ResizeObserver(reportHeight).observe(document.body);
                 all_edits.extend(window_edits)
 
             # Merge: deduplicate, discard empty find_text
-            seen: set = set()
+            seen: Set[Tuple[str, str]] = set()
             merged: List[Dict[str, str]] = []
             for edit in all_edits:
                 find_text = edit.get("find_text", "").strip()
@@ -11850,7 +11483,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         self,
         user_message: str,
         comprehensive_answer: str,
-        bibliography: List[Any],
+        bibliography: List[BibliographyEntry],
         sections: Optional[Dict[str, str]] = None,
     ):
         """Generate an abstract for the research report."""

@@ -16,7 +16,10 @@ dependencies = [
 [dependency-groups]
 dev = [
     "basedpyright>=1.39.2",
-    "open-webui>=0.5",
+    # pipe.py targets the OWUI async-ORM era (>= 0.9.0). 0.9.2 is the
+    # deployment baseline; older OWUI builds have sync ORM and will fail
+    # at awaited Chats/Knowledges/Files/router call sites.
+    "open-webui>=0.9.2",
 ]
 
 [build-system]
