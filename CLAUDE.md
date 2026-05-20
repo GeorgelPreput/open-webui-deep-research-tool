@@ -9,11 +9,31 @@ Two-file repo. Both files implement the same deep research engine (multi-cycle w
 | `pipe.py` | `Pipe` | OWUI **Function** (runs inside OWUI container, shares its asyncio loop and `app.state`) | `async def pipe(self, body, __user__, __event_emitter__, ...)` |
 | `deep_research_pipeline.py` | `Pipeline` | OWUI **Pipelines** plugin (runs in a separate Pipelines container, calls OWUI via REST) | `def pipe(self, user_message, model_id, messages, body) -> Iterator[str]` |
 
-`pipe.py` is **read-only reference** — do not modify it. All active development happens in `deep_research_pipeline.py`.
+`pipe.py` is the **active production code** — it ships as an OWUI Function. `deep_research_pipeline.py` was an attempted port to the OWUI Pipelines runtime; that approach proved a dead end (see "Why the Pipelines port was abandoned" below) and is kept only as historical reference. **Do not put new fixes in `deep_research_pipeline.py`.**
+
+### Why the Pipelines port was abandoned
+
+The Pipelines runtime forces a per-call thread + new-event-loop pattern, decouples the plugin from OWUI's request lifecycle, and prevents direct ORM access for chat persistence (the REST chat endpoints filter by API-key user, so persistence silently fails for chats not owned by that user). Cumulative friction made it not worth maintaining as a parallel implementation. The documentation below is preserved as a reference for how that port worked; do not treat it as a target for new code.
 
 ---
 
-## Architecture: `deep_research_pipeline.py`
+## Concurrency contract (`pipe.py`)
+
+OWUI instantiates `Pipe` once and calls `pipe()` concurrently for every user request. Concurrent invocations are **separate `asyncio.Task` instances on the same event loop** — not separate threads. The concurrency model in `pipe.py` is built on three rules.
+
+**Per-call state lives in module-level `contextvars.ContextVar` instances and is surfaced on `Pipe` via property descriptors.** The list (top of `pipe.py`): event emitter and call hook, `__user__`, `__model__`, `__request__`, `conversation_id`, `chat_id`, `is_pdf_content`, `research_date`, `trajectory_accumulator`, `_seen_subtopics`, `_seen_sections`. Each is declared as a ContextVar at module top and read/written through a `_ctxvar_prop` descriptor. `pipe()` initialises every slot at entry. A bare `self.foo = bar` in `Pipe.__init__` or `pipe()` for new per-call state will silently leak between concurrent users — add a new ContextVar instead.
+
+**Process-shared state lives on `Pipe` directly, guarded by `asyncio.Lock`.** This is limited to: `valves`, `state_manager`, `embedding_cache`, `transformation_cache`, `vocabulary_cache`, `vocabulary_embeddings`, `executor`, plus the locks (`_inflight_lock`, `_vocab_load_lock`, and the per-cache `_lock`) and the inflight set (`_inflight`). `asyncio.Lock` is the right primitive because `pipe.py` runs in OWUI's single event loop. `threading.Lock` is unnecessary; `threading.local` would be **wrong** — all concurrent `pipe()` coroutines share the same thread, so threadlocal slots would be shared, not isolated.
+
+**ContextVars do NOT propagate across `loop.run_in_executor`.** Callables submitted to `self.executor` run in pool worker threads whose ContextVar slots are unrelated to the calling Task's context. Never read per-call attributes (`self.__user__`, `self.conversation_id`, etc.) inside a function passed to `run_in_executor`; pass per-call values in as explicit closure arguments. At present this rule is observed — every executor callable in `pipe.py` captures only local args (`_run_load`, `extract_with_pypdf`, `extract_with_pdfplumber`, `extract_with_bs4`). Audit any new callbacks you add against this rule.
+
+**Same-conversation entry dedupe.** `pipe()` rejects a second invocation for a `conversation_id` already in `self._inflight`. Two concurrent calls on the same conversation would share the `ResearchStateManager` dict and corrupt state through interleaved read-modify-write across `await` boundaries; rather than retrofitting a lock around 60+ state mutation sites, the second invocation is rejected at entry with a notice.
+
+---
+
+## Architecture: `deep_research_pipeline.py` (historical, abandoned)
+
+**Abandoned.** This pipeline is no longer maintained; fixes go in `pipe.py`. The sections below describe how the port worked and what was learned from it. Do not extend or maintain this code.
 
 ### Key structural differences from `pipe.py`
 
@@ -207,34 +227,6 @@ These were wrong in the initial migration and required fixes. Trust these, not t
 
 ---
 
-## Bugs found and fixed during the Pipelines migration
-
-1. **`_kb_search` wrong response shape** — was calling `result.get("results")`. Fixed to unpack `result.get("documents", [[]])[0]` etc. (lists-of-lists).
-
-2. **`_primary_document_extract` wrong content field** — was reading `proc.get("data").get("content")`. Fixed to `proc.get("content")` (top-level field in `process/file` response), with fallback chain to `upload_file` response `data.content` and `get_file` `data.content`.
-
-3. **`generate_completion` hardcoded `stream=False`** — was ignoring caller's `stream` parameter. Fixed to pass through.
-
-4. **`_primary_web_extract` wrong field** — was looking for `documents`/`docs` keys. Fixed to read `result.get("content", "")`.
-
-5. **`user` field in `chat_completions`** — was sending `{"id": user_id}` dict; OpenAI spec requires string. Fixed to send `user_id` string directly.
-
-6. **`messages` not injected into body** — Pipelines framework passes `messages` as a separate argument, but the engine reads it from `body["messages"]`. Added defensive injection at the start of `_run_research_async`.
-
-7. **`DOMAIN_PRIORITY` / `CONTENT_PRIORITY` null validation error** — OWUI admin UI sends empty optional fields as JSON `null`; bare `str` Pydantic type rejects null. Fixed by changing both to `Optional[str]`.
-
-8. **`<details>` block not rendered** — marked tokenizer regex requires `\n` immediately after the opening `>`. Old renderer put `<summary>` on the same line. Fixed by adding the required newlines (see rendering format above).
-
-9. **"Future attached to a different loop"** — aiohttp session created in `on_startup()` was on the framework's main loop; worker threads use their own loops. Fixed by: removing session creation from `on_startup`, creating per-call `OWUIClient` in `_run_research_async`, adding `asyncio.set_event_loop(loop)` in each worker thread.
-
-10. **No streaming output for 9 minutes** — status lines accumulated in memory, only flushed at message events or end-of-run. Fixed with `REASONING_FLUSH_SECONDS` time-based flush in `_push_status_line`.
-
-11. **Final report not shown in QUIET_CHAT_MODE** — `_run_research` returns the report string; Pipelines framework discards return values. Fixed by capturing it in `_run_research_async` and pushing to sink after the last reasoning flush.
-
-12. **Executor not shut down** — `ThreadPoolExecutor` leaked on shutdown. Fixed by adding `self.executor.shutdown(wait=False, cancel_futures=True)` in `on_shutdown`.
-
----
-
 ## Deployment configuration
 
 ### Container setup
@@ -280,41 +272,56 @@ In `routers/openai.py::generate_chat_completion`, the bottom-level `except Excep
 
 ---
 
-## The "LLM disconnect crashes the pipe" investigation (pipe.py era)
+## Current `pipe.py` implementation details worth remembering
 
-### Symptom
-When litellm flakes mid-research, the user sees:
-```
-ERROR | open_webui.routers.openai:generate_chat_completion - Server disconnected
-ERROR | open_webui.main:process_chat - Error processing chat payload: Open WebUI: Server Connection Error
-INFO  | open_webui.utils.session_pool:close_session - Closed shared aiohttp session pool
-WARNING | open_webui.utils.middleware:response_handler - Task was cancelled!
-INFO  | open_webui.main:process_chat - Chat processing was cancelled
-```
-…and the OWUI pod is restarted by Kubernetes. The user's research session is lost.
+### Cache implementation
 
-### Correct diagnosis
-The cascade is a **clean uvicorn shutdown**, not an in-app cancellation triggered by the LLM error:
-- `close_session` is only called from the FastAPI lifespan shutdown hook (verified: exactly one caller at `main.py:740-742`).
-- `kubectl describe pod` showed `Last State: Terminated, Reason: Completed, Exit Code: 0`. Graceful uvicorn exit (SIGTERM → lifespan teardown → exit 0).
-- `middleware.py:5028` is a *handler* for `CancelledError`; it doesn't *cause* the cancellation.
+- Both in-process vector caches now share a byte-bounded LRU base class, `_LRUBytesBoundedCache`.
+- `EmbeddingCache` and `TransformationCache` store dense `numpy.float32` arrays internally and materialize fresh Python `list[float]` values on cache hits. This keeps memory bounded while preserving the external caller contract.
+- Cache keys for text inputs must be process-stable: use `_stable_text_key(text)` rather than Python `hash(...)`. This matters for both plain embedding lookups and transformation cache keys.
+- Cache values are intentionally snapshotted on write and materialized on read. Do not return internal array references or reuse caller-owned mutable inputs directly.
+- Cache eviction is true LRU, not FIFO. Reads update recency via `move_to_end(...)` semantics.
+- Cache sizing is controlled by valves: `EMBEDDING_CACHE_MAX_MB` and `TRANSFORMATION_CACHE_MAX_MB`. These are read in `Pipe.__init__`; applying a new value requires a process restart.
+- Cache stats now reflect actual hits/misses/evictions and byte usage. If you extend stats, keep the semantics aligned with real cache behavior.
 
-Chain: `something sends SIGTERM → uvicorn lifespan shutdown → close_session + all in-flight tasks cancelled → exit 0 → K8s restart per restartPolicy`.
+### Persistent and per-conversation state shape
 
-### Likely root causes (not confirmed)
-1. **Liveness probe timeout** — `compute_semantic_eigendecomposition`, KMeans, vocab embedding lookups block the asyncio event loop past a tight probe timeout.
-2. **Memory pressure** — same heavy work + cached embeddings; eviction can show as `Reason: Completed` rather than `OOMKilled`.
+- `ResearchStateManager` storage for `completed_topics` and `irrelevant_topics` is JSON-safe `list`, not `set`. When `_run_pipeline` needs set operations, it converts those lists to local `set(...)` working copies and converts back to `list(...)` on write-back.
+- The persisted deep-research state saved into chat metadata is still a JSON-shaped structure. New fields intended for persistence must stay JSON-serializable.
+- `conversation_id` is the real conversation identity key. Fresh-state provisioning happens when that id is first seen; there is no longer any `len(messages) <= 2` shortcut for deciding whether a conversation is new.
+- Post-report QA depends on preserving state across short follow-up turns. Any future “new conversation” heuristic based on message count, task type, or short-turn shape is likely wrong unless it keys off actual conversation identity.
+- `research_completed` remains meaningful for follow-up detection, but `emit_status` must derive UI status from the current `done` flag only.
 
-### Diagnostic checks
-```bash
-kubectl get deploy <owui-deploy> -n <ns> -o yaml | grep -A10 -E 'livenessProbe|readinessProbe|resources'
-kubectl top pod <owui-pod> -n <ns> --containers
-kubectl get pod <owui-pod> -n <ns> -w
-```
+### Completion and retry behavior
 
-**Resolution:** moving the pipe to the Pipelines container (separate pod) eliminates the OWUI liveness probe concern entirely — the heavy CPU work no longer runs inside the OWUI uvicorn worker.
+- `Pipe.generate_completion` must distinguish model failure from model output. Terminal failures raise `CompletionError`; they are not converted into completion-shaped payloads.
+- Transient retry classification lives in `_classify_transient_completion_error(...)`. It prefers exception type and HTTP status code inspection, with substring matching only as a fallback.
+- OWUI connection-wrapper failures can surface as `HTTPException` carrying `detail='Open WebUI: Server Connection Error'`; the retry classifier explicitly knows about that wrapper.
+- The front-of-pipeline planning stages are treated as hard dependencies. If initial query or outline generation raises `CompletionError`, the run should abort cleanly rather than continue with placeholder text.
 
----
+### Vocabulary and disk-cache paths
+
+- Deep-research disk caches now live under OWUI's resolved `CACHE_DIR`, inside `CACHE_DIR / "deep_research"`, not under a hardcoded `/app/backend/data/...` path.
+- That applies to both the vocabulary text cache and vocabulary-embedding `.npz` files.
+- If you add new on-disk caches for `pipe.py`, prefer sibling paths under `CACHE_DIR / "deep_research"` so they follow OWUI's resolved data-dir behavior.
+- Vocabulary lazy loading is process-shared and protected by `_vocab_load_lock`; keep any new lazy-init logic for shared vocabulary assets inside that locking pattern.
+
+### Executor and async patterns
+
+- Inside coroutines, use `asyncio.get_running_loop()`, not `asyncio.get_event_loop()`.
+- `run_in_executor` callables must receive all per-call inputs explicitly, because `ContextVar` state does not propagate into executor threads.
+- `asyncio.to_thread(...)` is not a drop-in replacement for existing `run_in_executor(self.executor, ...)` sites when the code relies on the custom executor's concurrency profile.
+
+### Fetching / extraction implementation details
+
+- `fake_useragent.UserAgent()` is initialized once at module import time, with a static fallback UA list if import or provider construction fails. Do not move that work back into `fetch_content`.
+- Domain cookie state used by `fetch_content` is treated as mapping-shaped data; the old alternate conversion path is gone because `SimpleCookie` already behaves like a `dict` for the relevant usage here.
+- Same-domain session reuse in `fetch_content` depends on the existing `domain_session_map` entry being initialized before cookie reuse. Preserve that control-flow assumption if you refactor the method.
+
+### Small but meaningful code-shape rules
+
+- `Pipe.get_research_model` no longer exists; read `self.valves.RESEARCH_MODEL` directly. `get_synthesis_model()` still exists because it contains real fallback logic.
+- Redundant in-function imports already covered by module-top imports were cleaned out. If you add imports inside a function, there should be a concrete reason such as lazy loading, circular-import avoidance, or optional dependency handling.
 
 ## Key takeaways for future Claude sessions
 
@@ -322,13 +329,6 @@ kubectl get pod <owui-pod> -n <ns> -w
 2. **`await asyncio.sleep(...)` inside a retry block is a no-op when the parent task is being cancelled** — `CancelledError` fires immediately.
 3. **Bypassing `generate_chat_completions` loses OWUI semantics** — custom models, pipe-as-model routing, filters, access controls. Don't propose this.
 4. **Pod-restart problems are infrastructure problems**, not pipe code problems. Look at probes / resources first.
-5. **Never create an aiohttp session in `on_startup` for a Pipelines plugin** — it binds to the framework's main loop; worker threads use their own loops. Always create per-call.
-6. **The marked extension tokenizer is strict** — `\n` after `<details ...>` and after `</summary>` are mandatory or the block renders as raw HTML.
-7. **OWUI REST response shapes differ from what you'd guess** — always verify against the installed source in `.venv/lib/python3.11/site-packages/open_webui/routers/`. The shapes in the plan doc and comments can be wrong; the source is authoritative.
-8. **Chat persistence requires API key ownership** — there is no admin bypass for `get_chat_by_id_and_user_id`. The `OWUI_API_KEY` user must own the chat.
-9. **QUIET_CHAT_MODE return values must be explicitly pushed to the sink** — Pipelines discards `pipe()` return values; only yielded strings reach OWUI.
-10. **`/api/embeddings` uses the chat models registry, not the RAG config** — `app.state.MODELS` is checked; the embedding model must be enabled in Admin > Models and its ID must match exactly. Disabled models are invisible to this endpoint even if configured in Documents settings.
-11. **"Model not found" on `/api/chat/completions` or `/api/embeddings`** — check two things: (a) the model ID in the valve uses the correct prefix format for this OWUI instance, and (b) the model is enabled in Admin > Models.
 
 ---
 

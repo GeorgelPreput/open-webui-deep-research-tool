@@ -1,5 +1,7 @@
 import asyncio
+import collections
 import concurrent.futures
+import contextvars
 import hashlib
 import html
 import json
@@ -8,13 +10,14 @@ import math
 import random
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
 import numpy as np
 import tiktoken
 import yarl
+from open_webui.config import CACHE_DIR
 from open_webui.constants import TASKS
 from open_webui.main import generate_chat_completions
 from open_webui.models.users import User
@@ -22,6 +25,26 @@ from pydantic import BaseModel, Field
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
+from starlette.exceptions import HTTPException as _HTTPException
+
+# Optional fake_useragent provider. Constructed once at module import:
+# UserAgent() scans the package's bundled index, so doing it per fetch is
+# wasted work. Catch Exception (not just ImportError) so a bad install or
+# corrupt bundled data falls back to the static list cleanly.
+try:
+    from fake_useragent import UserAgent as _UserAgent
+
+    _ua_provider: Optional[Any] = _UserAgent()
+except Exception:
+    _ua_provider = None
+
+_FALLBACK_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/123.0.0.0 Safari/537.36",
+]
 
 name = "Deep Research"
 
@@ -44,86 +67,330 @@ def setup_logger():
 logger = setup_logger()
 
 
-class EmbeddingCache:
-    """Cache for embeddings to avoid redundant API calls"""
+# ---------------------------------------------------------------------------
+# Per-call state isolation
+#
+# `Pipe` is instantiated once by Open WebUI and `pipe()` is called concurrently
+# for every user/request. Concurrent calls run as separate `asyncio.Task`s on
+# OWUI's single event loop -- NOT as separate threads -- so `threading.local`
+# would not isolate them. `contextvars.ContextVar` is the correct primitive:
+# values are isolated per Task and propagate through `await`,
+# `asyncio.create_task`, and `asyncio.gather`.
+#
+# Each ContextVar below is surfaced on `Pipe` via a `_ctxvar_prop` descriptor,
+# so all the existing `self.foo` reads keep working unchanged. Per-call values
+# are written exactly once at the top of `pipe()`.
+# ---------------------------------------------------------------------------
 
-    def __init__(self, max_size=10000000):
-        self.cache = {}
-        self.max_size = max_size
+_ev_emitter_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_ev_emitter", default=None
+)
+_ev_call_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_ev_call", default=None
+)
+_user_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_user", default=None
+)
+_model_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_model", default=None
+)
+_request_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_request", default=None
+)
+_conv_id_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_conv_id", default=None
+)
+_chat_id_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_chat_id", default=None
+)
+_is_pdf_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_is_pdf", default=False
+)
+_research_date_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_date", default=None
+)
+_trajectory_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_trajectory", default=None
+)
+_seen_subtopics_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_seen_subtopics", default=None
+)
+_seen_sections_var: contextvars.ContextVar = contextvars.ContextVar(
+    "deep_research_seen_sections", default=None
+)
+
+
+def _ctxvar_prop(var: contextvars.ContextVar) -> property:
+    """Build a property descriptor that reads/writes a module-level ContextVar.
+
+    This preserves `self.foo` access patterns across ~150 method bodies while
+    routing the underlying storage through a per-asyncio-Task ContextVar.
+    """
+
+    def fget(self):
+        return var.get()
+
+    def fset(self, value):
+        var.set(value)
+
+    return property(fget, fset)
+
+
+def _snapshot_embedding(emb):
+    """Snapshot an embedding for safe, dense cache storage.
+
+    Returns a caller-owned ``np.ndarray(dtype=float32)``. Accepts a list,
+    tuple, or numpy array. The ``.copy()`` is required so the cache owns
+    its storage and a producer mutating the value it passed to ``set()``
+    cannot corrupt the cache. Returns ``None`` if ``emb`` is ``None`` or
+    empty.
+
+    Float32 storage is ~8x denser than the prior tuple-of-Python-floats
+    representation (~24 B/element + tuple overhead) and is the standard
+    on-disk format for embeddings (see ``np.savez_compressed`` call in
+    ``load_vocabulary_embeddings``). Note: this avoids ``if not emb``
+    because numpy raises on the truthiness of multi-element arrays.
+    """
+    if emb is None:
+        return None
+    try:
+        if len(emb) == 0:
+            return None
+    except TypeError:
+        return None
+    return np.asarray(emb, dtype=np.float32).copy()
+
+
+def _materialize_embedding(stored):
+    """Build a caller-owned ``list[float]`` from a stored snapshot.
+
+    ``ndarray.tolist()`` returns a fresh Python list of Python floats on
+    every call, so consumers can mutate freely without corrupting the
+    cache. Returns ``None`` on cache miss. The ``list[float]`` return
+    type preserves the cache contract that callers see across the
+    ``EmbeddingCache``/``TransformationCache`` boundary.
+    """
+    if stored is None:
+        return None
+    return stored.tolist()
+
+
+def _stable_text_key(text) -> str:
+    """Return a deterministic, collision-resistant cache key for ``text``.
+
+    SHA-256 over the full UTF-8 encoding of the input. Replaces
+    ``hash(text[:2000])`` which was (a) salted per process by
+    PYTHONHASHSEED and (b) truncated, so two inputs sharing a 2000-char
+    prefix collided and the cache silently returned the wrong value.
+
+    Non-``str`` inputs are coerced via ``str()`` so the cache classes
+    can be keyed on heterogeneous transform_id values without raising.
+    """
+    if text is None:
+        text = ""
+    if not isinstance(text, str):
+        text = str(text)
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+# Codes that are always retriable per HTTP semantics, regardless of detail.
+_TRANSIENT_COMPLETION_CODES = frozenset({429, 502, 504})
+
+# OWUI's routers/openai.py wraps aiohttp.ClientError as
+# HTTPException(status_code=r.status if r else 500,
+#               detail='Open WebUI: Server Connection Error').
+# Status code can be 500 (no upstream response) or any code the upstream
+# API returned. Match the detail substring so we still classify
+# correctly even if OWUI tweaks the casing or appends context later.
+_OWUI_TRANSIENT_DETAIL = "open webui: server connection error"
+
+_TRANSIENT_AIOHTTP_TYPES = (
+    aiohttp.ServerDisconnectedError,
+    aiohttp.ClientConnectorError,
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientOSError,
+)
+
+_TRANSIENT_FALLBACK_PHRASES = (
+    "server disconnected",
+    "server connection error",
+    "connection reset",
+    "connection refused",
+)
+
+
+def _classify_transient_completion_error(e: BaseException) -> Optional[str]:
+    """Return a short reason string if `e` is a retriable error, else None.
+
+    Returning a reason (rather than a bare bool) lets callers log
+    *which* branch fired, so upstream wording drift surfaces in logs
+    instead of silently disabling retries.
+    """
+    if isinstance(e, _HTTPException):
+        if e.status_code in _TRANSIENT_COMPLETION_CODES:
+            return f"http_status={e.status_code}"
+        if (
+            e.status_code in {500, 503}
+            and isinstance(e.detail, str)
+            and _OWUI_TRANSIENT_DETAIL in e.detail.lower()
+        ):
+            return f"owui_wrap_status={e.status_code}"
+        return None
+    if isinstance(e, _TRANSIENT_AIOHTTP_TYPES):
+        return f"aiohttp_type={type(e).__name__}"
+    err_str = str(e).lower()
+    for phrase in _TRANSIENT_FALLBACK_PHRASES:
+        if phrase in err_str:
+            # Reaching the substring fallback means our structured checks above
+            # did not match — likely an unknown wrapper type or new upstream
+            # error shape. Logging at the call site makes drift visible.
+            return f"fallback_phrase={phrase!r}"
+    return None
+
+
+class CompletionError(RuntimeError):
+    """Raised when a completion fails non-transiently or exhausts retries."""
+
+    def __init__(
+        self,
+        model: str,
+        original: BaseException,
+        attempts: int,
+        transient_reason: Optional[str],
+    ) -> None:
+        self.model = model
+        self.original = original
+        self.attempts = attempts
+        self.transient_reason = transient_reason
+        kind = (
+            f"transient (reason={transient_reason}) retries exhausted"
+            if transient_reason
+            else "non-transient"
+        )
+        super().__init__(
+            f"Completion failed for model {model!r}: {kind} after "
+            f"{attempts} attempt(s): {type(original).__name__}: {original}"
+        )
+
+
+class _LRUBytesBoundedCache:
+    """OrderedDict-backed LRU cache bounded by bytes and entry count.
+
+    Stores embeddings as ``np.ndarray(dtype=float32)`` (see
+    ``_snapshot_embedding``). Returns caller-owned ``list[float]`` on hit
+    (see ``_materialize_embedding``). All dict mutations run under
+    ``self._lock`` (``asyncio.Lock``) so concurrent ``pipe()`` coroutines
+    can insert and evict safely.
+
+    Eviction policy: true LRU — on a cache hit ``_lru_get`` calls
+    ``move_to_end(key)`` so the most-recently-used entry is always at the
+    back and the least-recently-used is at the front (popped first).
+
+    ``max_entries`` is a belt-and-braces cap that prevents a handful of
+    very-high-dimensional vectors from consuming the whole byte budget and
+    destroying hit-rate for normal-sized embeddings.
+    """
+
+    # CPython 3.11+ overhead per entry: OrderedDict node (~280 B) +
+    # 64-hex SHA-256 key as a Python str (~120 B) + ndarray header (~128 B).
+    # Padded to 512 B to stay conservative as CPython versions evolve.
+    _PER_ENTRY_OVERHEAD = 512
+
+    def __init__(self, max_bytes: int, max_entries: int = 50_000):
+        self._od: collections.OrderedDict = collections.OrderedDict()
+        self._max_bytes = int(max_bytes)
+        self._max_entries = int(max_entries)
+        self._bytes = 0
         self.hit_count = 0
         self.miss_count = 0
-        self.url_token_counts = {}  # Track token counts for URLs
+        self.eviction_count = 0
+        self._lock = asyncio.Lock()
 
-    def get(self, text_key):
-        """Get embedding from cache using text as key"""
-        # Use a hash of the text as the key to limit memory usage
-        key = hash(text_key[:2000])
-        result = self.cache.get(key)
-        if result is not None:
+    def _entry_bytes(self, arr: np.ndarray) -> int:
+        return int(arr.nbytes) + self._PER_ENTRY_OVERHEAD
+
+    async def _lru_get(self, key: str):
+        async with self._lock:
+            arr = self._od.get(key)
+            if arr is None:
+                self.miss_count += 1
+                return None
+            self._od.move_to_end(key)
             self.hit_count += 1
-        return result
+        return _materialize_embedding(arr)
 
-    def set(self, text_key, embedding):
-        """Store embedding in cache"""
-        # Use a hash of the text as the key to limit memory usage
-        key = hash(text_key[:2000])
-        self.cache[key] = embedding
-        self.miss_count += 1
+    async def _lru_set(self, key: str, embedding):
+        snapshot = _snapshot_embedding(embedding)
+        if snapshot is None:
+            return
+        entry_bytes = self._entry_bytes(snapshot)
+        async with self._lock:
+            old = self._od.pop(key, None)
+            if old is not None:
+                self._bytes -= self._entry_bytes(old)
+            self._od[key] = snapshot
+            self._bytes += entry_bytes
+            while (
+                self._bytes > self._max_bytes or len(self._od) > self._max_entries
+            ) and self._od:
+                _, evicted = self._od.popitem(last=False)
+                self._bytes -= self._entry_bytes(evicted)
+                self.eviction_count += 1
 
-        # Simple LRU-like pruning if cache gets too large
-        if len(self.cache) > self.max_size:
-            # Remove a random key as a simple eviction strategy
-            self.cache.pop(next(iter(self.cache)))
-
-    def stats(self):
-        """Return cache statistics"""
+    def stats(self) -> dict:
         total = self.hit_count + self.miss_count
-        hit_rate = self.hit_count / total if total > 0 else 0
         return {
-            "size": len(self.cache),
+            "entries": len(self._od),
+            "bytes": self._bytes,
+            "max_bytes": self._max_bytes,
+            "max_entries": self._max_entries,
             "hits": self.hit_count,
             "misses": self.miss_count,
-            "hit_rate": hit_rate,
+            "evictions": self.eviction_count,
+            "hit_rate": (self.hit_count / total) if total else 0.0,
         }
 
 
-class TransformationCache:
-    """Simple cache for transformed embeddings to avoid redundant transformations"""
+class EmbeddingCache(_LRUBytesBoundedCache):
+    """Content-keyed embedding cache.
 
-    def __init__(self, max_size=2500000):
-        self.cache = {}
-        self.max_size = max_size
-        self.hit_count = 0
-        self.miss_count = 0
+    Process-shared and user-agnostic. Bounded by ``max_bytes`` with LRU
+    eviction and an ``max_entries`` safety cap. See ``_LRUBytesBoundedCache``
+    for storage and concurrency semantics.
+    """
 
-    def get(self, text, transform_id):
-        """Get transformed embedding from cache"""
-        key = f"{hash(text[:2000])}_{hash(str(transform_id))}"
-        result = self.cache.get(key)
-        if result is not None:
-            self.hit_count += 1
-        return result
+    def __init__(self, max_bytes: int, max_entries: int = 50_000):
+        super().__init__(max_bytes=max_bytes, max_entries=max_entries)
 
-    def set(self, text, transform_id, transformed_embedding):
-        """Store transformed embedding in cache"""
-        key = f"{hash(text[:2000])}_{hash(str(transform_id))}"
-        self.cache[key] = transformed_embedding
-        self.miss_count += 1
+    async def get(self, text_key):
+        """Return a fresh ``list[float]`` on hit, ``None`` on miss."""
+        return await self._lru_get(_stable_text_key(text_key))
 
-        # Simple LRU-like pruning if cache gets too large
-        if len(self.cache) > self.max_size:
-            self.cache.pop(next(iter(self.cache)))
+    async def set(self, text_key, embedding):
+        """Store embedding; snapshot is taken so producer mutation is safe."""
+        await self._lru_set(_stable_text_key(text_key), embedding)
 
-    def stats(self):
-        """Return cache statistics"""
-        total = self.hit_count + self.miss_count
-        hit_rate = self.hit_count / total if total > 0 else 0
-        return {
-            "size": len(self.cache),
-            "hits": self.hit_count,
-            "misses": self.miss_count,
-            "hit_rate": hit_rate,
-        }
+
+class TransformationCache(_LRUBytesBoundedCache):
+    """Cache for transformed embeddings; key = text + transform_id.
+
+    Same storage and concurrency model as ``EmbeddingCache``.
+    """
+
+    def __init__(self, max_bytes: int, max_entries: int = 25_000):
+        super().__init__(max_bytes=max_bytes, max_entries=max_entries)
+
+    @staticmethod
+    def _make_key(text, transform_id) -> str:
+        return f"{_stable_text_key(text)}_{_stable_text_key(transform_id)}"
+
+    async def get(self, text, transform_id):
+        """Return a fresh ``list[float]`` on hit, ``None`` on miss."""
+        return await self._lru_get(self._make_key(text, transform_id))
+
+    async def set(self, text, transform_id, transformed_embedding):
+        """Store transformed embedding; snapshot is taken so producer mutation is safe."""
+        await self._lru_set(self._make_key(text, transform_id), transformed_embedding)
 
 
 class ResearchStateManager:
@@ -168,8 +435,8 @@ class ResearchStateManager:
                 "search_history": [],
                 "active_outline": [],
                 "cycle_summaries": [],
-                "completed_topics": set(),
-                "irrelevant_topics": set(),
+                "completed_topics": [],
+                "irrelevant_topics": [],
                 "partial_topics": [],
                 "latest_new_topics": [],
                 "latest_completed_topics": [],
@@ -195,6 +462,22 @@ class ResearchStateManager:
 
 
 class Pipe:
+    # Per-call state, isolated per asyncio.Task via ContextVars. See the
+    # "Per-call state isolation" comment block near the top of this module
+    # for the rationale and the concurrency contract.
+    __current_event_emitter__ = _ctxvar_prop(_ev_emitter_var)
+    __current_event_call__ = _ctxvar_prop(_ev_call_var)
+    __user__ = _ctxvar_prop(_user_var)
+    __model__ = _ctxvar_prop(_model_var)
+    __request__ = _ctxvar_prop(_request_var)
+    conversation_id = _ctxvar_prop(_conv_id_var)
+    chat_id = _ctxvar_prop(_chat_id_var)
+    is_pdf_content = _ctxvar_prop(_is_pdf_var)
+    research_date = _ctxvar_prop(_research_date_var)
+    trajectory_accumulator = _ctxvar_prop(_trajectory_var)
+    _seen_subtopics = _ctxvar_prop(_seen_subtopics_var)
+    _seen_sections = _ctxvar_prop(_seen_sections_var)
+
     class Valves(BaseModel):
         ENABLED: bool = Field(
             default=True,
@@ -415,6 +698,26 @@ class Pipe:
             ge=1,
             le=2,
         )
+        EMBEDDING_CACHE_MAX_MB: int = Field(
+            default=32,
+            description=(
+                "Maximum process-wide RAM (in MiB) for the text→embedding LRU cache. "
+                "Stored as np.float32 vectors; ~5k entries at 1536-dim. "
+                "Read at startup — restart the pod to apply changes."
+            ),
+            ge=4,
+            le=1024,
+        )
+        TRANSFORMATION_CACHE_MAX_MB: int = Field(
+            default=16,
+            description=(
+                "Maximum process-wide RAM (in MiB) for the transformed-embedding LRU cache. "
+                "Stored as np.float32 vectors; ~2.5k entries at 1536-dim. "
+                "Read at startup — restart the pod to apply changes."
+            ),
+            ge=2,
+            le=512,
+        )
 
         # --- Report-level budgeting ---
         RESEARCH_MODEL_CONTEXT_WINDOW: int = Field(
@@ -494,33 +797,42 @@ class Pipe:
         self.type = "manifold"
         self.valves = self.Valves()
 
-        # Injected by Open WebUI before pipe() is called
-        self.__current_event_emitter__: Any = None
-        self.__current_event_call__: Any = None
-        self.__user__: Any = None
-        self.__model__: Any = None
-        self.__request__: Any = None
-
-        # Use state manager to isolate conversation states
+        # Per-conversation research state. Keyed by conversation_id; same-conv
+        # concurrent invocations are rejected at pipe() entry by _inflight.
         self.state_manager = ResearchStateManager()
-        self.conversation_id = None  # Will be set during pipe method
-        self.chat_id: Optional[str] = None  # OWUI chat record id (for persistence)
 
-        # Shared resources (not conversation-specific)
-        self.embedding_cache = EmbeddingCache(max_size=10000000)
-        self.transformation_cache = TransformationCache(max_size=2500000)
+        # Process-shared caches. Content-keyed and user-agnostic. Mutations
+        # are serialised by each cache's own asyncio.Lock.
+        self.embedding_cache = EmbeddingCache(
+            max_bytes=self.valves.EMBEDDING_CACHE_MAX_MB * 1024 * 1024,
+        )
+        self.transformation_cache = TransformationCache(
+            max_bytes=self.valves.TRANSFORMATION_CACHE_MAX_MB * 1024 * 1024,
+        )
+
+        # Process-shared vocab data, lazily loaded under _vocab_load_lock.
         self.vocabulary_cache = None
         self.vocabulary_embeddings = None
-        self.is_pdf_content = False
-        self.research_date = None
-        self.trajectory_accumulator: Optional["TrajectoryAccumulator"] = None
-        self._seen_subtopics: set[str] = set()
-        self._seen_sections: set[str] = set()
+        self._vocab_load_lock = asyncio.Lock()
 
-        self.research_date = datetime.now().strftime("%Y-%m-%d")
+        # Same-conversation entry dedupe. Prevents double-submit / retry-storm
+        # corruption of the conversation's mutable state dict.
+        self._inflight: set[str] = set()
+        self._inflight_lock = asyncio.Lock()
+
+        # Executor for sync/blocking work. NOTE: callables submitted to this
+        # pool run in worker threads whose ContextVar slots are unrelated to
+        # the calling Task's context. Never read per-call attributes
+        # (self.__user__, self.conversation_id, ...) inside a function passed
+        # to run_in_executor; pass per-call values in as explicit arguments.
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.valves.THREAD_WORKERS
         )
+
+        # All per-call state (event emitter, user, model, request, chat and
+        # conversation ids, is_pdf, research_date, trajectory accumulator,
+        # _seen_{subtopics,sections}) lives in module-level ContextVars and
+        # is set at the top of pipe().
 
     async def initialize_research_state(
         self,
@@ -572,8 +884,8 @@ class Pipe:
 
         # Initialize tracking variables
         self.update_state("topic_usage_counts", state.get("topic_usage_counts", {}))
-        self.update_state("completed_topics", state.get("completed_topics", set()))
-        self.update_state("irrelevant_topics", state.get("irrelevant_topics", set()))
+        self.update_state("completed_topics", list(state.get("completed_topics", [])))
+        self.update_state("irrelevant_topics", list(state.get("irrelevant_topics", [])))
         self.update_state("active_outline", all_topics.copy())
         self.update_state("cycle_summaries", state.get("cycle_summaries", []))
 
@@ -1269,7 +1581,7 @@ class Pipe:
             if vdb is None:
                 logger.warning("VECTOR_DB_CLIENT is not initialized")
                 return []
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             res = await loop.run_in_executor(
                 self.executor,
                 lambda: vdb.search(
@@ -1351,7 +1663,7 @@ class Pipe:
                 "Answer the question using only these excerpts. Cite by [KB:i]."
             ),
         }
-        chosen_model = model or self.get_research_model()
+        chosen_model = model or self.valves.RESEARCH_MODEL
         try:
             response = await self.generate_completion(
                 chosen_model,
@@ -1497,7 +1809,7 @@ class Pipe:
         text = text[:2000]
         text = text.replace(":", " - ")
 
-        cached_embedding = self.embedding_cache.get(text)
+        cached_embedding = await self.embedding_cache.get(text)
         if cached_embedding is not None:
             return cached_embedding
 
@@ -1508,7 +1820,7 @@ class Pipe:
                 return None
             embedding: Any = await embedding_fn(text, user=self.__user__)
             if embedding:
-                self.embedding_cache.set(text, embedding)
+                await self.embedding_cache.set(text, embedding)
                 return embedding
             return None
         except Exception as e:
@@ -1526,13 +1838,21 @@ class Pipe:
         if transformation is None:
             return await self.get_embedding(text)
 
-        # Check transformation cache first - simple lookup
-        transform_id = (
-            transformation.get("id", str(hash(str(transformation))))
-            if isinstance(transformation, dict)
-            else transformation
-        )
-        cached_transformed = self.transformation_cache.get(text, transform_id)
+        # Check transformation cache first - simple lookup. The fallback id
+        # (used when ``transformation`` has no explicit "id") must be a
+        # stable, collision-resistant digest -- the built-in ``hash()``
+        # would mean salted-per-process keys and collision risk in a 64-bit
+        # space across long runs.
+        if isinstance(transformation, dict):
+            transform_id = transformation.get(
+                "id",
+                _stable_text_key(
+                    json.dumps(transformation, sort_keys=True, default=str)
+                ),
+            )
+        else:
+            transform_id = transformation
+        cached_transformed = await self.transformation_cache.get(text, transform_id)
         if cached_transformed is not None:
             return cached_transformed
 
@@ -1548,7 +1868,7 @@ class Pipe:
 
         # Cache the transformed result only if successful
         if transformed:
-            self.transformation_cache.set(text, transform_id, transformed)
+            await self.transformation_cache.set(text, transform_id, transformed)
 
         return transformed
 
@@ -1572,161 +1892,194 @@ class Pipe:
         if self.vocabulary_cache is not None:
             return self.vocabulary_cache
 
-        disk_path = "/app/backend/data/deep_research_vocabulary.txt"
-        try:
-            with open(disk_path, "r") as f:
-                words = [w.strip() for w in f.readlines() if w.strip()]
-            if words:
-                self.vocabulary_cache = words
-                logger.info(
-                    f"Loaded {len(self.vocabulary_cache)} words vocabulary from disk cache"
+        async with self._vocab_load_lock:
+            # Re-check under the lock; a concurrent first-caller may have
+            # completed the load while we were waiting.
+            if self.vocabulary_cache is not None:
+                return self.vocabulary_cache
+
+            cache_dir = CACHE_DIR / "deep_research"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            disk_path = str(cache_dir / "vocabulary.txt")
+            try:
+                with open(disk_path, "r") as f:
+                    words = [w.strip() for w in f.readlines() if w.strip()]
+                if words:
+                    self.vocabulary_cache = words
+                    logger.info(
+                        f"Loaded {len(self.vocabulary_cache)} words vocabulary from disk cache"
+                    )
+                    return self.vocabulary_cache
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.warning(f"Could not read vocabulary from disk cache: {e}")
+
+            try:
+                url = "https://www.mit.edu/~ecprice/wordlist.10000"
+                connector = aiohttp.TCPConnector(force_close=True)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.get(
+                        url, timeout=aiohttp.ClientTimeout(total=10)
+                    ) as response:
+                        if response.status == 200:
+                            text = await response.text()
+                            self.vocabulary_cache = [
+                                word.strip()
+                                for word in text.splitlines()
+                                if word.strip()
+                            ]
+                            logger.info(
+                                f"Loaded {len(self.vocabulary_cache)} words vocabulary"
+                            )
+                            try:
+                                with open(disk_path, "w") as f:
+                                    f.write(text)
+                                logger.info(
+                                    f"Saved vocabulary to disk cache: {disk_path}"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Could not save vocabulary to disk cache: {e}"
+                                )
+                            return self.vocabulary_cache
+            except Exception as e:
+                logger.error(f"Error loading vocabulary: {e}")
+
+                # Use context to create a vocabulary if standard one is unavailable
+                # Get recent context from results history or any available text
+                context_text = ""
+                state = self.get_state()
+                results_history = state.get("results_history", [])
+                search_history = state.get("search_history", [])
+                section_synthesized_content = state.get(
+                    "section_synthesized_content", {}
+                )
+
+                if results_history:
+                    # Use the last few results
+                    for result in results_history[-5:]:
+                        context_text += result.get("content", "") + " "
+
+                # Add any research queries
+                if search_history:
+                    context_text += " ".join(search_history) + " "
+
+                # Add any section content
+                if section_synthesized_content:
+                    for content in list(section_synthesized_content.values())[:3]:
+                        context_text += content + " "
+
+                # If we still don't have enough context, just proceed with failure logging
+                if len(context_text) < 5000:
+                    logger.error("Insufficient context for vocabulary creation")
+                    return None
+
+                # Create vocabulary from context
+                self.vocabulary_cache = await self.create_context_vocabulary(
+                    context_text
                 )
                 return self.vocabulary_cache
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            logger.warning(f"Could not read vocabulary from disk cache: {e}")
-
-        try:
-            url = "https://www.mit.edu/~ecprice/wordlist.10000"
-            connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    if response.status == 200:
-                        text = await response.text()
-                        self.vocabulary_cache = [
-                            word.strip() for word in text.splitlines() if word.strip()
-                        ]
-                        logger.info(
-                            f"Loaded {len(self.vocabulary_cache)} words vocabulary"
-                        )
-                        try:
-                            with open(disk_path, "w") as f:
-                                f.write(text)
-                            logger.info(f"Saved vocabulary to disk cache: {disk_path}")
-                        except Exception as e:
-                            logger.warning(
-                                f"Could not save vocabulary to disk cache: {e}"
-                            )
-                        return self.vocabulary_cache
-        except Exception as e:
-            logger.error(f"Error loading vocabulary: {e}")
-
-            # Use context to create a vocabulary if standard one is unavailable
-            # Get recent context from results history or any available text
-            context_text = ""
-            state = self.get_state()
-            results_history = state.get("results_history", [])
-            search_history = state.get("search_history", [])
-            section_synthesized_content = state.get("section_synthesized_content", {})
-
-            if results_history:
-                # Use the last few results
-                for result in results_history[-5:]:
-                    context_text += result.get("content", "") + " "
-
-            # Add any research queries
-            if search_history:
-                context_text += " ".join(search_history) + " "
-
-            # Add any section content
-            if section_synthesized_content:
-                for content in list(section_synthesized_content.values())[:3]:
-                    context_text += content + " "
-
-            # If we still don't have enough context, just proceed with failure logging
-            if len(context_text) < 5000:
-                logger.error("Insufficient context for vocabulary creation")
-                return None
-
-            # Create vocabulary from context
-            self.vocabulary_cache = await self.create_context_vocabulary(context_text)
-            return self.vocabulary_cache
 
     def _vocab_embeddings_disk_path(self) -> str:
-        """Return a model-specific path for caching vocabulary embeddings on disk."""
+        """Return a model-specific path for caching vocabulary embeddings on disk.
+
+        Lives under OWUI's CACHE_DIR (DATA_DIR/cache), following the same
+        convention as OWUI's built-in per-feature caches (audio, tiktoken,
+        functions, etc.).
+        """
         try:
             cfg = self.__request__.app.state.config
             model_name = getattr(cfg, "RAG_EMBEDDING_MODEL", "") or "default"
         except Exception:
             model_name = "default"
         safe_model = re.sub(r"[^a-zA-Z0-9_-]", "_", model_name)[:64]
-        return f"/app/backend/data/deep_research_vocab_emb_{safe_model}.npz"
+        cache_dir = CACHE_DIR / "deep_research"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return str(cache_dir / f"vocab_emb_{safe_model}.npz")
 
     async def load_vocabulary_embeddings(self):
         """Generate vocabulary embeddings on demand using Open WebUI's configured embedding function."""
         if self.vocabulary_embeddings is not None:
             return self.vocabulary_embeddings
 
-        disk_path = self._vocab_embeddings_disk_path()
-        try:
-            data = np.load(disk_path)
-            words = data["words"].tolist()
-            embeddings = data["embeddings"].tolist()
-            self.vocabulary_embeddings = {w: e for w, e in zip(words, embeddings)}
+        async with self._vocab_load_lock:
+            # Re-check under the lock; a concurrent first-caller may have
+            # completed the load while we were waiting.
+            if self.vocabulary_embeddings is not None:
+                return self.vocabulary_embeddings
+
+            disk_path = self._vocab_embeddings_disk_path()
+            try:
+                data = np.load(disk_path)
+                words = data["words"].tolist()
+                embeddings = data["embeddings"].tolist()
+                self.vocabulary_embeddings = {w: e for w, e in zip(words, embeddings)}
+                logger.info(
+                    f"Loaded {len(self.vocabulary_embeddings)} vocabulary embeddings from disk cache"
+                )
+                return self.vocabulary_embeddings
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.warning(
+                    f"Could not load vocabulary embeddings from disk cache: {e}"
+                )
+
+            state = self.get_state()
+            cached_embeddings = state.get("vocabulary_embeddings")
+            if cached_embeddings:
+                self.vocabulary_embeddings = cached_embeddings
+                logger.info(
+                    f"Loaded {len(self.vocabulary_embeddings)} vocabulary embeddings from state"
+                )
+                return self.vocabulary_embeddings
+
+            vocab = await self.load_vocabulary()
+            if not vocab:
+                logger.error("Failed to load vocabulary for embeddings")
+                return {}
+
+            embedding_fn = self.__request__.app.state.EMBEDDING_FUNCTION
+            if embedding_fn is None:
+                logger.error("Open WebUI EMBEDDING_FUNCTION is not initialized")
+                return {}
+
+            batch_size = 512
             logger.info(
-                f"Loaded {len(self.vocabulary_embeddings)} vocabulary embeddings from disk cache"
+                f"Generating embeddings for {len(vocab)} vocabulary words (batch_size={batch_size})"
             )
-            return self.vocabulary_embeddings
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            logger.warning(f"Could not load vocabulary embeddings from disk cache: {e}")
+            all_embeddings = []
+            try:
+                for i in range(0, len(vocab), batch_size):
+                    batch = vocab[i : i + batch_size]
+                    batch_result: Any = await embedding_fn(batch, user=self.__user__)
+                    all_embeddings.extend(batch_result)
+            except Exception as e:
+                logger.error(f"Failed to generate vocabulary embeddings: {e}")
+                return {}
 
-        state = self.get_state()
-        cached_embeddings = state.get("vocabulary_embeddings")
-        if cached_embeddings:
-            self.vocabulary_embeddings = cached_embeddings
+            self.vocabulary_embeddings = {
+                word: emb for word, emb in zip(vocab, all_embeddings) if emb
+            }
             logger.info(
-                f"Loaded {len(self.vocabulary_embeddings)} vocabulary embeddings from state"
+                f"Generated embeddings for {len(self.vocabulary_embeddings)} vocabulary words"
             )
+            try:
+                valid_words = list(self.vocabulary_embeddings.keys())
+                valid_embs = list(self.vocabulary_embeddings.values())
+                np.savez_compressed(
+                    disk_path,
+                    words=np.array(valid_words, dtype="U64"),
+                    embeddings=np.array(valid_embs, dtype=np.float32),
+                )
+                logger.info(f"Saved vocabulary embeddings to disk cache: {disk_path}")
+            except Exception as e:
+                logger.warning(
+                    f"Could not save vocabulary embeddings to disk cache: {e}"
+                )
+            self.update_state("vocabulary_embeddings", self.vocabulary_embeddings)
             return self.vocabulary_embeddings
-
-        vocab = await self.load_vocabulary()
-        if not vocab:
-            logger.error("Failed to load vocabulary for embeddings")
-            return {}
-
-        embedding_fn = self.__request__.app.state.EMBEDDING_FUNCTION
-        if embedding_fn is None:
-            logger.error("Open WebUI EMBEDDING_FUNCTION is not initialized")
-            return {}
-
-        batch_size = 512
-        logger.info(
-            f"Generating embeddings for {len(vocab)} vocabulary words (batch_size={batch_size})"
-        )
-        all_embeddings = []
-        try:
-            for i in range(0, len(vocab), batch_size):
-                batch = vocab[i : i + batch_size]
-                batch_result: Any = await embedding_fn(batch, user=self.__user__)
-                all_embeddings.extend(batch_result)
-        except Exception as e:
-            logger.error(f"Failed to generate vocabulary embeddings: {e}")
-            return {}
-
-        self.vocabulary_embeddings = {
-            word: emb for word, emb in zip(vocab, all_embeddings) if emb
-        }
-        logger.info(
-            f"Generated embeddings for {len(self.vocabulary_embeddings)} vocabulary words"
-        )
-        try:
-            valid_words = list(self.vocabulary_embeddings.keys())
-            valid_embs = list(self.vocabulary_embeddings.values())
-            np.savez_compressed(
-                disk_path,
-                words=np.array(valid_words, dtype="U64"),
-                embeddings=np.array(valid_embs, dtype=np.float32),
-            )
-            logger.info(f"Saved vocabulary embeddings to disk cache: {disk_path}")
-        except Exception as e:
-            logger.warning(f"Could not save vocabulary embeddings to disk cache: {e}")
-        self.update_state("vocabulary_embeddings", self.vocabulary_embeddings)
-        return self.vocabulary_embeddings
 
     def chunk_text(self, text: str) -> List[str]:
         """Split text into chunks based on the configured chunk level"""
@@ -4589,7 +4942,7 @@ class Pipe:
             if hasattr(loader, "aload"):
                 docs = await loader.aload()
             else:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 docs = await loop.run_in_executor(self.executor, loader.load)
         except Exception as e:
             logger.info(f"Open WebUI Web Loader aload failed for {url}: {e}")
@@ -4694,7 +5047,7 @@ class Pipe:
                     basename, content_type or "application/pdf", tmp_path
                 )
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             docs = await loop.run_in_executor(self.executor, _run_load)
 
             if not docs:
@@ -4887,9 +5240,6 @@ class Pipe:
         try:
             # Try BeautifulSoup if available
             try:
-                import html
-                import re  # Explicitly import re here for the closure
-
                 from bs4 import BeautifulSoup
 
                 # Create a task for BS4 extraction
@@ -4994,7 +5344,7 @@ class Pipe:
                     return "\n\n".join(processed_lines)
 
                 # Run in executor to avoid blocking
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 bs4_extraction_task = loop.run_in_executor(None, extract_with_bs4)
                 bs4_result = await asyncio.wait_for(bs4_extraction_task, timeout=5.0)
 
@@ -5042,14 +5392,11 @@ class Pipe:
 
                 return content
 
-            except (ImportError, asyncio.TimeoutError, Exception) as e:
+            except Exception as e:
                 logger.warning(
                     f"BeautifulSoup extraction failed: {e}, using regex fallback"
                 )
                 # Use regex version if BS4 fails
-                import html
-                import re
-
                 # First unescape HTML entities properly
                 unescaped_content = (
                     html.unescape(html_content)
@@ -5095,9 +5442,6 @@ class Pipe:
             logger.error(f"Error extracting text from HTML: {e}")
             # Simple fallback - remove all HTML tags and unescape HTML entities
             try:
-                import html
-                import re
-
                 # Unescape HTML entities
                 if isinstance(html_content, str):
                     unescaped = html.unescape(html_content)
@@ -5183,22 +5527,13 @@ class Pipe:
                         )
                         await asyncio.sleep(delay_time)
 
-            # Import fake-useragent for better user agent rotation
-            try:
-                from fake_useragent import UserAgent
-
-                ua = UserAgent()
-                random_user_agent = ua.random
-            except ImportError:
-                # Fallback if fake-useragent is not installed
-                user_agents = [
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/123.0.0.0 Safari/537.36",
-                ]
-                random_user_agent = random.choice(user_agents)
+            if _ua_provider is not None:
+                try:
+                    random_user_agent = _ua_provider.random
+                except Exception:
+                    random_user_agent = random.choice(_FALLBACK_USER_AGENTS)
+            else:
+                random_user_agent = random.choice(_FALLBACK_USER_AGENTS)
 
             # Create comprehensive browser fingerprint headers
             headers = {
@@ -5291,14 +5626,6 @@ class Pipe:
             search_term = search_term.replace(" ", "+")
             headers["Referer"] = chosen_referrer + search_term
 
-            # Update domain tracking info
-            if domain not in domain_session_map:
-                domain_session_map[domain] = {
-                    "cookies": {},
-                    "last_visit": 0,
-                    "visit_count": 0,
-                }
-
             domain_session = domain_session_map[domain]
             domain_session["visit_count"] += 1
 
@@ -5311,23 +5638,11 @@ class Pipe:
             # Check if URL appears to be a PDF
             is_pdf = url.lower().endswith(".pdf")
 
-            # Get existing cookies for this domain if available
-            cookie_dict = {}
-            if domain in domain_session_map:
-                # Convert stored cookies to dictionary format for ClientSession
-                stored_cookies = domain_session_map[domain].get("cookies", {})
-
-                # Handle both dictionary and CookieJar formats
-                if isinstance(stored_cookies, dict):
-                    cookie_dict = stored_cookies
-                else:
-                    # Try to extract cookies from CookieJar
-                    try:
-                        for cookie_name, cookie in stored_cookies.items():
-                            cookie_dict[cookie_name] = cookie.value
-                    except AttributeError:
-                        # If that fails, use an empty dict
-                        cookie_dict = {}
+            # Stored cookies are always a dict — either the spoofed-cookie
+            # literal set above or a SimpleCookie returned by
+            # session.cookie_jar.filter_cookies, which subclasses dict.
+            # aiohttp's `cookies=` accepts both.
+            cookie_dict = domain_session_map[domain].get("cookies", {})
 
             async with aiohttp.ClientSession(
                 connector=connector, cookies=cookie_dict
@@ -6012,7 +6327,7 @@ class Pipe:
                         return None
 
                 # Execute in thread pool
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 pdf_extract_task = loop.run_in_executor(
                     self.executor, extract_with_pypdf
                 )
@@ -6027,7 +6342,7 @@ class Pipe:
                     logger.warning(
                         "PyPDF2 extraction returned empty text, trying pdfplumber..."
                     )
-            except (ImportError, Exception) as e:
+            except Exception as e:
                 logger.warning(f"PyPDF2 extraction failed: {e}, trying pdfplumber...")
 
             # Try pdfplumber as a fallback
@@ -6067,7 +6382,7 @@ class Pipe:
                         return None
 
                 # Execute in thread pool
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 pdf_extract_task = loop.run_in_executor(
                     self.executor, extract_with_pdfplumber
                 )
@@ -6080,7 +6395,7 @@ class Pipe:
                     return full_text
                 else:
                     logger.warning("pdfplumber extraction returned empty text")
-            except (ImportError, Exception) as e:
+            except Exception as e:
                 logger.warning(f"pdfplumber extraction failed: {e}")
 
             # If both methods failed but we can tell it's a PDF, provide a more useful message
@@ -6158,7 +6473,7 @@ class Pipe:
         try:
             # Use research model for citation identification with appropriate temperature
             citation_response = await self.generate_completion(
-                self.get_research_model(),
+                self.valves.RESEARCH_MODEL,
                 [citation_prompt, {"role": "user", "content": citation_context}],
                 temperature=self.valves.TEMPERATURE
                 * 0.3,  # Lower temperature for precision
@@ -7489,11 +7804,6 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
         return successful_results
 
-    def get_research_model(self):
-        """Get the appropriate model for research/mechanical tasks"""
-        # Always use the main research model
-        return self.valves.RESEARCH_MODEL
-
     def get_synthesis_model(self):
         """Get the appropriate model for synthesis tasks"""
         if (
@@ -7524,7 +7834,6 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
         max_retries = 3
         retry_delay = 5.0
-        _transient_phrases = ("server disconnected", "server connection error", "connection reset", "connection refused")
 
         for attempt in range(max_retries):
             try:
@@ -7541,18 +7850,32 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 logger.error(f"Completion timed out after {timeout}s for model {model}")
                 raise
             except Exception as e:
-                err_str = str(e).lower()
-                is_transient = any(phrase in err_str for phrase in _transient_phrases)
-                if is_transient and attempt < max_retries - 1:
-                    wait = retry_delay * (2 ** attempt)
+                transient_reason = _classify_transient_completion_error(e)
+                if transient_reason and attempt < max_retries - 1:
+                    wait = retry_delay * (2**attempt)
                     logger.warning(
-                        f"Transient connection error for model {model} (attempt {attempt + 1}/{max_retries}): {e}. "
+                        f"Transient completion error for model {model} "
+                        f"(attempt {attempt + 1}/{max_retries}, reason={transient_reason}): {e}. "
                         f"Retrying in {wait:.0f}s..."
                     )
                     await asyncio.sleep(wait)
-                else:
-                    logger.error(f"Error generating completion with model {model}: {e}")
-                    return {"choices": [{"message": {"content": f"Error: {str(e)}"}}]}
+                    continue
+                logger.error(
+                    f"Completion failed for model {model} "
+                    f"(attempt {attempt + 1}/{max_retries}, transient={transient_reason}): {e}"
+                )
+                raise CompletionError(
+                    model=model,
+                    original=e,
+                    attempts=attempt + 1,
+                    transient_reason=transient_reason,
+                ) from e
+        raise CompletionError(
+            model=model,
+            original=RuntimeError("max_retries must be >= 1"),
+            attempts=0,
+            transient_reason=None,
+        )
 
     async def emit_message(self, message: str):
         """Emit a message to the client"""
@@ -7567,15 +7890,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
     async def emit_status(self, level: str, message: str, done: bool = False):
         """Emit a status message to the client"""
         try:
-            # Check if research is completed
-            state = self.get_state()
-            research_completed = state.get("research_completed", False)
-
-            if research_completed and not done:
-                status = "complete"
-            else:
-                status = "complete" if done else "in_progress"
-
+            status = "complete" if done else "in_progress"
             await self.__current_event_emitter__(
                 {
                     "type": "status",
@@ -7587,7 +7902,6 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     },
                 }
             )
-
         except Exception as e:
             logger.error(f"Error emitting status: {e}")
             # Can't do much if this fails, but we don't want to crash
@@ -7627,8 +7941,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         synthesis_tokens = memory_stats.get("synthesis_tokens", 0)
         total_tokens = memory_stats.get("total_tokens", 0)
 
-        completed = state.get("completed_topics", set()) or set()
-        irrelevant = state.get("irrelevant_topics", set()) or set()
+        completed = state.get("completed_topics", []) or []
+        irrelevant = state.get("irrelevant_topics", []) or []
         partial = state.get("partial_topics", []) or []
         latest_new = state.get("latest_new_topics", []) or []
         active_outline = state.get("active_outline", []) or []
@@ -8259,7 +8573,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         # Generate interpretation of user feedback
         try:
             response = await self.generate_completion(
-                self.get_research_model(),
+                self.valves.RESEARCH_MODEL,
                 [interpret_prompt, {"role": "user", "content": context}],
                 temperature=self.valves.TEMPERATURE
                 * 0.3,  # Low temperature for consistent interpretation
@@ -8617,7 +8931,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         # Generate the query
         try:
             response = await self.generate_completion(
-                self.get_research_model(),
+                self.valves.RESEARCH_MODEL,
                 [prompt, message],
                 temperature=self.valves.TEMPERATURE * 0.7,
             )
@@ -8672,7 +8986,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         # Extract relevant information
         try:
             response = await self.generate_completion(
-                self.get_research_model(),
+                self.valves.RESEARCH_MODEL,
                 extraction_messages,
                 temperature=self.valves.TEMPERATURE
                 * 0.4,  # Lower temperature for factual extraction
@@ -8728,7 +9042,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         # Generate refined topics
         try:
             response = await self.generate_completion(
-                self.get_research_model(),
+                self.valves.RESEARCH_MODEL,
                 refine_messages,
                 temperature=self.valves.TEMPERATURE
                 * 0.7,  # Balanced temperature for creativity with focus
@@ -9289,7 +9603,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         # Generate the title
         try:
             response = await self.generate_completion(
-                self.get_research_model(),
+                self.valves.RESEARCH_MODEL,
                 [title_prompt, message],
                 temperature=0.7,
             )
@@ -9317,22 +9631,9 @@ new ResizeObserver(reportHeight).observe(document.body);
         prev_comprehensive_summary = state.get("prev_comprehensive_summary", "")
         research_completed = state.get("research_completed", False)
 
-        # Check if we're waiting for outline feedback - if so, don't treat as new or follow-up
-        waiting_for_outline_feedback = state.get("waiting_for_outline_feedback", False)
-        if waiting_for_outline_feedback:
-            return False
-
-        # Check for fresh conversation by examining message count
-        # A brand new conversation will have very few messages
-        is_new_conversation = (
-            len(messages) <= 2
-        )  # Only 1-2 messages in a new conversation
-
-        # If this appears to be a new conversation and we're not waiting for feedback,
-        # don't treat as follow-up and reset state
-        if is_new_conversation and not waiting_for_outline_feedback:
-            # Reset the state for this conversation to ensure clean start
-            self.reset_state()
+        # Don't treat as a follow-up while we're still expecting outline
+        # feedback on the current run.
+        if state.get("waiting_for_outline_feedback", False):
             return False
 
         return bool(prev_comprehensive_summary and research_completed)
@@ -9506,8 +9807,6 @@ new ResizeObserver(reportHeight).observe(document.body);
                         pass
 
                 # Use regex to find any JSON structure containing "outline" array
-                import re
-
                 json_pattern = r'(\{[^{}]*"outline"\s*:\s*\[[^\[\]]*\][^{}]*\})'
                 matches = re.findall(json_pattern, outline_content, re.DOTALL)
 
@@ -10454,7 +10753,7 @@ new ResizeObserver(reportHeight).observe(document.body);
 
             # Generate verification assessment using the research model
             response = await self.generate_completion(
-                self.get_research_model(),
+                self.valves.RESEARCH_MODEL,
                 [verify_prompt, {"role": "user", "content": verify_context}],
                 temperature=self.valves.TEMPERATURE
                 * 0.2,  # 20% of normal temperature for precise verification
@@ -10782,7 +11081,6 @@ new ResizeObserver(reportHeight).observe(document.body);
     async def export_research_data(self) -> Dict[str, Any]:
         """Export the full research data including results, queries, timestamps, URLs, and content"""
         import os
-        from datetime import datetime
 
         state = self.get_state()
         results_history = state.get("results_history", [])
@@ -10808,8 +11106,6 @@ new ResizeObserver(reportHeight).observe(document.body);
             # Add timestamp to result if not already present
             if "timestamp" not in result:
                 # As a fallback, create a synthetic timestamp based on position in history
-                from datetime import timedelta
-
                 synthetic_time = datetime.now() - timedelta(
                     minutes=(len(results_history) - i)
                 )
@@ -11299,7 +11595,7 @@ new ResizeObserver(reportHeight).observe(document.body);
 
             # Generate replacements
             # Use research model for generating replacements
-            research_model = self.get_research_model()
+            research_model = self.valves.RESEARCH_MODEL
             response = await self.generate_completion(
                 research_model,
                 messages,
@@ -11388,7 +11684,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         # Generate the queries first, without any embedding operations
         try:
             response = await self.generate_completion(
-                self.get_research_model(),
+                self.valves.RESEARCH_MODEL,
                 [query_prompt, message],
                 temperature=self.valves.TEMPERATURE,
             )
@@ -11472,7 +11768,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         }
 
         try:
-            research_model = self.get_research_model()
+            research_model = self.valves.RESEARCH_MODEL
 
             # Compute task budget before building context
             budget = await self._get_task_context_budget(
@@ -11659,11 +11955,20 @@ new ResizeObserver(reportHeight).observe(document.body);
         __model__=None,
         __request__=None,
     ) -> str:
+        # Per-call state bootstrap. Each invocation runs in its own
+        # asyncio.Task; values written through these descriptors land in the
+        # current Task's ContextVar copy and are invisible to other concurrent
+        # pipe() calls. See "Concurrency contract" in CLAUDE.md.
         self.__current_event_emitter__ = __event_emitter__
         self.__current_event_call__ = __event_call__
         self.__user__ = User(**__user__)
         self.__model__ = __model__
         self.__request__ = __request__
+        self.is_pdf_content = False
+        self.research_date = datetime.now().strftime("%Y-%m-%d")
+        self.trajectory_accumulator = None
+        self._seen_subtopics = set()
+        self._seen_sections = set()
 
         # Extract conversation ID from the message history
         messages = body.get("messages", [])
@@ -11679,14 +11984,41 @@ new ResizeObserver(reportHeight).observe(document.body);
         conversation_id = f"{__user__['id']}_{first_message.get('id', 'default')}"
         self.conversation_id = conversation_id
 
-        # Check if this appears to be a completely new conversation
+        # Same-conversation entry dedupe. Two pipe() invocations on the same
+        # conversation_id would share the ResearchStateManager dict and corrupt
+        # state through interleaved read-modify-write across `await` boundaries.
+        # Reject the second invocation rather than serialise the two runs.
+        async with self._inflight_lock:
+            if conversation_id in self._inflight:
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "message",
+                            "data": {
+                                "content": (
+                                    "\n\n*A research run is already in progress "
+                                    "for this conversation. Please wait for it "
+                                    "to finish or start a new chat.*\n\n"
+                                )
+                            },
+                        }
+                    )
+                return ""
+            self._inflight.add(conversation_id)
+
+        try:
+            return await self._run_pipeline(body, __task__, messages)
+        finally:
+            async with self._inflight_lock:
+                self._inflight.discard(conversation_id)
+
+    async def _run_pipeline(
+        self,
+        body: dict[str, Any],
+        __task__: Any,
+        messages: List[Dict[str, Any]],
+    ) -> str:
         state = self.get_state()
-        waiting_for_outline_feedback = state.get("waiting_for_outline_feedback", False)
-        if (
-            len(messages) <= 2 and not waiting_for_outline_feedback
-        ):  # Check we're not waiting for feedback
-            logger.info(f"New conversation detected with ID: {conversation_id}")
-            self.reset_state()  # Reset all state for this conversation
 
         # Rehydrate persisted deepResearch state (chat-record JSON) into
         # in-memory state when a checkpoint exists. This lets the pipe
@@ -11713,7 +12045,7 @@ new ResizeObserver(reportHeight).observe(document.body);
             dr_now
             and dr_now.get("mode") == "post_report_user_qa"
             and dr_now.get("kb_id")
-            and not waiting_for_outline_feedback
+            and not state.get("waiting_for_outline_feedback", False)
         ):
             return await self._answer_post_report_user_qa(body)
 
@@ -11768,8 +12100,6 @@ new ResizeObserver(reportHeight).observe(document.body);
             return ""
 
         # Set research date
-        from datetime import datetime
-
         self.research_date = datetime.now().strftime("%Y-%m-%d")
 
         # Get state for this conversation
@@ -11935,11 +12265,25 @@ new ResizeObserver(reportHeight).observe(document.body);
                 ]
 
                 # Get initial search queries
-                query_response = await self.generate_completion(
-                    self.get_research_model(),
-                    initial_query_messages,
-                    temperature=self.valves.TEMPERATURE,
-                )
+                try:
+                    query_response = await self.generate_completion(
+                        self.valves.RESEARCH_MODEL,
+                        initial_query_messages,
+                        temperature=self.valves.TEMPERATURE,
+                    )
+                except CompletionError as e:
+                    logger.error(f"Initial follow-up query generation failed: {e}")
+                    await self.emit_status(
+                        "error",
+                        "Research aborted: the language model could not generate follow-up search queries. Please retry; if the problem persists, check model availability.",
+                        True,
+                    )
+                    if not self.valves.QUIET_CHAT_MODE:
+                        await self.emit_message(
+                            "\n\n*Research aborted: model call failed during follow-up query generation. "
+                            f"({type(e.original).__name__}). Please retry.*\n\n"
+                        )
+                    return ""
                 query_content = query_response["choices"][0]["message"]["content"]
 
                 # Extract JSON from response
@@ -11952,8 +12296,6 @@ new ResizeObserver(reportHeight).observe(document.body);
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.error(f"Error parsing query JSON: {e}")
                     # Fallback: extract queries using regex if JSON parsing fails
-                    import re
-
                     initial_queries = re.findall(r'"([^"]+)"', query_content)[:3]
                     if not initial_queries:
                         initial_queries = ["Information about " + user_message]
@@ -12075,9 +12417,23 @@ new ResizeObserver(reportHeight).observe(document.body);
                 ]
 
                 # Generate the research outline
-                outline_response = await self.generate_completion(
-                    self.get_research_model(), outline_messages
-                )
+                try:
+                    outline_response = await self.generate_completion(
+                        self.valves.RESEARCH_MODEL, outline_messages
+                    )
+                except CompletionError as e:
+                    logger.error(f"Follow-up outline generation failed: {e}")
+                    await self.emit_status(
+                        "error",
+                        "Research aborted: the language model could not generate the research outline for the follow-up request. Please retry; if the problem persists, check model availability.",
+                        True,
+                    )
+                    if not self.valves.QUIET_CHAT_MODE:
+                        await self.emit_message(
+                            "\n\n*Research aborted: model call failed during follow-up outline generation. "
+                            f"({type(e.original).__name__}). Please retry.*\n\n"
+                        )
+                    return ""
                 outline_content = outline_response["choices"][0]["message"]["content"]
 
                 # Extract JSON from response
@@ -12160,11 +12516,25 @@ new ResizeObserver(reportHeight).observe(document.body);
                 ]
 
                 # Get initial search queries
-                query_response = await self.generate_completion(
-                    self.get_research_model(),
-                    initial_query_messages,
-                    temperature=self.valves.TEMPERATURE,
-                )
+                try:
+                    query_response = await self.generate_completion(
+                        self.valves.RESEARCH_MODEL,
+                        initial_query_messages,
+                        temperature=self.valves.TEMPERATURE,
+                    )
+                except CompletionError as e:
+                    logger.error(f"Initial query generation failed: {e}")
+                    await self.emit_status(
+                        "error",
+                        "Research aborted: the language model could not generate initial search queries. Please retry; if the problem persists, check model availability.",
+                        True,
+                    )
+                    if not self.valves.QUIET_CHAT_MODE:
+                        await self.emit_message(
+                            "\n\n*Research aborted: model call failed during initial query generation. "
+                            f"({type(e.original).__name__}). Please retry.*\n\n"
+                        )
+                    return ""
                 query_content = query_response["choices"][0]["message"]["content"]
 
                 # Extract JSON from response
@@ -12177,8 +12547,6 @@ new ResizeObserver(reportHeight).observe(document.body);
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.error(f"Error parsing query JSON: {e}")
                     # Fallback: extract queries using regex if JSON parsing fails
-                    import re
-
                     initial_queries = re.findall(r'"([^"]+)"', query_content)[:3]
                     if not initial_queries:
                         initial_queries = ["Information about " + user_message]
@@ -12303,9 +12671,23 @@ new ResizeObserver(reportHeight).observe(document.body);
                 ]
 
                 # Generate the research outline
-                outline_response = await self.generate_completion(
-                    self.get_research_model(), outline_messages
-                )
+                try:
+                    outline_response = await self.generate_completion(
+                        self.valves.RESEARCH_MODEL, outline_messages
+                    )
+                except CompletionError as e:
+                    logger.error(f"Initial outline generation failed: {e}")
+                    await self.emit_status(
+                        "error",
+                        "Research aborted: the language model could not generate the research outline. Please retry; if the problem persists, check model availability.",
+                        True,
+                    )
+                    if not self.valves.QUIET_CHAT_MODE:
+                        await self.emit_message(
+                            "\n\n*Research aborted: model call failed during outline generation. "
+                            f"({type(e.original).__name__}). Please retry.*\n\n"
+                        )
+                    return ""
                 outline_content = outline_response["choices"][0]["message"]["content"]
 
                 # Extract JSON from response
@@ -12405,8 +12787,8 @@ new ResizeObserver(reportHeight).observe(document.body);
         cycle = 1  # We've already done one cycle with the initial queries
         max_cycles = self.valves.MAX_CYCLES
         min_cycles = self.valves.MIN_CYCLES
-        completed_topics = set(state.get("completed_topics", set()))
-        irrelevant_topics = set(state.get("irrelevant_topics", set()))
+        completed_topics = set(state.get("completed_topics", []))
+        irrelevant_topics = set(state.get("irrelevant_topics", []))
         search_history = state.get("search_history", [])
         results_history = state.get("results_history", []) + (initial_results or [])
         active_outline = list(set(all_topics) - completed_topics - irrelevant_topics)
@@ -12682,7 +13064,7 @@ Format your response as a valid JSON object with the following structure:
 
                 try:
                     analysis_response = await self.generate_completion(
-                        self.get_research_model(), analysis_messages
+                        self.valves.RESEARCH_MODEL, analysis_messages
                     )
                     analysis_content = analysis_response["choices"][0]["message"][
                         "content"
@@ -12697,12 +13079,12 @@ Format your response as a valid JSON object with the following structure:
                     # Update completed topics
                     newly_completed = set(analysis_data.get("completed_topics", []))
                     completed_topics.update(newly_completed)
-                    self.update_state("completed_topics", completed_topics)
+                    self.update_state("completed_topics", list(completed_topics))
 
                     # Update irrelevant topics
                     newly_irrelevant = set(analysis_data.get("irrelevant_topics", []))
                     irrelevant_topics.update(newly_irrelevant)
-                    self.update_state("irrelevant_topics", irrelevant_topics)
+                    self.update_state("irrelevant_topics", list(irrelevant_topics))
 
                     # Add any new topics discovered
                     new_topics = analysis_data.get("new_topics", [])
@@ -12881,7 +13263,7 @@ Format your response as a valid JSON object with the following structure:
                             )
 
                         completed_topics.add(completed_topic)
-                        self.update_state("completed_topics", completed_topics)
+                        self.update_state("completed_topics", list(completed_topics))
 
                         active_outline.remove(completed_topic)
                         self.update_state("active_outline", active_outline)
