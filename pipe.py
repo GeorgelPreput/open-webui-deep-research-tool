@@ -66,6 +66,10 @@ def setup_logger():
 
 logger = setup_logger()
 
+# Ephemeral chat id for nested generate_chat_completions calls. OWUI >=0.9.5
+# crashes when metadata['chat_id'] is None; local: ids skip chat DB persistence.
+_INTERNAL_COMPLETION_CHAT_ID = "local:dr-pipe-internal"
+
 EventEmitter = Callable[[Dict[str, Any]], Awaitable[Any]]
 
 
@@ -116,6 +120,12 @@ _conv_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 )
 _chat_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "deep_research_chat_id", default=None
+)
+_session_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "deep_research_session_id", default=None
+)
+_parent_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "deep_research_parent_id", default=None
 )
 _is_pdf_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "deep_research_is_pdf", default=False
@@ -486,6 +496,8 @@ class Pipe:
     __request__ = _ctxvar_prop(_request_var)
     conversation_id = _ctxvar_prop(_conv_id_var)
     chat_id = _ctxvar_prop(_chat_id_var)
+    session_id = _ctxvar_prop(_session_id_var)
+    parent_id = _ctxvar_prop(_parent_id_var)
     is_pdf_content = _ctxvar_prop(_is_pdf_var)
     research_date = _ctxvar_prop(_research_date_var)
     trajectory_accumulator = _ctxvar_prop(_trajectory_var)
@@ -1065,10 +1077,77 @@ class Pipe:
         self.update_state("dr_state", dr_state)
 
     @staticmethod
-    def _resolve_chat_id(body: Dict[str, Any]) -> Optional[str]:
-        """Pull the OWUI chat_id from body or its metadata."""
+    def _owui_request_metadata(request: Optional[Any]) -> Dict[str, Any]:
+        """Return OWUI chat metadata attached to the inbound HTTP request."""
+        if request is None:
+            return {}
+        state = getattr(request, "state", None)
+        md = getattr(state, "metadata", None) if state is not None else None
+        return md if isinstance(md, dict) else {}
+
+    @staticmethod
+    def _resolve_chat_id(
+        body: Dict[str, Any], request: Optional[Any] = None
+    ) -> Optional[str]:
+        """Pull the OWUI chat_id from body, nested metadata, or request.state."""
         md = body.get("metadata") or {}
-        return md.get("chat_id") or body.get("chat_id")
+        chat_id = md.get("chat_id") or body.get("chat_id")
+        if not chat_id:
+            chat_id = Pipe._owui_request_metadata(request).get("chat_id")
+        return chat_id
+
+    @staticmethod
+    def _resolve_session_id(
+        body: Dict[str, Any], request: Optional[Any] = None
+    ) -> Optional[str]:
+        """Pull the OWUI session_id from body, nested metadata, or request.state."""
+        md = body.get("metadata") or {}
+        session_id = md.get("session_id") or body.get("session_id")
+        if not session_id:
+            session_id = Pipe._owui_request_metadata(request).get("session_id")
+        return session_id
+
+    @staticmethod
+    def _resolve_parent_id(
+        body: Dict[str, Any], request: Optional[Any] = None
+    ) -> Optional[str]:
+        """Pull the OWUI parent message id from body, nested metadata, or request.state."""
+        md = body.get("metadata") or {}
+        parent_id = (
+            md.get("parent_message_id")
+            or md.get("parent_id")
+            or body.get("parent_id")
+        )
+        if not parent_id:
+            req_md = Pipe._owui_request_metadata(request)
+            parent_id = req_md.get("parent_message_id") or req_md.get("parent_id")
+        return parent_id
+
+    def _build_internal_completion_form_data(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        stream: bool,
+        temperature: float,
+    ) -> Dict[str, Any]:
+        """Build form_data for nested generate_chat_completions calls.
+
+        Uses a synthetic local: chat_id so inner research LLM calls do not hit
+        OWUI >=0.9.5 None chat_id startswith crashes or mutate the user's chat
+        record. Forwards session_id/parent_id when known for routing parity.
+        """
+        form_data: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "temperature": temperature,
+            "chat_id": _INTERNAL_COMPLETION_CHAT_ID,
+        }
+        if self.session_id:
+            form_data["session_id"] = self.session_id
+        if self.parent_id:
+            form_data["parent_id"] = self.parent_id
+        return form_data
 
     async def _load_persisted_dr_state(
         self, chat_id: Optional[str]
@@ -7435,12 +7514,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         if temperature is None:
             temperature = self.valves.TEMPERATURE
 
-        form_data = {
-            "model": model,
-            "messages": messages,
-            "stream": stream,
-            "temperature": temperature,
-        }
+        form_data = self._build_internal_completion_form_data(
+            model=model,
+            messages=messages,
+            stream=stream,
+            temperature=temperature,
+        )
 
         max_retries = 3
         retry_delay = 5.0
@@ -11608,9 +11687,12 @@ new ResizeObserver(reportHeight).observe(document.body);
         if not messages:
             return ""
 
-        # Resolve OWUI chat record id (used for the persisted deepResearch
-        # checkpoint). Falls back to None when running outside a chat context.
-        self.chat_id = self._resolve_chat_id(body)
+        # Resolve OWUI chat/session context (checkpoint persistence and nested
+        # LLM routing). Metadata is usually on request.state after OWUI pops it
+        # from the pipe body.
+        self.chat_id = self._resolve_chat_id(body, __request__)
+        self.session_id = self._resolve_session_id(body, __request__)
+        self.parent_id = self._resolve_parent_id(body, __request__)
 
         # First message ID in the conversation serves as our conversation identifier
         first_message = messages[0] if messages else {}
