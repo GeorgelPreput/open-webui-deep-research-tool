@@ -51,16 +51,16 @@ name = "Deep Research"
 
 def setup_logger():
     logger = logging.getLogger(name)
-    if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
-        handler = logging.StreamHandler()
-        handler.set_name(name)
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+    # Propagate to the root logger so OWUI's loguru InterceptHandler
+    # (open_webui.utils.logger.InterceptHandler, attached to root via
+    # logging.basicConfig in env.py / utils/logger.py) captures our records
+    # and emits them through the same loguru sink as the rest of OWUI. With
+    # propagate=False our messages never reach loguru and stay invisible in
+    # the container logs. Do NOT attach a local StreamHandler here — that
+    # would either double-log (alongside loguru) or write to stderr where
+    # uvicorn's stdout-only capture drops them.
+    logger.propagate = True
     return logger
 
 
@@ -100,8 +100,8 @@ class BibliographyData(TypedDict):
 # are written exactly once at the top of `pipe()`.
 # ---------------------------------------------------------------------------
 
-_ev_emitter_var: contextvars.ContextVar[Optional[EventEmitter]] = contextvars.ContextVar(
-    "deep_research_ev_emitter", default=None
+_ev_emitter_var: contextvars.ContextVar[Optional[EventEmitter]] = (
+    contextvars.ContextVar("deep_research_ev_emitter", default=None)
 )
 _ev_call_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
     "deep_research_ev_call", default=None
@@ -130,8 +130,8 @@ _research_date_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 _trajectory_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
     "deep_research_trajectory", default=None
 )
-_seen_subtopics_var: contextvars.ContextVar[Optional[Set[str]]] = contextvars.ContextVar(
-    "deep_research_seen_subtopics", default=None
+_seen_subtopics_var: contextvars.ContextVar[Optional[Set[str]]] = (
+    contextvars.ContextVar("deep_research_seen_subtopics", default=None)
 )
 _seen_sections_var: contextvars.ContextVar[Optional[Set[str]]] = contextvars.ContextVar(
     "deep_research_seen_sections", default=None
@@ -1323,13 +1323,14 @@ class Pipe:
         =False) so embedding completes before we add to the collection.
         """
         try:
-            from io import BytesIO
             from importlib import import_module
+            from io import BytesIO
 
             from fastapi import UploadFile
             from open_webui.models.knowledge import Knowledges
             from open_webui.routers.files import upload_file_handler
             from open_webui.routers.retrieval import ProcessFileForm, process_file
+
             db_mod = import_module("open_webui.internal.db")
             get_async_db_context = getattr(db_mod, "get_async_db_context", None)
             if get_async_db_context is None:
@@ -1860,7 +1861,9 @@ class Pipe:
             )
 
     def pipes(self) -> list[dict[str, str]]:
-        return [{"id": f"{name}-pipe", "name": f"{name} Pipe"}]
+        sub_pipes = [{"id": f"{name}-pipe", "name": f"{name} Pipe"}]
+        logger.info(f"Pipe.pipes() called; registering sub_pipes={sub_pipes}")
+        return sub_pipes
 
     async def count_tokens(self, text: str) -> int:
         """Count tokens in text using tiktoken (cl100k_base encoding)"""
@@ -5727,8 +5730,10 @@ class Pipe:
                         # Route through the primary-then-fallback PDF path:
                         # Open WebUI's document Loader is tried first, then
                         # the legacy PyPDF2/pdfplumber extractor.
-                        extracted_content = await self._extract_pdf_with_primary_fallback(
-                            pdf_content, url, "application/pdf"
+                        extracted_content = (
+                            await self._extract_pdf_with_primary_fallback(
+                                pdf_content, url, "application/pdf"
+                            )
                         )
 
                         # Limit cached content to 3x MAX_RESULT_TOKENS
@@ -5775,7 +5780,10 @@ class Pipe:
                                 "master_source_table", master_source_table
                             )
 
-                        if isinstance(extracted_content, str) and extracted_content.strip():
+                        if (
+                            isinstance(extracted_content, str)
+                            and extracted_content.strip()
+                        ):
                             try:
                                 await self._persist_selected_source(
                                     url=url,
@@ -5806,7 +5814,9 @@ class Pipe:
                             f"(archive fallback failed)"
                         )
                     else:
-                        logger.error(f"Error fetching URL {url}: HTTP {response.status}")
+                        logger.error(
+                            f"Error fetching URL {url}: HTTP {response.status}"
+                        )
                         return f"Error fetching content: HTTP status {response.status}"
 
         except asyncio.TimeoutError:
@@ -7510,6 +7520,15 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 transient_reason=None,
             )
 
+        # Log the outbound call parameters so we can diagnose model-not-found
+        # errors without exposing message content.
+        roles = [m.get("role", "?") for m in messages]
+        logger.info(
+            f"generate_completion: model={model!r} "
+            f"messages={len(messages)} roles={roles} "
+            f"stream={stream} temperature={temperature} timeout={timeout}"
+        )
+
         for attempt in range(max_retries):
             try:
                 response = await asyncio.wait_for(
@@ -7519,6 +7538,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         user=self.__user__,
                     ),
                     timeout=timeout,
+                )
+                logger.info(
+                    f"generate_completion: model={model!r} attempt={attempt + 1} succeeded"
                 )
                 return response
             except asyncio.TimeoutError:
@@ -7558,9 +7580,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             emitter = self.__current_event_emitter__
             if emitter is None:
                 return
-            await emitter(
-                {"type": "message", "data": {"content": message}}
-            )
+            await emitter({"type": "message", "data": {"content": message}})
         except Exception as e:
             logger.error(f"Error emitting message: {e}")
             # Can't do much if this fails, but we don't want to crash
@@ -7607,9 +7627,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             emitter = self.__current_event_emitter__
             if emitter is None:
                 return
-            await emitter(
-                {"type": "embeds", "data": {"embeds": [html_content]}}
-            )
+            await emitter({"type": "embeds", "data": {"embeds": [html_content]}})
         except Exception as e:
             logger.error(f"Error emitting embed: {e}")
 
@@ -10380,7 +10398,9 @@ new ResizeObserver(reportHeight).observe(document.body);
             "url_to_global_id": url_to_global_id,
         }
 
-    async def format_bibliography_list(self, bibliography: List[BibliographyEntry]) -> str:
+    async def format_bibliography_list(
+        self, bibliography: List[BibliographyEntry]
+    ) -> str:
         """Format the bibliography as a numbered list"""
         if not bibliography:
             return "No sources were referenced in this research."
@@ -11661,6 +11681,19 @@ new ResizeObserver(reportHeight).observe(document.body);
         self.trajectory_accumulator = None
         self._seen_subtopics = set()
         self._seen_sections = set()
+
+        # Log entry into the pipe. If "Model not found" fires in OWUI before
+        # this point, this line will be absent from the logs — that means the
+        # model_id in the request body does not match any sub-pipe ID
+        # registered via Pipe.pipes().
+        body_model = body.get("model") if isinstance(body, dict) else None
+        passed_model = __model__.get("id") if isinstance(__model__, dict) else __model__
+        msg_count = len(body.get("messages", []) or []) if isinstance(body, dict) else 0
+        logger.info(
+            f"Pipe.pipe() entry: body['model']={body_model!r} "
+            f"__model__.id={passed_model!r} messages={msg_count} "
+            f"user_id={__user__.get('id') if isinstance(__user__, dict) else None!r}"
+        )
 
         # Extract conversation ID from the message history
         messages = body.get("messages", [])
