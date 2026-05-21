@@ -121,12 +121,6 @@ _conv_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 _chat_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "deep_research_chat_id", default=None
 )
-_session_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "deep_research_session_id", default=None
-)
-_parent_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "deep_research_parent_id", default=None
-)
 _is_pdf_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "deep_research_is_pdf", default=False
 )
@@ -496,8 +490,6 @@ class Pipe:
     __request__ = _ctxvar_prop(_request_var)
     conversation_id = _ctxvar_prop(_conv_id_var)
     chat_id = _ctxvar_prop(_chat_id_var)
-    session_id = _ctxvar_prop(_session_id_var)
-    parent_id = _ctxvar_prop(_parent_id_var)
     is_pdf_content = _ctxvar_prop(_is_pdf_var)
     research_date = _ctxvar_prop(_research_date_var)
     trajectory_accumulator = _ctxvar_prop(_trajectory_var)
@@ -1096,33 +1088,6 @@ class Pipe:
             chat_id = Pipe._owui_request_metadata(request).get("chat_id")
         return chat_id
 
-    @staticmethod
-    def _resolve_session_id(
-        body: Dict[str, Any], request: Optional[Any] = None
-    ) -> Optional[str]:
-        """Pull the OWUI session_id from body, nested metadata, or request.state."""
-        md = body.get("metadata") or {}
-        session_id = md.get("session_id") or body.get("session_id")
-        if not session_id:
-            session_id = Pipe._owui_request_metadata(request).get("session_id")
-        return session_id
-
-    @staticmethod
-    def _resolve_parent_id(
-        body: Dict[str, Any], request: Optional[Any] = None
-    ) -> Optional[str]:
-        """Pull the OWUI parent message id from body, nested metadata, or request.state."""
-        md = body.get("metadata") or {}
-        parent_id = (
-            md.get("parent_message_id")
-            or md.get("parent_id")
-            or body.get("parent_id")
-        )
-        if not parent_id:
-            req_md = Pipe._owui_request_metadata(request)
-            parent_id = req_md.get("parent_message_id") or req_md.get("parent_id")
-        return parent_id
-
     def _build_internal_completion_form_data(
         self,
         model: str,
@@ -1134,20 +1099,18 @@ class Pipe:
 
         Uses a synthetic local: chat_id so inner research LLM calls do not hit
         OWUI >=0.9.5 None chat_id startswith crashes or mutate the user's chat
-        record. Forwards session_id/parent_id when known for routing parity.
+        record. session_id and parent_id are intentionally NOT forwarded:
+        OWUI >=0.9 fans out any (session_id, chat_id) pair to a background
+        task that returns {'status': True, 'task_ids': [...]} instead of a
+        completion dict, which would break the inner ["choices"] access.
         """
-        form_data: Dict[str, Any] = {
+        return {
             "model": model,
             "messages": messages,
             "stream": stream,
             "temperature": temperature,
             "chat_id": _INTERNAL_COMPLETION_CHAT_ID,
         }
-        if self.session_id:
-            form_data["session_id"] = self.session_id
-        if self.parent_id:
-            form_data["parent_id"] = self.parent_id
-        return form_data
 
     async def _load_persisted_dr_state(
         self, chat_id: Optional[str]
@@ -5052,13 +5015,26 @@ class Pipe:
             return None
 
         try:
-            if hasattr(loader, "aload"):
-                docs = await loader.aload()
-            else:
-                loop = asyncio.get_running_loop()
-                docs = await loop.run_in_executor(self.executor, loader.load)
+            # Always use the synchronous loader.load() path via the thread-pool
+            # executor rather than loader.aload() (the async path).
+            #
+            # SafeWebBaseLoader.aload() uses aiohttp internally.  aiohttp ≥3.10
+            # no longer accepts a plain float/int for the `timeout` parameter —
+            # it raises ValueError immediately (before any network connection),
+            # which is caught by langchain's _fetch_with_rate_limit as a silent
+            # "Error fetching URL, skipping" and produces empty documents.
+            # SafeWebBaseLoader._fetch() also passes allow_redirects=False which
+            # causes redirect-heavy sites to return empty bodies.
+            #
+            # The synchronous path (loader.load → _scrape → requests.Session.get)
+            # accepts a float timeout and follows redirects, matching what curl
+            # does.  Running it in the executor keeps the asyncio event loop free.
+            loop = asyncio.get_running_loop()
+            docs = await loop.run_in_executor(self.executor, loader.load)
         except Exception as e:
-            logger.info(f"Open WebUI Web Loader aload failed for {url}: {e}")
+            logger.info(
+                f"Open WebUI Web Loader load failed for {url}: {e}", exc_info=True
+            )
             return None
 
         if not docs:
@@ -8234,13 +8210,17 @@ new ResizeObserver(reportHeight).observe(document.body);
             },
         )
 
-        # Return a default response (this will be overridden in the next call)
+        # Return a default response (this will be overridden in the next call).
+        # _feedback_message is included so the caller can return it directly as the
+        # pipe() return value — OWUI >=0.9 overwrites emitted content with the return
+        # value on final save, so returning "" would produce an empty assistant message.
         return {
             "kept_items": flat_items,
             "removed_items": [],
             "kept_indices": list(range(len(flat_items))),
             "removed_indices": [],
             "preference_vector": {"pdv": None, "strength": 0.0, "impact": 0.0},
+            "_feedback_message": feedback_message,
         }
 
     async def process_natural_language_feedback(
@@ -11687,12 +11667,9 @@ new ResizeObserver(reportHeight).observe(document.body);
         if not messages:
             return ""
 
-        # Resolve OWUI chat/session context (checkpoint persistence and nested
-        # LLM routing). Metadata is usually on request.state after OWUI pops it
-        # from the pipe body.
+        # Resolve OWUI chat_id for checkpoint persistence. Metadata is usually
+        # on request.state after OWUI pops it from the pipe body.
         self.chat_id = self._resolve_chat_id(body, __request__)
-        self.session_id = self._resolve_session_id(body, __request__)
-        self.parent_id = self._resolve_parent_id(body, __request__)
 
         # First message ID in the conversation serves as our conversation identifier
         first_message = messages[0] if messages else {}
@@ -12443,23 +12420,21 @@ new ResizeObserver(reportHeight).observe(document.body);
                 if self.valves.INTERACTIVE_RESEARCH:
                     # Get user feedback on the research outline
                     if not state.get("waiting_for_outline_feedback", False):
-                        # Display the outline to the user
-                        outline_text = "### Research Outline\n\n"
-                        for topic in research_outline:
-                            outline_text += f"**{topic['topic']}**\n"
-                            for subtopic in topic.get("subtopics", []):
-                                outline_text += f"- {subtopic}\n"
-                            outline_text += "\n"
-
-                        await self.emit_message(outline_text)
-
-                        # Get user feedback (this will set the flags and state for continuation)
+                        # process_user_outline_feedback emits the outline + instructions
+                        # and sets waiting_for_outline_feedback / outline_feedback_data.
+                        # It also returns the message string it emitted so we can use it
+                        # as the pipe() return value — OWUI >=0.9 overwrites the in-flight
+                        # emitted content with the return value on final message save, so
+                        # returning "" would leave the user with a blank assistant turn.
                         feedback_result = await self.process_user_outline_feedback(
                             research_outline, user_message
                         )
 
-                        # Return empty string to pause execution until next message
-                        return ""
+                        # Return the feedback message so OWUI saves it correctly.
+                        # (On older OWUI that appends the return value the message text
+                        # will appear once from the emit and once from the return value;
+                        # that duplication is benign compared to an empty message.)
+                        return feedback_result.get("_feedback_message", "")
                 else:
                     # Regular display of outline if interactive research is disabled
                     if not self.valves.QUIET_CHAT_MODE:
@@ -13615,11 +13590,14 @@ Format your response as a valid JSON object with the following structure:
         await self.emit_status("success", "Deep research complete!", True)
 
         # Return the final research report as the assistant message content.
-        # Open WebUI pipes should return content rather than rely on "message"
-        # events, which the frontend may overwrite on final save.
-        if self.valves.QUIET_CHAT_MODE:
-            return comprehensive_answer
-        return ""
+        # OWUI >=0.9 uses the pipe() return value as the final saved message,
+        # overwriting any content that was streamed via emit_message() events.
+        # Always returning comprehensive_answer ensures the report is saved
+        # correctly on all OWUI versions.  On older OWUI that appends the return
+        # value to the streamed content, non-QUIET users will see the report
+        # body twice (once from emit_message, once from the return value); that
+        # duplication is acceptable compared to an empty saved message.
+        return comprehensive_answer
 
 
 class TrajectoryAccumulator:
