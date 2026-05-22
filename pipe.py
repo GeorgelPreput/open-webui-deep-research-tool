@@ -52,6 +52,13 @@ name = "Deep Research"
 def setup_logger():
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
+    # Remove any handlers left over from a previous module exec. OWUI can
+    # re-exec this module (e.g. on function save/reload) while the process
+    # stays alive. logging.getLogger() returns a process-global singleton, so
+    # handlers from prior execs accumulate and produce double (or triple) output
+    # — one copy per old StreamHandler plus one from loguru. Clear them first.
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
     # Propagate to the root logger so OWUI's loguru InterceptHandler
     # (open_webui.utils.logger.InterceptHandler, attached to root via
     # logging.basicConfig in env.py / utils/logger.py) captures our records
@@ -11694,6 +11701,44 @@ new ResizeObserver(reportHeight).observe(document.body);
             f"__model__.id={passed_model!r} messages={msg_count} "
             f"user_id={__user__.get('id') if isinstance(__user__, dict) else None!r}"
         )
+
+        # Scenario-B model guard: ensure the configured research model is visible
+        # in app.state.MODELS before we attempt any LLM call.  OWUI backs
+        # app.state.MODELS with a RedisDict that persists across restarts; if a
+        # model was added after the last snapshot the dict may be stale and
+        # generate_chat_completions will raise "Model not found" partway through
+        # the research run.  Checking here — after we have __request__ — lets us
+        # self-correct with a single proactive refresh.  This cannot help when
+        # the *deep_research* routing model itself is missing (that error fires
+        # before pipe() is ever called); for that case an external refresh is
+        # required (e.g. Admin → Functions → Save, or GET /api/models?refresh=true).
+        if __request__ is not None:
+            research_model = self.valves.RESEARCH_MODEL
+            if research_model and research_model not in __request__.app.state.MODELS:
+                logger.warning(
+                    "Research model %r not found in app.state.MODELS; "
+                    "triggering a proactive model refresh before research run",
+                    research_model,
+                )
+                try:
+                    from open_webui.utils.models import get_all_models
+
+                    await get_all_models(__request__, refresh=True)
+                    if research_model in __request__.app.state.MODELS:
+                        logger.info(
+                            "Model refresh succeeded; %r is now registered",
+                            research_model,
+                        )
+                    else:
+                        logger.error(
+                            "Model refresh completed but %r is still not registered — "
+                            "check that the model is enabled in OWUI Admin → Models",
+                            research_model,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Proactive model refresh failed (will proceed anyway): %s", exc
+                    )
 
         # Extract conversation ID from the message history
         messages = body.get("messages", [])
