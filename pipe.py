@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import concurrent.futures
+import contextlib
 import contextvars
 import hashlib
 import html
@@ -10,8 +11,9 @@ import math
 import random
 import re
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, TypedDict
+from typing import Any, TypedDict
 
 import aiohttp
 import numpy as np
@@ -34,7 +36,7 @@ from starlette.exceptions import HTTPException as _HTTPException
 try:
     from fake_useragent import UserAgent as _UserAgent
 
-    _ua_provider: Optional[Any] = _UserAgent()
+    _ua_provider: Any | None = _UserAgent()
 except Exception:
     _ua_provider = None
 
@@ -77,7 +79,7 @@ logger = setup_logger()
 # crashes when metadata['chat_id'] is None; local: ids skip chat DB persistence.
 _INTERNAL_COMPLETION_CHAT_ID = "local:dr-pipe-internal"
 
-EventEmitter = Callable[[Dict[str, Any]], Awaitable[Any]]
+EventEmitter = Callable[[dict[str, Any]], Awaitable[Any]]
 
 
 class BibliographyEntry(TypedDict):
@@ -87,9 +89,9 @@ class BibliographyEntry(TypedDict):
 
 
 class BibliographyData(TypedDict):
-    bibliography: List[BibliographyEntry]
-    title_to_global_id: Dict[str, int]
-    url_to_global_id: Dict[str, int]
+    bibliography: list[BibliographyEntry]
+    title_to_global_id: dict[str, int]
+    url_to_global_id: dict[str, int]
 
 
 # ---------------------------------------------------------------------------
@@ -107,40 +109,40 @@ class BibliographyData(TypedDict):
 # are written exactly once at the top of `pipe()`.
 # ---------------------------------------------------------------------------
 
-_ev_emitter_var: contextvars.ContextVar[Optional[EventEmitter]] = (
+_ev_emitter_var: contextvars.ContextVar[EventEmitter | None] = (
     contextvars.ContextVar("deep_research_ev_emitter", default=None)
 )
-_ev_call_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+_ev_call_var: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "deep_research_ev_call", default=None
 )
-_user_var: contextvars.ContextVar[Optional[User]] = contextvars.ContextVar(
+_user_var: contextvars.ContextVar[User | None] = contextvars.ContextVar(
     "deep_research_user", default=None
 )
-_model_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+_model_var: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "deep_research_model", default=None
 )
-_request_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+_request_var: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "deep_research_request", default=None
 )
-_conv_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+_conv_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "deep_research_conv_id", default=None
 )
-_chat_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+_chat_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "deep_research_chat_id", default=None
 )
 _is_pdf_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "deep_research_is_pdf", default=False
 )
-_research_date_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+_research_date_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "deep_research_date", default=None
 )
-_trajectory_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+_trajectory_var: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "deep_research_trajectory", default=None
 )
-_seen_subtopics_var: contextvars.ContextVar[Optional[Set[str]]] = (
+_seen_subtopics_var: contextvars.ContextVar[set[str] | None] = (
     contextvars.ContextVar("deep_research_seen_subtopics", default=None)
 )
-_seen_sections_var: contextvars.ContextVar[Optional[Set[str]]] = contextvars.ContextVar(
+_seen_sections_var: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar(
     "deep_research_seen_sections", default=None
 )
 
@@ -244,7 +246,7 @@ _TRANSIENT_FALLBACK_PHRASES = (
 )
 
 
-def _classify_transient_completion_error(e: BaseException) -> Optional[str]:
+def _classify_transient_completion_error(e: BaseException) -> str | None:
     """Return a short reason string if `e` is a retriable error, else None.
 
     Returning a reason (rather than a bare bool) lets callers log
@@ -281,7 +283,7 @@ class CompletionError(RuntimeError):
         model: str,
         original: BaseException,
         attempts: int,
-        transient_reason: Optional[str],
+        transient_reason: str | None,
     ) -> None:
         self.model = model
         self.original = original
@@ -362,7 +364,7 @@ class _LRUBytesBoundedCache:
                 self._bytes -= self._entry_bytes(evicted)
                 self.eviction_count += 1
 
-    def stats(self) -> Dict[str, float | int]:
+    def stats(self) -> dict[str, float | int]:
         total = self.hit_count + self.miss_count
         return {
             "entries": len(self._od),
@@ -855,7 +857,7 @@ class Pipe:
         # _seen_{subtopics,sections}) lives in module-level ContextVars and
         # is set at the top of pipe().
 
-    def _require_request(self, context: str) -> Optional[Any]:
+    def _require_request(self, context: str) -> Any | None:
         """Return the per-call OWUI Request object or log a clear failure."""
         req = self.__request__
         if req is None:
@@ -1035,7 +1037,7 @@ class Pipe:
 
     DR_STATE_VERSION = 2
 
-    def _new_dr_state(self, *, user_request: str = "") -> Dict[str, Any]:
+    def _new_dr_state(self, *, user_request: str = "") -> dict[str, Any]:
         """Build a fresh deepResearch checkpoint object."""
         now_iso = datetime.now().isoformat()
         return {
@@ -1068,15 +1070,15 @@ class Pipe:
             "followup_constraints_summary": "",
         }
 
-    def _get_dr_state(self) -> Optional[Dict[str, Any]]:
+    def _get_dr_state(self) -> dict[str, Any] | None:
         return self.get_state().get("dr_state")
 
-    def _set_dr_state(self, dr_state: Dict[str, Any]) -> None:
+    def _set_dr_state(self, dr_state: dict[str, Any]) -> None:
         dr_state["last_checkpoint_at"] = datetime.now().isoformat()
         self.update_state("dr_state", dr_state)
 
     @staticmethod
-    def _owui_request_metadata(request: Optional[Any]) -> Dict[str, Any]:
+    def _owui_request_metadata(request: Any | None) -> dict[str, Any]:
         """Return OWUI chat metadata attached to the inbound HTTP request."""
         if request is None:
             return {}
@@ -1086,8 +1088,8 @@ class Pipe:
 
     @staticmethod
     def _resolve_chat_id(
-        body: Dict[str, Any], request: Optional[Any] = None
-    ) -> Optional[str]:
+        body: dict[str, Any], request: Any | None = None
+    ) -> str | None:
         """Pull the OWUI chat_id from body, nested metadata, or request.state."""
         md = body.get("metadata") or {}
         chat_id = md.get("chat_id") or body.get("chat_id")
@@ -1098,10 +1100,10 @@ class Pipe:
     def _build_internal_completion_form_data(
         self,
         model: str,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         stream: bool,
         temperature: float,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Build form_data for nested generate_chat_completions calls.
 
         Uses a synthetic local: chat_id so inner research LLM calls do not hit
@@ -1120,8 +1122,8 @@ class Pipe:
         }
 
     async def _load_persisted_dr_state(
-        self, chat_id: Optional[str]
-    ) -> Optional[Dict[str, Any]]:
+        self, chat_id: str | None
+    ) -> dict[str, Any] | None:
         """Read deepResearch checkpoint from the chat record."""
         if not chat_id:
             return None
@@ -1140,7 +1142,7 @@ class Pipe:
             return None
 
     async def _save_persisted_dr_state(
-        self, chat_id: Optional[str], dr_state: Dict[str, Any]
+        self, chat_id: str | None, dr_state: dict[str, Any]
     ) -> None:
         """Read-merge-write the deepResearch checkpoint into chat JSON.
 
@@ -1172,7 +1174,7 @@ class Pipe:
         await self._save_persisted_dr_state(getattr(self, "chat_id", None), dr)
 
     async def _attach_collection_to_chat(
-        self, chat_id: Optional[str], kb_id: str, kb_name: str
+        self, chat_id: str | None, kb_id: str, kb_name: str
     ) -> None:
         """Append the research KB as a collection entry on the chat's files list.
 
@@ -1225,7 +1227,7 @@ class Pipe:
         slug = cls._slugify_research_title(title or "")
         return f"dr-{timestamp}-{slug}"
 
-    async def _ensure_research_kb(self, title_hint: str) -> Optional[tuple[str, str]]:
+    async def _ensure_research_kb(self, title_hint: str) -> tuple[str, str] | None:
         """Create (or return existing) private research KB. Returns (id, name)."""
         dr = self._get_dr_state()
         if dr and dr.get("kb_id") and dr.get("kb_name"):
@@ -1275,7 +1277,7 @@ class Pipe:
         url: str,
         title: str,
         exact_text: str,
-        meta: Dict[str, Any],
+        meta: dict[str, Any],
     ) -> str:
         """Wrap exact extractor output with a deterministic metadata preamble.
 
@@ -1321,8 +1323,8 @@ class Pipe:
         kb_id: str,
         filename: str,
         markdown_text: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
+        metadata: dict[str, Any] | None = None,
+    ) -> str | None:
         """Upload synthetic markdown, process inline, add to the KB.
 
         Returns the OWUI file_id on success, or None on failure. The upload
@@ -1356,10 +1358,8 @@ class Pipe:
                 return None
             payload = markdown_text.encode("utf-8", errors="replace")
             uf = UploadFile(filename=filename, file=BytesIO(payload))
-            try:
+            with contextlib.suppress(Exception):
                 uf.headers["content-type"] = "text/markdown"
-            except Exception:
-                pass
 
             upload_meta = dict(metadata or {})
             upload_meta.setdefault("name", filename)
@@ -1434,7 +1434,7 @@ class Pipe:
         source_type: str = "web",
         archived: bool = False,
         search_query: str = "",
-    ) -> Optional[str]:
+    ) -> str | None:
         """Write a selected source through to the research KB.
 
         Idempotent per URL: if the URL is already in the source_manifest with
@@ -1529,7 +1529,7 @@ class Pipe:
 
     async def _persist_final_report(
         self, report_md: str, report_title: str
-    ) -> Optional[str]:
+    ) -> str | None:
         """Persist the finalized report markdown into the research KB."""
         dr = self._get_dr_state()
         if not dr or not dr.get("kb_id"):
@@ -1585,7 +1585,7 @@ class Pipe:
         self._set_dr_state(dr)
 
     @staticmethod
-    def _extract_token_counts(response: Dict[str, Any]) -> tuple[int, int]:
+    def _extract_token_counts(response: dict[str, Any]) -> tuple[int, int]:
         """Best-effort extraction of (prompt_tokens, completion_tokens) from
         an OWUI completion response. Returns (0, 0) if unavailable."""
         try:
@@ -1600,7 +1600,7 @@ class Pipe:
             pass
         return 0, 0
 
-    async def _rehydrate_working_corpus_from_kb(self) -> Dict[str, str]:
+    async def _rehydrate_working_corpus_from_kb(self) -> dict[str, str]:
         """Rebuild url_results_cache from persisted KB file content.
 
         Returns the rehydrated cache (and also installs it into in-memory
@@ -1619,7 +1619,7 @@ class Pipe:
             logger.warning(f"Cannot rehydrate corpus, Files model unavailable: {e}")
             return {}
 
-        rehydrated: Dict[str, str] = {}
+        rehydrated: dict[str, str] = {}
         for url, entry in manifest.items():
             file_id = entry.get("file_id")
             if not file_id:
@@ -1647,7 +1647,7 @@ class Pipe:
 
     async def _kb_search(
         self, kb_id: str, query: str, k: int = 6
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Run a vector search against the research KB collection.
 
         Uses Open WebUI's configured EMBEDDING_FUNCTION + VECTOR_DB_CLIENT.
@@ -1680,7 +1680,7 @@ class Pipe:
             docs0 = documents[0] if documents and len(documents) > 0 else []
             metas0 = metadatas[0] if metadatas and len(metadatas) > 0 else []
             dists0 = distances[0] if distances and len(distances) > 0 else []
-            out: List[Dict[str, Any]] = []
+            out: list[dict[str, Any]] = []
             for i, txt in enumerate(docs0):
                 meta = metas0[i] if i < len(metas0) else {}
                 dist = dists0[i] if i < len(dists0) else None
@@ -1697,7 +1697,7 @@ class Pipe:
         qa_prompt: str,
         *,
         k: int = 6,
-        model: Optional[str] = None,
+        model: str | None = None,
     ) -> str:
         """Targeted KB-grounded QA call used during report synthesis.
 
@@ -1713,7 +1713,7 @@ class Pipe:
         chunks = await self._kb_search(kb_id, qa_prompt, k=k)
         if not chunks:
             return ""
-        ctx_lines: List[str] = []
+        ctx_lines: list[str] = []
         for i, c in enumerate(chunks, start=1):
             src = c.get("source") or {}
             origin = (
@@ -1790,7 +1790,7 @@ class Pipe:
         "  so the user can copy-paste that summary into a new chat."
     )
 
-    async def _answer_post_report_user_qa(self, body: Dict[str, Any]) -> str:
+    async def _answer_post_report_user_qa(self, body: dict[str, Any]) -> str:
         """Post-report QA path: skip deep-research orchestration entirely
         and answer the user's latest message using the persisted KB."""
         dr = self._get_dr_state()
@@ -1821,7 +1821,7 @@ class Pipe:
                 "No KB matches found; answering from system prompt only.",
                 False,
             )
-        ctx_lines: List[str] = []
+        ctx_lines: list[str] = []
         for i, c in enumerate(chunks, start=1):
             src = c.get("source") or {}
             origin = (
@@ -1884,7 +1884,7 @@ class Pipe:
             logger.error(f"Error counting tokens with tiktoken: {e}")
             return int(len(text.split()) * 1.3)
 
-    async def get_embedding(self, text: str) -> Optional[List[float]]:
+    async def get_embedding(self, text: str) -> list[float] | None:
         """Get embedding via Open WebUI's configured embedding function (handles
         local sentence-transformers, Ollama, OpenAI, or Azure OpenAI transparently)."""
         if not text or not text.strip():
@@ -1913,7 +1913,7 @@ class Pipe:
 
     async def get_transformed_embedding(
         self, text: str, transformation=None
-    ) -> Optional[List[float]]:
+    ) -> list[float] | None:
         """Get embedding with optional transformation applied, using caching for efficiency"""
         if not text or not text.strip():
             return None
@@ -1958,7 +1958,7 @@ class Pipe:
 
     async def create_context_vocabulary(
         self, context_text: str, min_size: int = 1000
-    ) -> List[str]:
+    ) -> list[str]:
         """Create a vocabulary from recent context when standard vocabulary is unavailable"""
         logger.info("Creating vocabulary from context as fallback")
 
@@ -1986,7 +1986,7 @@ class Pipe:
             cache_dir.mkdir(parents=True, exist_ok=True)
             disk_path = str(cache_dir / "vocabulary.txt")
             try:
-                with open(disk_path, "r") as f:
+                with open(disk_path) as f:
                     words = [w.strip() for w in f.readlines() if w.strip()]
                 if words:
                     self.vocabulary_cache = words
@@ -2098,7 +2098,7 @@ class Pipe:
                 data = np.load(disk_path)
                 words = data["words"].tolist()
                 embeddings = data["embeddings"].tolist()
-                self.vocabulary_embeddings = {w: e for w, e in zip(words, embeddings)}
+                self.vocabulary_embeddings = {w: e for w, e in zip(words, embeddings, strict=False)}
                 logger.info(
                     f"Loaded {len(self.vocabulary_embeddings)} vocabulary embeddings from disk cache"
                 )
@@ -2144,7 +2144,7 @@ class Pipe:
                 return {}
 
             self.vocabulary_embeddings = {
-                word: emb for word, emb in zip(vocab, all_embeddings) if emb
+                word: emb for word, emb in zip(vocab, all_embeddings, strict=False) if emb
             }
             logger.info(
                 f"Generated embeddings for {len(self.vocabulary_embeddings)} vocabulary words"
@@ -2165,7 +2165,7 @@ class Pipe:
             self.update_state("vocabulary_embeddings", self.vocabulary_embeddings)
             return self.vocabulary_embeddings
 
-    def chunk_text(self, text: str) -> List[str]:
+    def chunk_text(self, text: str) -> list[str]:
         """Split text into chunks based on the configured chunk level"""
         chunk_level = self.valves.CHUNK_LEVEL
 
@@ -2667,10 +2667,7 @@ class Pipe:
                             curr_number = int(curr_match.group(1))
 
                             # Check if sequential
-                            if curr_number == prev_number + 1:
-                                is_numbered_item = True
-                            else:
-                                is_numbered_item = False
+                            is_numbered_item = curr_number == prev_number + 1
                         except ValueError:
                             pass
 
@@ -2841,7 +2838,7 @@ class Pipe:
     # Report-level token-budget helpers
     # -----------------------------------------------------------------------
 
-    async def _count_message_tokens(self, messages: List[Dict[str, Any]]) -> int:
+    async def _count_message_tokens(self, messages: list[dict[str, Any]]) -> int:
         """Estimate total tokens for an OpenAI-style messages list.
 
         Adds a small per-message overhead for chat framing that count_tokens()
@@ -2872,16 +2869,16 @@ class Pipe:
         self,
         task_name: str,
         model: str,
-        fixed_messages: List[Dict[str, Any]],
-        output_reserve: Optional[int] = None,
-    ) -> Dict[str, int]:
+        fixed_messages: list[dict[str, Any]],
+        output_reserve: int | None = None,
+    ) -> dict[str, int]:
         """Compute the allowed input-content token budget for one model call.
 
         Returns a dict with keys:
             context_window, prompt_tokens, output_reserve,
             safety_margin, input_budget
         """
-        _TASK_OUTPUT_RESERVES: Dict[str, int] = {
+        _TASK_OUTPUT_RESERVES: dict[str, int] = {
             "titles": 250,
             "abstract": 700,
             "introduction": 600,
@@ -2907,22 +2904,22 @@ class Pipe:
 
     async def _score_section_chunks(
         self,
-        sections: Dict[str, str],
+        sections: dict[str, str],
         anchor_text: str,
-        summary_text: Optional[str] = None,
-        task_name: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        summary_text: str | None = None,
+        task_name: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Score all chunks across sections for relevance to *anchor_text*.
 
         Returns a flat list of chunk records, each with keys:
             section_title, chunk_index, text, tokens, score, pinned
         """
         anchor_embedding = await self.get_embedding(anchor_text[:2000])
-        summary_embedding: Optional[List[float]] = None
+        summary_embedding: list[float] | None = None
         if summary_text:
             summary_embedding = await self.get_embedding(summary_text[:2000])
 
-        records: List[Dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
 
         for section_title, content in sections.items():
             if not content or not content.strip():
@@ -2931,12 +2928,12 @@ class Pipe:
             n = len(chunks)
 
             # Compute embeddings chunk by chunk, keeping index alignment
-            chunk_embeddings: List[Optional[List[float]]] = []
+            chunk_embeddings: list[list[float] | None] = []
             for chunk in chunks:
                 emb = await self.get_embedding(chunk)
                 chunk_embeddings.append(emb)
 
-            for idx, (chunk, emb) in enumerate(zip(chunks, chunk_embeddings)):
+            for idx, (chunk, emb) in enumerate(zip(chunks, chunk_embeddings, strict=False)):
                 token_count = await self.count_tokens(chunk)
 
                 # Base score from anchor similarity
@@ -2979,14 +2976,14 @@ class Pipe:
 
     async def _pack_sections_to_budget(
         self,
-        sections: Dict[str, str],
+        sections: dict[str, str],
         input_budget: int,
         anchor_text: str,
         task_name: str,
         include_query_line: bool = True,
         include_section_headings: bool = True,
         pinned_prefix: str = "",
-        min_chunks_per_section: Optional[int] = None,
+        min_chunks_per_section: int | None = None,
         allow_lossy: bool = True,
     ) -> str:
         """Pack section content into *input_budget* tokens preserving cross-section coverage.
@@ -3009,7 +3006,7 @@ class Pipe:
         pinned_tokens = await self.count_tokens(pinned_prefix) if pinned_prefix else 0
 
         # Section heading tokens
-        heading_tokens: Dict[str, int] = {}
+        heading_tokens: dict[str, int] = {}
         if include_section_headings:
             for title in sections:
                 heading_tokens[title] = await self.count_tokens(f"## {title}\n")
@@ -3023,14 +3020,14 @@ class Pipe:
         # ------------------------------------------------------------------ #
         # Step 3 — Guarantee minimum per-section coverage
         # ------------------------------------------------------------------ #
-        selected: List[Dict[str, Any]] = []
+        selected: list[dict[str, Any]] = []
         used_tokens = 0
-        covered_sections: Set[str] = set()
+        covered_sections: set[str] = set()
 
         # For each section pick the top min_chunks_per_section chunks
         from collections import defaultdict
 
-        by_section: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        by_section: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for rec in chunk_records:
             by_section[rec["section_title"]].append(rec)
         for title in by_section:
@@ -3083,11 +3080,11 @@ class Pipe:
         # ------------------------------------------------------------------ #
         # Step 6 — Assemble final text
         # ------------------------------------------------------------------ #
-        parts: List[str] = []
+        parts: list[str] = []
         if pinned_prefix:
             parts.append(pinned_prefix)
 
-        current_section: Optional[str] = None
+        current_section: str | None = None
         for rec in selected:
             if include_section_headings and rec["section_title"] != current_section:
                 parts.append(f"## {rec['section_title']}")
@@ -3140,7 +3137,7 @@ class Pipe:
     async def _build_titles_context(
         self,
         user_message: str,
-        sections: Dict[str, str],
+        sections: dict[str, str],
         input_budget: int,
     ) -> str:
         """Compact context for title generation: query + section titles + 1 key chunk each."""
@@ -3166,8 +3163,8 @@ class Pipe:
     async def _build_abstract_context(
         self,
         user_message: str,
-        sections: Dict[str, str],
-        bibliography: List[BibliographyEntry],
+        sections: dict[str, str],
+        bibliography: list[BibliographyEntry],
         input_budget: int,
     ) -> str:
         """Context for abstract: query + section coverage + source count."""
@@ -3192,8 +3189,8 @@ class Pipe:
     async def _build_intro_context(
         self,
         user_message: str,
-        outline: List[Dict[str, Any]],
-        sections: Dict[str, str],
+        outline: list[dict[str, Any]],
+        sections: dict[str, str],
         input_budget: int,
     ) -> str:
         """Context for introduction: query + outline bullets + section chunks."""
@@ -3227,7 +3224,7 @@ class Pipe:
     async def _build_conclusion_context(
         self,
         user_message: str,
-        sections: Dict[str, str],
+        sections: dict[str, str],
         input_budget: int,
     ) -> str:
         """Context for conclusion: query + section-aware packed content."""
@@ -3251,10 +3248,10 @@ class Pipe:
     async def compress_content_with_local_similarity(
         self,
         content: str,
-        query_embedding: Optional[List[float]],
-        summary_embedding: Optional[List[float]] = None,
-        ratio: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        query_embedding: list[float] | None,
+        summary_embedding: list[float] | None = None,
+        ratio: float | None = None,
+        max_tokens: int | None = None,
         _retry_depth: int = 0,
     ) -> str:
         """Apply semantic compression with local similarity influence and token limiting"""
@@ -3490,10 +3487,10 @@ class Pipe:
     async def compress_content_with_eigendecomposition(
         self,
         content: str,
-        query_embedding: Optional[List[float]],
-        summary_embedding: Optional[List[float]] = None,
-        ratio: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        query_embedding: list[float] | None,
+        summary_embedding: list[float] | None = None,
+        ratio: float | None = None,
+        max_tokens: int | None = None,
         _retry_depth: int = 0,
     ) -> str:
         """Apply semantic compression using eigendecomposition with token limiting"""
@@ -3791,7 +3788,7 @@ class Pipe:
         self,
         content: str,
         url: str,
-        query_embedding: Optional[List[float]],
+        query_embedding: list[float] | None,
         repeat_count: int,
     ) -> str:
         """Process repeated content with improved sliding window and adaptive shrinkage"""
@@ -3913,10 +3910,10 @@ class Pipe:
 
     async def apply_stepped_compression(
         self,
-        results_history: List[Dict[str, Any]],
-        query_embedding: Optional[List[float]],
-        summary_embedding: Optional[List[float]] = None,
-    ) -> List[Dict[str, Any]]:
+        results_history: list[dict[str, Any]],
+        query_embedding: list[float] | None,
+        summary_embedding: list[float] | None = None,
+    ) -> list[dict[str, Any]]:
         """Apply tiered compression to all research results based on age"""
         if not self.valves.STEPPED_SYNTHESIS_COMPRESSION or len(results_history) <= 2:
             return results_history
@@ -4308,10 +4305,10 @@ class Pipe:
 
     async def calculate_query_similarity(
         self,
-        content_embedding: List[float],
-        query_embedding: List[float],
-        outline_embedding: Optional[List[float]] = None,
-        summary_embedding: Optional[List[float]] = None,
+        content_embedding: list[float],
+        query_embedding: list[float],
+        outline_embedding: list[float] | None = None,
+        summary_embedding: list[float] | None = None,
     ) -> float:
         """Calculate similarity to query with optional context embeddings using caching"""
 
@@ -4422,9 +4419,9 @@ class Pipe:
 
     async def scale_token_limit_by_relevance(
         self,
-        result: Dict[str, Any],
-        query_embedding: Optional[List[float]],
-        pdv: Optional[List[float]] = None,
+        result: dict[str, Any],
+        query_embedding: list[float] | None,
+        pdv: list[float] | None = None,
     ) -> int:
         """Scale the token limit for a result based on its relevance to the query and PDV"""
         base_token_limit = self.valves.MAX_RESULT_TOKENS
@@ -4488,8 +4485,8 @@ class Pipe:
         return impact
 
     async def calculate_preference_direction_vector(
-        self, kept_items: List[str], removed_items: List[str], all_topics: List[str]
-    ) -> Dict[str, Any]:
+        self, kept_items: list[str], removed_items: list[str], all_topics: list[str]
+    ) -> dict[str, Any]:
         """Calculate the Preference Direction Vector based on kept and removed items"""
         if not kept_items or not removed_items:
             return {"pdv": None, "strength": 0.0, "impact": 0.0}
@@ -4701,7 +4698,7 @@ class Pipe:
             logger.warning("No research dimensions available for display")
 
     async def initialize_research_dimensions(
-        self, outline_items: List[str], user_query: str
+        self, outline_items: list[str], user_query: str
     ):
         """Initialize the semantic dimensions for tracking research progress"""
         try:
@@ -4807,7 +4804,7 @@ class Pipe:
         except Exception as e:
             logger.error(f"Error updating dimension coverage: {e}")
 
-    async def identify_research_gaps(self) -> List[int]:
+    async def identify_research_gaps(self) -> list[int]:
         """Identify semantic dimensions that need more research"""
         state = self.get_state()
         research_dimensions = state.get("research_dimensions")
@@ -4928,13 +4925,9 @@ class Pipe:
         if lowered.startswith("error") or lowered.startswith("could not extract"):
             return False
         # Reject HTML-tag-dominated output (primary path should return text)
-        if stripped.startswith("<") and stripped.count("<") > max(
-            20, len(stripped) // 20
-        ):
-            return False
-        return True
+        return not (stripped.startswith("<") and stripped.count("<") > max(20, len(stripped) // 20))
 
-    def _build_document_loader_kwargs(self) -> Dict[str, Any]:
+    def _build_document_loader_kwargs(self) -> dict[str, Any]:
         """Best-effort gather of Open WebUI document loader configuration.
 
         The Loader class accepts an engine name plus a wide set of engine
@@ -4982,13 +4975,11 @@ class Pipe:
             "MINERU_API_TIMEOUT",
             "MINERU_PARAMS",
         ):
-            try:
+            with contextlib.suppress(Exception):
                 kwargs[attr] = getattr(cfg, attr)
-            except Exception:
-                pass
         return kwargs
 
-    async def _primary_web_extract(self, url: str) -> Optional[Dict[str, Any]]:
+    async def _primary_web_extract(self, url: str) -> dict[str, Any] | None:
         """Run Open WebUI's configured Web Loader for a single URL.
 
         Returns a normalized dict {"text", "title", "source_type",
@@ -5075,7 +5066,7 @@ class Pipe:
         content_bytes,
         url: str,
         content_type: str = "application/pdf",
-    ) -> Optional[str]:
+    ) -> str | None:
         """Run Open WebUI's configured document Loader on raw bytes.
 
         Stages the bytes to a temp file (the Loader API expects a path),
@@ -5120,10 +5111,8 @@ class Pipe:
                 with os.fdopen(fd, "wb") as fh:
                     fh.write(payload)
             except Exception:
-                try:
+                with contextlib.suppress(Exception):
                     os.close(fd)
-                except Exception:
-                    pass
                 raise
 
             loader_kwargs = self._build_document_loader_kwargs()
@@ -5160,10 +5149,8 @@ class Pipe:
             return None
         finally:
             if tmp_path:
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(tmp_path)
-                except OSError:
-                    pass
 
     async def _extract_pdf_with_primary_fallback(
         self,
@@ -5211,7 +5198,7 @@ class Pipe:
         logger.info(f"Using legacy PDF extractor for {url}")
         return await self.extract_text_from_pdf(pdf_content)
 
-    async def _register_primary_source(self, url: str, result: Dict[str, Any]) -> None:
+    async def _register_primary_source(self, url: str, result: dict[str, Any]) -> None:
         """Write a successful primary-path extraction into cache and source table.
 
         This is the single shared registration point for the primary web
@@ -5276,7 +5263,7 @@ class Pipe:
             except Exception as e:
                 logger.warning(f"KB persistence failed for {url}: {e}")
 
-    async def _try_primary_web_flow(self, url: str) -> Optional[str]:
+    async def _try_primary_web_flow(self, url: str) -> str | None:
         """Try Open WebUI's Web Loader for an HTML URL.
 
         Returns the extracted text on success (cache + master_source_table +
@@ -5826,7 +5813,7 @@ class Pipe:
                         )
                         return f"Error fetching content: HTTP status {response.status}"
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"Timeout fetching content from {url}")
             return f"Timeout while fetching content from {url}"
         except aiohttp.ClientConnectorError as e:
@@ -6365,12 +6352,12 @@ class Pipe:
 
     async def process_search_result(
         self,
-        result: Dict[str, Any],
+        result: dict[str, Any],
         query: str,
-        query_embedding: Optional[List[float]],
-        outline_embedding: Optional[List[float]],
-        summary_embedding: Optional[List[float]] = None,
-    ) -> Dict[str, Any]:
+        query_embedding: list[float] | None,
+        outline_embedding: list[float] | None,
+        summary_embedding: list[float] | None = None,
+    ) -> dict[str, Any]:
         """Process a search result to extract and compress content with token limiting"""
         title = result.get("title", "")
         url = result.get("url", "")
@@ -6659,7 +6646,7 @@ class Pipe:
 
     async def _try_openwebui_search(
         self, query: str, total_results: int
-    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    ) -> tuple[list[dict[str, Any]], str | None]:
         """Call Open WebUI's integrated web search.
 
         Returns (results, failure_reason), where None means the call completed
@@ -6681,7 +6668,7 @@ class Pipe:
             search_results = await asyncio.wait_for(search_task, timeout=15.0)
 
             logger.debug(f"Search results received: {type(search_results)}")
-            results: List[Dict[str, Any]] = []
+            results: list[dict[str, Any]] = []
 
             if not search_results:
                 return results, None
@@ -6740,14 +6727,14 @@ class Pipe:
 
             return results, None
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"OpenWebUI search timed out for query: {query}")
             return [], "timeout"
         except Exception as e:
             logger.error(f"Error in _try_openwebui_search: {str(e)}")
             return [], f"error: {e}"
 
-    async def search_web(self, query: str) -> List[Dict[str, Any]]:
+    async def search_web(self, query: str) -> list[dict[str, Any]]:
         """Perform an Open WebUI integrated web search.
 
         Returns normalized {title, url, snippet} results, or one synthetic
@@ -6759,7 +6746,7 @@ class Pipe:
         url_selected_count = state.get("url_selected_count", {})
 
         repeat_count = 0
-        for url, count in url_selected_count.items():
+        for _url, count in url_selected_count.items():
             if count >= self.valves.REPEATS_BEFORE_EXPANSION:
                 repeat_count += 1
 
@@ -6799,12 +6786,12 @@ class Pipe:
 
     async def select_most_relevant_results(
         self,
-        results: List[Dict[str, Any]],
+        results: list[dict[str, Any]],
         query: str,
-        query_embedding: Optional[List[float]],
-        outline_embedding: Optional[List[float]],
-        summary_embedding: Optional[List[float]] = None,
-    ) -> List[Dict[str, Any]]:
+        query_embedding: list[float] | None,
+        outline_embedding: list[float] | None,
+        summary_embedding: list[float] | None = None,
+    ) -> list[dict[str, Any]]:
         """Select the most relevant results from extra results pool using semantic transformations with similarity caching"""
         if not results:
             return results
@@ -7095,9 +7082,9 @@ class Pipe:
 
     async def check_result_relevance(
         self,
-        result: Dict[str, Any],
+        result: dict[str, Any],
         query: str,
-        outline_items: Optional[List[str]] = None,
+        outline_items: list[str] | None = None,
     ) -> bool:
         """Check if a search result is relevant to the query and research outline using a lightweight model"""
         if not self.valves.QUALITY_FILTER_ENABLED:
@@ -7189,11 +7176,11 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
     async def process_query(
         self,
         query: str,
-        query_embedding: Optional[List[float]],
-        outline_embedding: Optional[List[float]],
-        cycle_feedback: Optional[Dict[str, Any]] = None,
-        summary_embedding: Optional[List[float]] = None,
-    ) -> List[Dict[str, Any]]:
+        query_embedding: list[float] | None,
+        outline_embedding: list[float] | None,
+        cycle_feedback: dict[str, Any] | None = None,
+        summary_embedding: list[float] | None = None,
+    ) -> list[dict[str, Any]]:
         """Process a single search query and get results with quality filtering"""
         await self.emit_status("info", f"Searching for: {query}", False)
 
@@ -7498,9 +7485,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
     async def generate_completion(
         self,
         model: str,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         stream: bool = False,
-        temperature: Optional[float] = None,
+        temperature: float | None = None,
         timeout: float = 600.0,
     ) -> dict[str, Any]:
         """Generate a completion from the specified model"""
@@ -7550,7 +7537,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     f"generate_completion: model={model!r} attempt={attempt + 1} succeeded"
                 )
                 return response
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.error(f"Completion timed out after {timeout}s for model {model}")
                 raise
             except Exception as e:
@@ -7638,7 +7625,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         except Exception as e:
             logger.error(f"Error emitting embed: {e}")
 
-    def build_progress_snapshot(self, cycle: Optional[int] = None) -> Dict[str, Any]:
+    def build_progress_snapshot(self, cycle: int | None = None) -> dict[str, Any]:
         """Collect state into a normalized snapshot for the progress embed."""
         state = self.get_state()
         research_state = state.get("research_state") or {}
@@ -7678,15 +7665,15 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         }
 
     def normalize_progress_categories(
-        self, snapshot: Dict[str, Any]
-    ) -> Dict[str, List[str]]:
+        self, snapshot: dict[str, Any]
+    ) -> dict[str, list[str]]:
         """Apply precedence (irrelevant > completed > partial > remaining) and stable ordering."""
         all_topics = list(snapshot.get("all_topics", []))
         new_topics = [t for t in snapshot.get("new_topics", []) if t]
 
         # Stable base order: original outline, then newly discovered topics in discovery order
-        base_order: List[str] = []
-        seen: Set[str] = set()
+        base_order: list[str] = []
+        seen: set[str] = set()
         for t in all_topics + new_topics:
             if t and t not in seen:
                 seen.add(t)
@@ -7712,7 +7699,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             and t not in partial_set
         }
 
-        def ordered(topics: Set[str]) -> List[str]:
+        def ordered(topics: set[str]) -> list[str]:
             known = [t for t in base_order if t in topics]
             extras = [t for t in sorted(topics) if t not in set(known)]
             return known + extras
@@ -7725,7 +7712,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             "remaining": ordered(remaining_set),
         }
 
-    def render_progress_embed_html(self, snapshot: Dict[str, Any]) -> str:
+    def render_progress_embed_html(self, snapshot: dict[str, Any]) -> str:
         """Render a self-contained, sandbox-safe HTML panel for the progress artifact."""
         categories = self.normalize_progress_categories(snapshot)
         e = self.escape_html
@@ -7752,7 +7739,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             f"</div>"
         )
 
-        def checklist(items: List[str], checked: bool) -> str:
+        def checklist(items: list[str], checked: bool) -> str:
             if not items:
                 return '<div class="empty">—</div>'
             attrs = " checked" if checked else ""
@@ -7762,7 +7749,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             ]
             return "".join(rows)
 
-        def emoji_list(items: List[str], emoji: str) -> str:
+        def emoji_list(items: list[str], emoji: str) -> str:
             if not items:
                 return '<div class="empty">—</div>'
             rows = [
@@ -7819,7 +7806,7 @@ new ResizeObserver(reportHeight).observe(document.body);
 </body></html>"""
 
     async def refresh_progress_embed(
-        self, cycle: Optional[int] = None, force: bool = False
+        self, cycle: int | None = None, force: bool = False
     ) -> None:
         """Build the latest progress snapshot and emit an embed if it changed."""
         if not self.valves.ENABLE_PROGRESS_EMBED:
@@ -7837,11 +7824,11 @@ new ResizeObserver(reportHeight).observe(document.body);
 
     async def rank_topics_by_research_priority(
         self,
-        active_topics: List[str],
-        gap_vector: Optional[List[float]] = None,
-        completed_topics: Optional[Set[str]] = None,
-        research_results: Optional[List[Dict[str, Any]]] = None,
-    ) -> List[str]:
+        active_topics: list[str],
+        gap_vector: list[float] | None = None,
+        completed_topics: set[str] | None = None,
+        research_results: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
         """Rank research topics by priority using semantic dimensions and gap analysis with dampening for frequently used topics"""
         if not active_topics:
             return []
@@ -8177,8 +8164,8 @@ new ResizeObserver(reportHeight).observe(document.body);
         return ranked_topics
 
     async def process_user_outline_feedback(
-        self, outline_items: List[Dict[str, Any]], original_query: str
-    ) -> Dict[str, Any]:
+        self, outline_items: list[dict[str, Any]], original_query: str
+    ) -> dict[str, Any]:
         """Process user feedback on research outline items by asking for feedback in chat"""
         # Number each outline item (maintain hierarchy but flatten for numbering)
         numbered_outline = []
@@ -8249,39 +8236,39 @@ new ResizeObserver(reportHeight).observe(document.body);
         }
 
     async def process_natural_language_feedback(
-        self, user_message: str, flat_items: List[str]
-    ) -> Dict[str, Any]:
+        self, user_message: str, flat_items: list[str]
+    ) -> dict[str, Any]:
         """Process natural language feedback to determine which topics to keep/remove"""
 
         # Create a prompt for the model to interpret user feedback
         interpret_prompt = {
             "role": "system",
             "content": """You are a post-grad research assistant analyzing user feedback on a research outline.
-	Based on the user's natural language input, determine which research topics should be kept or removed.
+    Based on the user's natural language input, determine which research topics should be kept or removed.
 
-	The user's message expresses preferences about the research direction. Analyze this to identify:
-	1. Which specific topics from the outline align with their interests
-	2. Which specific topics should be removed based on their preferences
+    The user's message expresses preferences about the research direction. Analyze this to identify:
+    1. Which specific topics from the outline align with their interests
+    2. Which specific topics should be removed based on their preferences
 
-	Your task is to categorize each topic as EITHER "keep" OR "remove", NEVER both, based on the user's natural language feedback.
+    Your task is to categorize each topic as EITHER "keep" OR "remove", NEVER both, based on the user's natural language feedback.
     Don't allow your own biases or preferences to have any affect on your answer - please remain purely objective and user research-oriented.
-	Provide your response as a JSON object with two lists: "keep" for indices to keep, and "remove" for indices to remove.
-	Indices should be 0-based (first item is index 0).""",
+    Provide your response as a JSON object with two lists: "keep" for indices to keep, and "remove" for indices to remove.
+    Indices should be 0-based (first item is index 0).""",
         }
 
         # Prepare context with list of topics and user message
         topics_list = "\n".join([f"{i}. {topic}" for i, topic in enumerate(flat_items)])
 
         context = f"""Research outline topics:
-	{topics_list}
+    {topics_list}
 
-	User feedback:
-	"{user_message}"
+    User feedback:
+    "{user_message}"
 
-	Based on this feedback, categorize each topic (by index) as either "keep" or "remove".
-	If the user clearly expresses a preference to focus on certain topics or avoid others, use that to guide your decisions.
-	If the user's feedback is ambiguous about some topics, categorize them based on their similarity to clearly mentioned preferences.
-	"""
+    Based on this feedback, categorize each topic (by index) as either "keep" or "remove".
+    If the user clearly expresses a preference to focus on certain topics or avoid others, use that to guide your decisions.
+    If the user's feedback is ambiguous about some topics, categorize them based on their similarity to clearly mentioned preferences.
+    """
 
         # Generate interpretation of user feedback
         try:
@@ -8624,21 +8611,21 @@ new ResizeObserver(reportHeight).observe(document.body);
         prompt = {
             "role": "system",
             "content": """You are a post-grad research assistant generating an effective search query.
-	Create a search query that will find relevant information for a group of related topics aimed at addressing the original user input.
-	The query should be specific enough to find targeted information while broadly representing all topics in the group.
-	Make the query concise (maximum 10 words) and focused.""",
+    Create a search query that will find relevant information for a group of related topics aimed at addressing the original user input.
+    The query should be specific enough to find targeted information while broadly representing all topics in the group.
+    Make the query concise (maximum 10 words) and focused.""",
         }
 
         # Create the message content
         message = {
             "role": "user",
             "content": f"""Generate a search query for this group of topics:
-	{topics_text}
+    {topics_text}
 
-	This is related to the original user query: "{user_message}"
+    This is related to the original user query: "{user_message}"
 
-	Generate a single concise search query that will find information relevant to these topics.
-	Just respond with the search query text only.""",
+    Generate a single concise search query that will find information relevant to these topics.
+    Just respond with the search query text only.""",
         }
 
         # Generate the query
@@ -8674,9 +8661,9 @@ new ResizeObserver(reportHeight).observe(document.body);
         extraction_prompt = {
             "role": "system",
             "content": """You are a post-grad research assistant extracting information from search results.
-	Identify and extract information that is specifically relevant to the given topics.
-	Format the extracted information as concise bullet points, focusing on facts, data, and insights.
-	Ignore general information not directly related to the topics.""",
+    Identify and extract information that is specifically relevant to the given topics.
+    Format the extracted information as concise bullet points, focusing on facts, data, and insights.
+    Ignore general information not directly related to the topics.""",
         }
 
         # Create context with search results and topics
@@ -8723,12 +8710,12 @@ new ResizeObserver(reportHeight).observe(document.body);
         refine_prompt = {
             "role": "system",
             "content": """You are a post-grad research assistant refining research topics.
-	Based on the extracted information and user preferences, revise each topic to:
-	1. Be specific and targeted based on the research findings, while maintaining alignment with user preferences and the original query
-	2. Prioritize topics that seem most relevant to answering the query and that will reasonably result in worthwhile expanded research
-	3. Be phrased as clear, researchable topics in the same style as those to be replaced
+    Based on the extracted information and user preferences, revise each topic to:
+    1. Be specific and targeted based on the research findings, while maintaining alignment with user preferences and the original query
+    2. Prioritize topics that seem most relevant to answering the query and that will reasonably result in worthwhile expanded research
+    3. Be phrased as clear, researchable topics in the same style as those to be replaced
 
-	Your refined topics should incorporate new discoveries that heighten and expand upon the intent of the original query.
+    Your refined topics should incorporate new discoveries that heighten and expand upon the intent of the original query.
     Avoid overstating the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
     You do not need to include justification along with your refined topics.""",
         }
@@ -8740,14 +8727,14 @@ new ResizeObserver(reportHeight).observe(document.body);
 
         refine_context = f"""Original topics: {", ".join(topics)}
 
-	Original query: {original_query}
+    Original query: {original_query}
 
-	Extracted research information:
-	{relevant_info}
-	{pdv_context}
+    Extracted research information:
+    {relevant_info}
+    {pdv_context}
 
-	Refine these topics based on the research findings and user preferences.
-	Provide a list of the same number of refined topics."""
+    Refine these topics based on the research findings and user preferences.
+    Provide a list of the same number of refined topics."""
 
         # Create messages for refinement
         refine_messages = [refine_prompt, {"role": "user", "content": refine_context}]
@@ -9278,7 +9265,7 @@ new ResizeObserver(reportHeight).observe(document.body);
                 self.update_state("waiting_for_outline_feedback", False)
                 return outline_items, all_topics, outline_embedding
 
-    async def generate_group_title(self, topics: List[str], user_message: str) -> str:
+    async def generate_group_title(self, topics: list[str], user_message: str) -> str:
         """Generate a descriptive title for a group of related topics"""
         if not topics:
             return ""
@@ -9336,7 +9323,7 @@ new ResizeObserver(reportHeight).observe(document.body);
             # Single clean fallback that uses first topic
             return f"{topics[0][:40]}... & Related Topics"
 
-    async def is_follow_up_query(self, messages: List[Dict[str, Any]]) -> bool:
+    async def is_follow_up_query(self, messages: list[dict[str, Any]]) -> bool:
         """Determine if the current query is a follow-up to a previous research session"""
         # If we have a previous comprehensive summary and research has been completed,
         # treat any new query as a follow-up
@@ -9353,11 +9340,11 @@ new ResizeObserver(reportHeight).observe(document.body);
 
     async def generate_synthesis_outline(
         self,
-        original_outline: List[Dict[str, Any]],
-        completed_topics: Set[str],
+        original_outline: list[dict[str, Any]],
+        completed_topics: set[str],
         user_query: str,
-        research_results: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+        research_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         """Generate a refined research outline for synthesis that better integrates additional research areas"""
 
         state = self.get_state()
@@ -9370,14 +9357,14 @@ new ResizeObserver(reportHeight).observe(document.body);
             "role": "system",
             "content": f"""You are a post-graduate academic scholar reorganizing a research outline to be used in writing a comprehensive research report.
 
-	Create a refined outline that condenses key topics/subtopics and insights from the current outline, and focuses on addressing the original query in areas best supported by the research.
+    Create a refined outline that condenses key topics/subtopics and insights from the current outline, and focuses on addressing the original query in areas best supported by the research.
     Aim to have approximately {round((elapsed_cycles * 0.25) + 2)} main topics and {round((elapsed_cycles * 0.8) + 5)} subtopics in your revised outline.
 
     The original user query was: "{user_query}".
 
     Your refined outline must:
-	1. Appropriately incorporate relevant new topics discovered along the way that are directly relevant to the research "core" and original user query.
-	2. Tailors the outline to reflect the progress and outcome of research activities without getting distracted by irrelevant results or specific examples, brands, locations, etc.
+    1. Appropriately incorporate relevant new topics discovered along the way that are directly relevant to the research "core" and original user query.
+    2. Tailors the outline to reflect the progress and outcome of research activities without getting distracted by irrelevant results or specific examples, brands, locations, etc.
     3. Unite how research has evolved, and the reference material obtained during research, with the initial purpose and scope, prioritizing the initial purpose and scope.
     4. Where appropriate, reign in the representation of tangential research branches to refocus on topics more directly related to the original query.
 
@@ -9389,11 +9376,11 @@ new ResizeObserver(reportHeight).observe(document.body);
 
     The goal is to create a refined outline reflecting a logical narrative and informational flow for the final comprehensive report based on the user's query and gathered research.
 
-	Format your response as a valid JSON object with the following structure:
-	{{"outline": [
-	  {{"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]}},
-	  {{"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}}
-	]}}""",
+    Format your response as a valid JSON object with the following structure:
+    {{"outline": [
+      {{"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]}},
+      {{"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}}
+    ]}}""",
         }
 
         # Calculate similarity of research results to the research outline
@@ -9569,11 +9556,11 @@ new ResizeObserver(reportHeight).observe(document.body);
         section_title: str,
         subtopic: str,
         original_query: str,
-        research_results: List[Dict[str, Any]],
+        research_results: list[dict[str, Any]],
         synthesis_model: str,
         is_follow_up: bool = False,
         previous_summary: str = "",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Generate content for a single subtopic with numbered citations"""
         # Only emit status if we haven't seen this subtopic yet
         if subtopic not in self._seen_subtopics:
@@ -9928,13 +9915,13 @@ new ResizeObserver(reportHeight).observe(document.body);
     async def generate_section_content_with_citations(
         self,
         section_title: str,
-        subtopics: List[str],
+        subtopics: list[str],
         original_query: str,
-        research_results: List[Dict[str, Any]],
+        research_results: list[dict[str, Any]],
         synthesis_model: str,
         is_follow_up: bool = False,
         previous_summary: str = "",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Generate content for a section by combining subtopics with citations"""
         # Only emit status if we haven't seen this section yet
         if section_title not in self._seen_sections:
@@ -10165,9 +10152,8 @@ new ResizeObserver(reportHeight).observe(document.body);
                         if (
                             subtopic in original_ids
                             and original_ids[subtopic] == local_id
-                        ):
-                            if url in global_citation_map:
-                                global_ids.append(str(global_citation_map[url]))
+                        ) and url in global_citation_map:
+                            global_ids.append(str(global_citation_map[url]))
 
                 # If we found global IDs, create the replacement citation
                 if global_ids:
@@ -10240,7 +10226,7 @@ new ResizeObserver(reportHeight).observe(document.body);
     async def smooth_section_transitions(
         self,
         section_title: str,
-        subtopics: List[str],
+        subtopics: list[str],
         combined_content: str,
         original_query: str,
         synthesis_model: str,
@@ -10331,8 +10317,8 @@ new ResizeObserver(reportHeight).observe(document.body);
 
     async def generate_bibliography(
         self,
-        master_source_table: Dict[str, Dict[str, Any]],
-        global_citation_map: Dict[str, int],
+        master_source_table: dict[str, dict[str, Any]],
+        global_citation_map: dict[str, int],
     ) -> BibliographyData:
         """Generate a bibliography using sequential numbering based on actual citations in the report"""
         if not master_source_table:
@@ -10364,9 +10350,9 @@ new ResizeObserver(reportHeight).observe(document.body);
         sorted_urls = sorted(cited_urls.items(), key=lambda x: x[1])
 
         # Create bibliography entries based on cited sources only
-        bibliography: List[BibliographyEntry] = []
-        url_to_global_id: Dict[str, int] = {}
-        title_to_global_id: Dict[str, int] = {}
+        bibliography: list[BibliographyEntry] = []
+        url_to_global_id: dict[str, int] = {}
+        title_to_global_id: dict[str, int] = {}
 
         # Use the sequential numbers already assigned in global_citation_map
         for url, global_id in sorted_urls:
@@ -10406,7 +10392,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         }
 
     async def format_bibliography_list(
-        self, bibliography: List[BibliographyEntry]
+        self, bibliography: list[BibliographyEntry]
     ) -> str:
         """Format the bibliography as a numbered list"""
         if not bibliography:
@@ -10422,10 +10408,7 @@ new ResizeObserver(reportHeight).observe(document.body);
             url = entry["url"]
 
             # Format URL for markdown linking
-            if url.startswith("http"):
-                url_formatted = f"[{url}]({url})"
-            else:
-                url_formatted = url
+            url_formatted = f"[{url}]({url})" if url.startswith("http") else url
 
             bib_list += f"[{citation_id}] {title}. {url_formatted}\n\n"
 
@@ -10797,7 +10780,7 @@ new ResizeObserver(reportHeight).observe(document.body);
 
         return verification_results
 
-    async def export_research_data(self) -> Dict[str, Any]:
+    async def export_research_data(self) -> dict[str, Any]:
         """Export the full research data including results, queries, timestamps, URLs, and content"""
         import os
 
@@ -10960,11 +10943,11 @@ new ResizeObserver(reportHeight).observe(document.body);
 
     async def review_synthesis(
         self,
-        compiled_sections: Dict[str, str],
+        compiled_sections: dict[str, str],
         original_query: str,
-        research_outline: List[Dict[str, Any]],
+        research_outline: list[dict[str, Any]],
         synthesis_model: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Review the compiled synthesis and suggest edits.
 
         Uses the full verbatim report when it fits the review budget.
@@ -10974,17 +10957,17 @@ new ResizeObserver(reportHeight).observe(document.body);
         review_prompt = {
             "role": "system",
             "content": """You are a post-grad research editor reviewing a comprehensive research report assembled per-section in different model contexts.
-	Your task is to identify any issues with this combination of multiple sections and the flow between them.
+    Your task is to identify any issues with this combination of multiple sections and the flow between them.
 
-	Focus on:
-	1. Identifying areas needing better transitions between sections
+    Focus on:
+    1. Identifying areas needing better transitions between sections
     2. Finding obvious anomalies in section generation or stylistic discrepancies large enough to be distracting
-	3. Making the report read as though it were written by one author who compiled these topics together for good purpose
+    3. Making the report read as though it were written by one author who compiled these topics together for good purpose
 
-	Do NOT:
-	1. Impart your own biases, interests, or preferences onto the report
-	2. Re-interpret the research information or soften its conclusions
-	3. Make useless or unnecessary revisions beyond the scope of ensuring flow from start to finish
+    Do NOT:
+    1. Impart your own biases, interests, or preferences onto the report
+    2. Re-interpret the research information or soften its conclusions
+    3. Make useless or unnecessary revisions beyond the scope of ensuring flow from start to finish
     4. Remove or edit ANY in-text citations or instances of applied strikethrough. These are for specific human review and MUST NOT be changed or decoupled
 
     For each suggested edit, provide exact text to find, and exact replacement text.
@@ -11032,7 +11015,7 @@ new ResizeObserver(reportHeight).observe(document.body);
 
         review_temperature = self.valves.SYNTHESIS_TEMPERATURE * 0.5
 
-        async def _run_single_review(ctx: str) -> Dict[str, Any]:
+        async def _run_single_review(ctx: str) -> dict[str, Any]:
             """Run the review prompt against one verbatim context string."""
             msgs = [review_prompt, {"role": "user", "content": ctx}]
             resp = await self.generate_completion(
@@ -11086,7 +11069,7 @@ new ResizeObserver(reportHeight).observe(document.body);
             step_chars = int(window_chars * (1.0 - overlap_ratio))
             step_chars = max(1, step_chars)
 
-            windows: List[str] = []
+            windows: list[str] = []
             pos = 0
             while pos < len(review_context):
                 end = min(pos + int(window_chars), len(review_context))
@@ -11100,15 +11083,15 @@ new ResizeObserver(reportHeight).observe(document.body);
                 f"(~{int(window_chars)} chars each, {int(overlap_ratio * 100)}% overlap)"
             )
 
-            all_edits: List[Dict[str, str]] = []
-            for idx, window in enumerate(windows):
+            all_edits: list[dict[str, str]] = []
+            for _idx, window in enumerate(windows):
                 window_data = await _run_single_review(window)
                 window_edits = window_data.get("global_edits", [])
                 all_edits.extend(window_edits)
 
             # Merge: deduplicate, discard empty find_text
-            seen: Set[Tuple[str, str]] = set()
-            merged: List[Dict[str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            merged: list[dict[str, str]] = []
             for edit in all_edits:
                 find_text = edit.get("find_text", "").strip()
                 if not find_text:
@@ -11126,8 +11109,8 @@ new ResizeObserver(reportHeight).observe(document.body);
 
     async def apply_review_edits(
         self,
-        compiled_sections: Dict[str, str],
-        review_data: Dict[str, Any],
+        compiled_sections: dict[str, str],
+        review_data: dict[str, Any],
         synthesis_model: str,
     ):
         """Apply the suggested edits from the review to improve the synthesis"""
@@ -11170,11 +11153,11 @@ new ResizeObserver(reportHeight).observe(document.body);
     async def generate_replacement_topics(
         self,
         query: str,
-        kept_items: List[str],
-        removed_items: List[str],
-        preference_vector: Dict[str, Any],
-        outline_items: List[str],
-    ) -> List[str]:
+        kept_items: list[str],
+        removed_items: list[str],
+        preference_vector: dict[str, Any],
+        outline_items: list[str],
+    ) -> list[str]:
         """Generate replacement topics using semantic transformation"""
         # If nothing was removed, return empty list
         if not removed_items:
@@ -11429,7 +11412,7 @@ new ResizeObserver(reportHeight).observe(document.body);
                     )
                     queries = [
                         {"query": q, "topic": t}
-                        for q, t in zip(query_strings, query_topics)
+                        for q, t in zip(query_strings, query_topics, strict=False)
                     ]
 
                 return queries
@@ -11438,7 +11421,7 @@ new ResizeObserver(reportHeight).observe(document.body);
                 logger.error(f"Error parsing query JSON: {e}")
                 # Fallback: generate basic queries for priority topics
                 queries = []
-                for i, topic in enumerate(priority_topics[:3]):
+                for _i, topic in enumerate(priority_topics[:3]):
                     queries.append({"query": f"{user_message} {topic}", "topic": topic})
 
                 return queries
@@ -11447,7 +11430,7 @@ new ResizeObserver(reportHeight).observe(document.body);
             logger.error(f"Error generating improved queries: {e}")
             # Fallback: generate basic queries
             queries = []
-            for i, topic in enumerate(priority_topics[:3]):
+            for _i, topic in enumerate(priority_topics[:3]):
                 queries.append({"query": f"{user_message} {topic}", "topic": topic})
 
             return queries
@@ -11456,34 +11439,34 @@ new ResizeObserver(reportHeight).observe(document.body);
         self,
         user_message: str,
         comprehensive_answer: str,
-        sections: Optional[Dict[str, str]] = None,
+        sections: dict[str, str] | None = None,
     ):
         """Generate a main title and subtitle for the research report."""
         titles_prompt = {
             "role": "system",
             "content": """You are a post-grad research writer creating compelling titles for research reports.
 
-	Create a main title and subtitle for a comprehensive research report. The titles should:
-	1. Be relevant and accurately reflect the content and focus of the research
-	2. Be engaging and professional. Intriguing, even
-	3. Follow academic/research paper conventions
-	4. Avoid clickbait or sensationalism unless it's really begging for it
+    Create a main title and subtitle for a comprehensive research report. The titles should:
+    1. Be relevant and accurately reflect the content and focus of the research
+    2. Be engaging and professional. Intriguing, even
+    3. Follow academic/research paper conventions
+    4. Avoid clickbait or sensationalism unless it's really begging for it
 
-	For main title:
-	- 5-12 words in length
-	- Clear and focused
-	- Appropriately formal for academic/research context
+    For main title:
+    - 5-12 words in length
+    - Clear and focused
+    - Appropriately formal for academic/research context
 
-	For subtitle:
-	- 8-15 words in length
-	- Provides additional context and specificity
-	- Complements the main title without redundancy
+    For subtitle:
+    - 8-15 words in length
+    - Provides additional context and specificity
+    - Complements the main title without redundancy
 
-	Format your response as a JSON object with the following structure:
-	{
-	  "main_title": "Your proposed main title",
-	  "subtitle": "Your proposed subtitle"
-	}""",
+    Format your response as a JSON object with the following structure:
+    {
+      "main_title": "Your proposed main title",
+      "subtitle": "Your proposed subtitle"
+    }""",
         }
 
         try:
@@ -11569,19 +11552,19 @@ new ResizeObserver(reportHeight).observe(document.body);
         self,
         user_message: str,
         comprehensive_answer: str,
-        bibliography: List[BibliographyEntry],
-        sections: Optional[Dict[str, str]] = None,
+        bibliography: list[BibliographyEntry],
+        sections: dict[str, str] | None = None,
     ):
         """Generate an abstract for the research report."""
         abstract_prompt = {
             "role": "system",
             "content": """You are a post-grad research assistant writing an abstract for a comprehensive research report.
 
-	Create a concise academic abstract (150-250 words) that summarizes the research report. The abstract should:
-	1. Outline the research objective and original intent without simply restating the original query
-	2. Summarize the key findings and their significance
-	3. Be written in an academic yet interesting tone
-	4. Be self-contained and understandable on its own
+    Create a concise academic abstract (150-250 words) that summarizes the research report. The abstract should:
+    1. Outline the research objective and original intent without simply restating the original query
+    2. Summarize the key findings and their significance
+    3. Be written in an academic yet interesting tone
+    4. Be self-contained and understandable on its own
     5. Draw you in by highlighting the interesting aspects of the research without being misleading or disingenuous
 
     The abstract must NOT:
@@ -11592,7 +11575,7 @@ new ResizeObserver(reportHeight).observe(document.body);
     5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
     6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
 
-	The abstract should follow scientific paper abstract structure but be accessible to an educated general audience.""",
+    The abstract should follow scientific paper abstract structure but be accessible to an educated general audience.""",
         }
 
         try:
@@ -11649,7 +11632,7 @@ new ResizeObserver(reportHeight).observe(document.body);
                     await self.emit_message("*Abstract generation fallback used.*\n")
                 return f"This research report addresses the query: '{user_message}'. It synthesizes information from {len(bibliography)} sources to provide a comprehensive analysis of the topic, examining key aspects and presenting relevant findings."
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("Abstract generation timed out after 5 minutes")
             if not self.valves.QUIET_CHAT_MODE:
                 await self.emit_message(
@@ -11786,7 +11769,7 @@ new ResizeObserver(reportHeight).observe(document.body);
         self,
         body: dict[str, Any],
         __task__: Any,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
     ) -> str:
         state = self.get_state()
 
@@ -11938,8 +11921,8 @@ new ResizeObserver(reportHeight).observe(document.body);
         self.update_state("follow_up_mode", is_follow_up)
 
         # Get summary embedding if this is a follow-up
-        summary_embedding: Optional[List[float]] = None
-        query_embedding: Optional[List[float]] = None
+        summary_embedding: list[float] | None = None
+        query_embedding: list[float] | None = None
         if is_follow_up:
             prev_comprehensive_summary = state.get("prev_comprehensive_summary", "")
             if prev_comprehensive_summary:
@@ -12014,16 +11997,16 @@ new ResizeObserver(reportHeight).observe(document.body);
                 initial_query_prompt = {
                     "role": "system",
                     "content": """You are a post-grad research assistant generating effective search queries for continued research based on an existing report.
-	Based on the user's follow-up question and the previous research summary, generate 6 initial search queries.
-	Each query should be specific, use relevant keywords, and be designed to find new information that builds on the previous research towards the new query.
+    Based on the user's follow-up question and the previous research summary, generate 6 initial search queries.
+    Each query should be specific, use relevant keywords, and be designed to find new information that builds on the previous research towards the new query.
     Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
 
-	Format your response as a valid JSON object with the following structure:
-	{"queries": [
-	  "search query 1",
-	  "search query 2",
-	  "search query 3"
-	]}""",
+    Format your response as a valid JSON object with the following structure:
+    {"queries": [
+      "search query 1",
+      "search query 2",
+      "search query 3"
+    ]}""",
                 }
 
                 initial_query_messages = [
@@ -12150,20 +12133,20 @@ new ResizeObserver(reportHeight).observe(document.body);
                 outline_prompt = {
                     "role": "system",
                     "content": """You are a post-grad research assistant creating a structured research outline.
-	Based on the user's follow-up question, previous research summary, and new search results, create a comprehensive outline
-	that builds on the previous research while addressing the new aspects from the follow-up question.
+    Based on the user's follow-up question, previous research summary, and new search results, create a comprehensive outline
+    that builds on the previous research while addressing the new aspects from the follow-up question.
 
-	The outline should:
-	1. Include relevant topics from the previous research that provide context
-	2. Add new topics that specifically address the follow-up question
-	3. Be organized in a hierarchical structure with main topics and subtopics
-	4. Focus on aspects that weren't covered in depth in the previous research
+    The outline should:
+    1. Include relevant topics from the previous research that provide context
+    2. Add new topics that specifically address the follow-up question
+    3. Be organized in a hierarchical structure with main topics and subtopics
+    4. Focus on aspects that weren't covered in depth in the previous research
 
-	Format your response as a valid JSON object with the following structure:
-	{"outline": [
-	  {"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]},
-	  {"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}
-	]}""",
+    Format your response as a valid JSON object with the following structure:
+    {"outline": [
+      {"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]},
+      {"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}
+    ]}""",
                 }
 
                 # Build context from initial search results and previous summary
@@ -12264,17 +12247,17 @@ new ResizeObserver(reportHeight).observe(document.body);
                     "role": "system",
                     "content": f"""You are a post-grad research assistant generating effective search queries.
     The user has submitted a research query: "{user_message}".
-	Based on the user's input, generate 8 initial search queries to begin research and help us delineate the research topic.
+    Based on the user's input, generate 8 initial search queries to begin research and help us delineate the research topic.
     Half of the queries should be broad, aimed at identifying and defining the main topic and returning core characteristic information about it.
-	The other half should be more specific, designed to find information to help expand on known base details of the user's query.
+    The other half should be more specific, designed to find information to help expand on known base details of the user's query.
     Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
 
-	Format your response as a valid JSON object with the following structure:
-	{{"queries": [
-	  "search query 1",
-	  "search query 2",
-	  "search query 3..."
-	]}}""",
+    Format your response as a valid JSON object with the following structure:
+    {{"queries": [
+      "search query 1",
+      "search query 2",
+      "search query 3..."
+    ]}}""",
                 }
 
                 initial_query_messages = [
@@ -12401,13 +12384,13 @@ new ResizeObserver(reportHeight).observe(document.body);
                 outline_prompt = {
                     "role": "system",
                     "content": f"""You are a post-graduate academic scholar tasked with creating a structured research outline.
-	Based on the user's query and the initial search results, create a comprehensive conceptual outline of additional information
-	needed to completely and thoroughly address the user's original query: "{user_message}".
+    Based on the user's query and the initial search results, create a comprehensive conceptual outline of additional information
+    needed to completely and thoroughly address the user's original query: "{user_message}".
 
-	The outline must:
-	1. Break down the query into key concepts that need to be researched and key details about important figures, details, methods, etc.
-	2. Be organized in a hierarchical structure, with main topics directly relevant to addressing the query, and subtopics to flesh out main topics.
-	3. Include topics discovered in the initial search results relevant to addressing the user's input, while ignoring overly-specific or unrelated topics.
+    The outline must:
+    1. Break down the query into key concepts that need to be researched and key details about important figures, details, methods, etc.
+    2. Be organized in a hierarchical structure, with main topics directly relevant to addressing the query, and subtopics to flesh out main topics.
+    3. Include topics discovered in the initial search results relevant to addressing the user's input, while ignoring overly-specific or unrelated topics.
 
     The outline MUST NOT:
     1. Delve into philosophical or theoretical approaches, unless clearly appropriate to the subject or explicitly solicited by the user.
@@ -12418,11 +12401,11 @@ new ResizeObserver(reportHeight).observe(document.body);
     Do NOT allow rendering artifacts, web site UI features, HTML/CSS/underlying website build language, or any other irrelevant text to distract you from your goal.
     Don't add an appendix topic, nor an explicit introduction or conclusion topic. ONLY include the outline in your response.
 
-	Format your response as a valid JSON object with the following structure:
-	{{"outline": [
-	  {{"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]}},
-	  {{"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}}
-	]}}""",
+    Format your response as a valid JSON object with the following structure:
+    {{"outline": [
+      {{"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]}},
+      {{"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}}
+    ]}}""",
                 }
 
                 # Build context from initial search results

@@ -1,0 +1,81 @@
+from pydantic import BaseModel, Field
+
+# Engineering knobs that aren't user-facing live in config.constants.
+# Only fields that an OWUI admin or end user might reasonably want to tune
+# appear on the Valves model below — see REFACTOR_PLAN.md A.3.
+
+
+class ModelsValves(BaseModel):
+    research_model: str = Field("gemma3:12b", description="Primary research LLM")
+    synthesis_model: str = Field("gemma3:27b", description="Synthesis LLM (optional override)")
+    quality_filter_model: str = Field("gemma3:4b", description="Relevance filter LLM")
+
+    research_context_window: int | None = Field(
+        None, description="Override; None = auto-detect from /api/v1/models/list"
+    )
+    synthesis_context_window: int | None = Field(
+        None, description="Override; None = auto-detect from /api/v1/models/list"
+    )
+
+    temperature: float = 0.7
+    synthesis_temperature: float = 0.6
+
+
+class CyclesValves(BaseModel):
+    min_cycles: int = 10
+    max_cycles: int = 15
+    gap_exploration_weight: float = 0.4
+    trajectory_momentum: float = 0.6
+    followup_weight: float = 0.5
+
+
+class WebValves(BaseModel):
+    search_results_per_query: int = 3
+    successful_results_per_query: int = 1
+    extra_results_per_query: int = 3
+    repeats_before_expansion: int = 3
+    max_result_tokens: int = 4000
+    domain_priority: str = ""
+    content_priority: str = ""
+    quality_filter_enabled: bool = True
+    quality_similarity_threshold: float = 0.60
+    fetch_concurrency: int = 4
+    search_concurrency: int = 2
+
+
+class CompressionValves(BaseModel):
+    chunk_level: int = 2
+    compression_level: int = 4
+    stepped_synthesis_compression: bool = True
+
+
+class PersistenceValves(BaseModel):
+    export_research_data: bool = True
+    interactive_research: bool = True
+    user_preference_throughout: bool = True
+
+
+class EventsValves(BaseModel):
+    enable_progress_embed: bool = True
+    flush_interval_ms: int = 400
+    quiet_chat_mode: bool = True
+
+
+class AdvancedValves(BaseModel):
+    query_weight: float = 0.5
+    llm_concurrency: int = 4
+    embedding_concurrency: int = 8
+    executor_workers: int = 2
+    http_timeout_seconds: int = 600
+    http_max_retries: int = 3
+
+
+class Valves(BaseModel):
+    enabled: bool = True
+    models: ModelsValves = Field(default_factory=ModelsValves)
+    cycles: CyclesValves = Field(default_factory=CyclesValves)
+    web: WebValves = Field(default_factory=WebValves)
+    compression: CompressionValves = Field(default_factory=CompressionValves)
+    persistence: PersistenceValves = Field(default_factory=PersistenceValves)
+    events: EventsValves = Field(default_factory=EventsValves)
+    advanced: AdvancedValves = Field(default_factory=AdvancedValves)

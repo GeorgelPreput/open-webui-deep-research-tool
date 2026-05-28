@@ -1,0 +1,100 @@
+import contextlib
+import os
+from typing import Any
+
+from deep_research.config.valves import Valves
+
+
+def load_valves_from_env(prefix: str = "DR_") -> Valves:
+    prefix_upper = prefix.upper()
+    env_data: dict[str, Any] = {}
+
+    for key, raw in os.environ.items():
+        if not key.startswith(prefix_upper):
+            continue
+        rest = key[len(prefix_upper) :]
+        parts = rest.lower().split("_", 1)
+        if len(parts) != 2:
+            continue
+        group, field = parts
+        if group not in VALVES_GROUP_MAP:
+            continue
+        if field not in VALVES_GROUP_MAP[group]:
+            continue
+        target_type = VALVES_GROUP_MAP[group][field]
+        with contextlib.suppress(ValueError, TypeError):
+            env_data.setdefault(group, {})[field] = _coerce(raw, target_type)
+
+    raw_valves = {}
+    for group, fields in env_data.items():
+        raw_valves[group] = fields
+
+    return Valves.model_validate(raw_valves)
+
+
+def _coerce(value: str, target: type) -> Any:
+    if target is bool:
+        return value.lower() in ("1", "true", "yes", "on")
+    if target is int:
+        return int(value)
+    if target is float:
+        return float(value)
+    if target is str:
+        return value
+    return value
+
+
+VALVES_GROUP_MAP: dict[str, dict[str, type]] = {
+    "models": {
+        "research_model": str,
+        "synthesis_model": str,
+        "quality_filter_model": str,
+        "research_context_window": int,
+        "synthesis_context_window": int,
+        "temperature": float,
+        "synthesis_temperature": float,
+    },
+    "cycles": {
+        "min_cycles": int,
+        "max_cycles": int,
+        "gap_exploration_weight": float,
+        "trajectory_momentum": float,
+        "followup_weight": float,
+    },
+    "web": {
+        "search_results_per_query": int,
+        "successful_results_per_query": int,
+        "extra_results_per_query": int,
+        "repeats_before_expansion": int,
+        "max_result_tokens": int,
+        "domain_priority": str,
+        "content_priority": str,
+        "quality_filter_enabled": bool,
+        "quality_similarity_threshold": float,
+        "fetch_concurrency": int,
+        "search_concurrency": int,
+    },
+    "compression": {
+        "chunk_level": int,
+        "compression_level": int,
+        "stepped_synthesis_compression": bool,
+    },
+    "persistence": {
+        "export_research_data": bool,
+        "interactive_research": bool,
+        "user_preference_throughout": bool,
+    },
+    "events": {
+        "enable_progress_embed": bool,
+        "flush_interval_ms": int,
+        "quiet_chat_mode": bool,
+    },
+    "advanced": {
+        "query_weight": float,
+        "llm_concurrency": int,
+        "embedding_concurrency": int,
+        "executor_workers": int,
+        "http_timeout_seconds": int,
+        "http_max_retries": int,
+    },
+}

@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check deep_research/ tests/
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install mypy pydantic httpx
+      - run: mypy --strict deep_research/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install .[dev]
+      - run: pytest tests/ --cov=deep_research --cov-report=term-missing
+
+  bump-version:
+    needs: [lint, typecheck, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      version: ${{ steps.bump.outputs.version }}
+      sha: ${{ steps.bump.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Default GITHUB_TOKEN; the push back is on the same branch and the
+          # commit message carries [skip ci] so it does not re-enter this job.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: bump
+        name: Bump patch version in pyproject.toml
+        run: |
+          set -euo pipefail
+          # Loop guard: if the triggering commit is itself a version bump,
+          # surface the current version but do not bump again.
+          LAST_MSG=$(git log -1 --pretty=%B)
+          if echo "$LAST_MSG" | grep -q "^chore: bump version"; then
+            CURRENT=$(awk -F\" '/^version = / {print $2; exit}' pyproject.toml)
+            echo "Triggering commit is a version bump; skipping."
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT=$(awk -F\" '/^version = / {print $2; exit}' pyproject.toml)
+          if [ -z "$CURRENT" ]; then
+            echo "::error::Could not read current version from pyproject.toml" >&2
+            exit 1
+          fi
+          IFS=. read -r MAJ MIN PATCH <<< "$CURRENT"
+          NEW="$MAJ.$MIN.$((PATCH + 1))"
+
+          # Replace only the first `version = "..."` line — pyproject's [project]
+          # version, not any nested dependency-specifier version constraints.
+          awk -v new="$NEW" '
+            !done && /^version = "/ { sub(/"[^"]+"/, "\"" new "\""); done=1 }
+            { print }
+          ' pyproject.toml > pyproject.toml.tmp
+          mv pyproject.toml.tmp pyproject.toml
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "chore: bump version to $NEW [skip ci]"
+          git push origin HEAD:${GITHUB_REF#refs/heads/}
+
+          NEW_SHA=$(git rev-parse HEAD)
+          echo "bumped=true"      >> "$GITHUB_OUTPUT"
+          echo "version=$NEW"     >> "$GITHUB_OUTPUT"
+          echo "sha=$NEW_SHA"     >> "$GITHUB_OUTPUT"
+
+  publish-tool:
+    needs: bump-version
+    if: needs.bump-version.outputs.bumped == 'true'
+    uses: ./.github/workflows/docker-openapi-tool.yml
+    with:
+      ref: ${{ needs.bump-version.outputs.sha }}
+      version: ${{ needs.bump-version.outputs.version }}
+    secrets: inherit
+
+  publish-mcp:
+    needs: bump-version
+    if: needs.bump-version.outputs.bumped == 'true'
+    uses: ./.github/workflows/docker-mcp-server.yml
+    with:
+      ref: ${{ needs.bump-version.outputs.sha }}
+      version: ${{ needs.bump-version.outputs.version }}
+    secrets: inherit

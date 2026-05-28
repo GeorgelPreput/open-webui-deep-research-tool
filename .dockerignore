@@ -1,0 +1,27 @@
+.git/
+.github/
+.venv/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Legacy pre-refactor sources — not used at runtime, kept only as reference
+pipe.py
+deep_research_pipeline.py
+REFACTOR_PLAN.md
+CLAUDE.md
+
+# Tests + tooling
+tests/
+.pre-commit-config.yaml
+
+# Lockfile (not needed for pip-based image build)
+uv.lock
+
+# Local notes
+*.md
+!README.md
