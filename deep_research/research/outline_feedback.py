@@ -259,7 +259,7 @@ async def process_outline_feedback_continuation(ctx: RunContext, user_message: s
             )
 
         # Process the indices and ranges
-        selected_indices = set()
+        selected_indices: set[int] = set()
         for part in items_part.split():
             part = part.strip()
             if not part:
@@ -306,19 +306,19 @@ async def process_outline_feedback_continuation(ctx: RunContext, user_message: s
                 except ValueError:
                     await _emit_message(ctx, f"Invalid number: '{part}'. Skipping.")
 
-        # Convert to lists
-        selected_indices = sorted(list(selected_indices))
+        # Convert to a sorted list for deterministic downstream slicing.
+        sorted_selected: list[int] = sorted(selected_indices)
 
         # Determine kept and removed indices based on mode
         if is_keep_cmd:
             # Keep mode - selected indices are kept, others removed
-            kept_indices = selected_indices
+            kept_indices = sorted_selected
             removed_indices = [
                 i for i in range(len(flat_items)) if i not in kept_indices
             ]
         else:
             # Remove mode - selected indices are removed, others kept
-            removed_indices = selected_indices
+            removed_indices = sorted_selected
             kept_indices = [
                 i for i in range(len(flat_items)) if i not in removed_indices
             ]

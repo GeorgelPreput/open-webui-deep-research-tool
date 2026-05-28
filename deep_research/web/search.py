@@ -104,7 +104,7 @@ async def search_web(ctx: RunContext, query: str) -> list[dict[str, Any]]:
         f"Requesting {total_results} search results (added {additional_results} due to repeats)"
     )
 
-    results, failure_reason = await try_owui_search(query, total_results)
+    results, failure_reason = await try_owui_search(ctx, query, total_results)
 
     if results:
         logger.debug(
@@ -166,7 +166,7 @@ async def process_search_result(ctx: RunContext, result: dict[str, Any], query: 
         # If the snippet is empty or short but we have a URL, try to fetch content
         if (not snippet or len(snippet) < 200) and url:
             await ctx.events.emit(StatusEvent(description=f"Fetching content from URL: {url}...", level="info", done=False))
-            content = await fetch_content(url)
+            content = await fetch_content(ctx, url)
 
             if content and len(content) > 200:
                 snippet = content
@@ -190,7 +190,7 @@ async def process_search_result(ctx: RunContext, result: dict[str, Any], query: 
         # For repeated URLs, apply special sliding window treatment
         if repeat_count > 0:
             snippet = await handle_repeated_content(
-                snippet, url, query_embedding, repeat_count
+                ctx, snippet, url, query_embedding, repeat_count
             )
 
         # Calculate tokens in the content
@@ -203,7 +203,7 @@ async def process_search_result(ctx: RunContext, result: dict[str, Any], query: 
 
         # Apply token limit if needed with adaptive scaling based on relevance
         max_tokens = await scale_token_limit_by_relevance(
-            result, query_embedding, pdv
+            ctx, result, query_embedding, pdv
         )
 
         if content_tokens > max_tokens:
@@ -286,6 +286,7 @@ async def process_search_result(ctx: RunContext, result: dict[str, Any], query: 
                         if isinstance(snippet, str) and snippet.strip():
                             try:
                                 await persist_selected_source(
+                                    ctx=ctx,
                                     url=url,
                                     full_text=snippet,
                                     title=title,
@@ -360,6 +361,7 @@ async def process_search_result(ctx: RunContext, result: dict[str, Any], query: 
         if isinstance(snippet, str) and snippet.strip():
             try:
                 await persist_selected_source(
+                    ctx=ctx,
                     url=url,
                     full_text=snippet,
                     title=title,

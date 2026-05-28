@@ -109,6 +109,10 @@ async def load_vocabulary(ctx: RunContext) -> list[str] | None:
             )
             return _vocabulary_cache
 
+    # Reached only if the network fetch returned a non-200 without raising;
+    # caller treats None as "no vocabulary available".
+    return None
+
 
 def vocab_embeddings_disk_path(ctx: RunContext) -> str:
     try:

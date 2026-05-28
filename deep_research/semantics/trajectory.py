@@ -53,6 +53,10 @@ async def calculate_research_trajectory(
             traj_acc = TrajectoryAccumulator(384)
             _trajectory_accumulators[ctx.conversation_id] = traj_acc
 
+    # The branches above always assign traj_acc; mypy can't see that
+    # through the for/else flow, so make the invariant explicit.
+    assert traj_acc is not None
+
     try:
         max_history_cycles = 5
         queries_per_cycle = ctx.valves.web.search_results_per_query

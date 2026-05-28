@@ -55,7 +55,7 @@ async def compute_semantic_eigendecomposition(
         explained_variance_ratio = eigenvalues / total_variance
 
         cumulative_variance = np.cumsum(explained_variance_ratio)
-        n_components = np.argmax(cumulative_variance >= 0.8) + 1
+        n_components = int(np.argmax(cumulative_variance >= 0.8)) + 1
         n_components = max(3, min(n_components, 10))
 
         principal_components = eigenvectors[:, :n_components]

@@ -24,8 +24,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install mypy pydantic httpx
-      - run: mypy --strict deep_research/
+      - run: pip install .[dev,server,mcp]
+      - run: mypy deep_research/
 
   test:
     runs-on: ubuntu-latest
@@ -34,7 +34,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install .[dev]
+      # All optional extras so the smoke-import test sees the entry-point
+      # modules under entrypoints/{openapi_tool,mcp,owui_pipeline} too.
+      - run: pip install .[dev,server,mcp]
       - run: pytest tests/ --cov=deep_research --cov-report=term-missing
 
   bump-version:

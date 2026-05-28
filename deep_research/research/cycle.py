@@ -56,7 +56,7 @@ async def process_query(
     )
 
     # Process each search result until we have enough successful results
-    successful_results = []
+    successful_results: list[dict[str, Any]] = []
     failed_count = 0
 
     # Get state for access to research outline

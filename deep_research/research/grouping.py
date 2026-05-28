@@ -65,7 +65,7 @@ async def group_replacement_topics(ctx: RunContext, replacement_topics):
         assert kmeans.labels_ is not None
 
         # Group topics by cluster
-        grouped_topics = {}
+        grouped_topics: dict[int, list[str]] = {}
         for i, (topic, _) in enumerate(topic_embeddings):
             cluster_id = kmeans.labels_[i]
             if cluster_id not in grouped_topics:

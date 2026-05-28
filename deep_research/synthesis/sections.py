@@ -468,7 +468,7 @@ async def generate_section_content_with_citations(
 
     if VERIFY_CITATIONS and all_section_citations:
         # Group citations by URL for efficient verification
-        citations_by_url = {}
+        citations_by_url: dict[str, list[dict[str, Any]]] = {}
         for citation in all_section_citations:
             url = citation.get("url")
             if url:

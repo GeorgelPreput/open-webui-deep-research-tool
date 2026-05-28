@@ -72,7 +72,11 @@ class AdvancedValves(BaseModel):
 
 class Valves(BaseModel):
     enabled: bool = True
-    models: ModelsValves = Field(default_factory=ModelsValves)
+    # mypy treats `ModelsValves` as having required positional args because
+    # the inner Field(default, description=…) form confuses the stubs; the
+    # other group models have plain `= default` and accept default_factory
+    # without complaint.
+    models: ModelsValves = Field(default_factory=ModelsValves)  # type: ignore[arg-type]
     cycles: CyclesValves = Field(default_factory=CyclesValves)
     web: WebValves = Field(default_factory=WebValves)
     compression: CompressionValves = Field(default_factory=CompressionValves)

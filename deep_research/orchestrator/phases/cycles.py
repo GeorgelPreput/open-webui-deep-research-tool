@@ -10,11 +10,13 @@ from deep_research.research.cycle import process_query
 from deep_research.research.query_gen import improved_query_generation
 from deep_research.research.ranking import rank_topics_by_research_priority
 from deep_research.semantics.dimensions import (
-    identify_research_gaps,
     update_dimension_coverage,
 )
 from deep_research.semantics.embeddings import get_embedding
-from deep_research.semantics.trajectory import calculate_research_trajectory
+from deep_research.semantics.trajectory import (
+    calculate_gap_vector,
+    calculate_research_trajectory,
+)
 
 logger = logging.getLogger("deep_research.orchestrator.phases.cycles")
 
@@ -51,9 +53,9 @@ async def run_cycles(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
             trajectory = await calculate_research_trajectory(ctx, search_history, results_history)
             conv_state["research_trajectory"] = trajectory
 
-        gap_vector = await identify_research_gaps(ctx)
+        gap_vector = await calculate_gap_vector(ctx)
         prioritized_topics = await rank_topics_by_research_priority(
-            ctx, active_outline, gap_vector, list(completed_topics), results_history
+            ctx, active_outline, gap_vector, set(completed_topics), results_history
         )
         priority_topics = prioritized_topics[:10]
 

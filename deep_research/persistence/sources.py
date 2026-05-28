@@ -95,19 +95,19 @@ async def run_synthesis_time_kb_qa(
             "Answer the question using only these excerpts. Cite by [KB:i]."
         ),
     }
-    chosen_model = model or ctx.valves.RESEARCH_MODEL
+    chosen_model = model or ctx.valves.models.research_model
     try:
         response = await ctx.client.chat_completions(
             chosen_model,
             [system, user],
             stream=False,
-            temperature=min(ctx.valves.TEMPERATURE, 0.3),
+            temperature=min(ctx.valves.models.temperature, 0.3),
         )
         content = ""
         if response and response.get("choices"):
             content = response["choices"][0].get("message", {}).get("content") or ""
-        p, c = extract_token_counts(response)
-        record_token_usage(ctx, "synthesis_time_kb_qa", p, c)
+        prompt_tokens, completion_tokens = extract_token_counts(response)
+        record_token_usage(ctx, "synthesis_time_kb_qa", prompt_tokens, completion_tokens)
         await checkpoint(ctx)
         return content
     except Exception as e:
@@ -135,16 +135,20 @@ async def answer_post_report_user_qa(ctx: RunContext, body: dict[str, Any]) -> s
     # and re-attach defensively in case it was stripped.
     await attach_collection_to_chat(ctx, ctx.chat_id, kb_id, kb_name)
 
-    await ctx.events.emit_status(
-        "info", "Post-report mode: answering from research KB...", False
-    )
+    from deep_research.progress.events import StatusEvent
+
+    await ctx.events.emit(StatusEvent(
+        description="Post-report mode: answering from research KB...",
+        level="info",
+        done=False,
+    ))
     chunks = await kb_search(ctx, kb_id, user_message, k=8)
     if not chunks:
-        await ctx.events.emit_status(
-            "warning",
-            "No KB matches found; answering from system prompt only.",
-            False,
-        )
+        await ctx.events.emit(StatusEvent(
+            description="No KB matches found; answering from system prompt only.",
+            level="warning",
+            done=False,
+        ))
     ctx_lines: list[str] = []
     for i, c in enumerate(chunks, start=1):
         src = c.get("source") or {}
@@ -170,19 +174,19 @@ async def answer_post_report_user_qa(ctx: RunContext, body: dict[str, Any]) -> s
         ),
     }
 
-    chosen_model = ctx.valves.SYNTHESIS_MODEL or ctx.valves.RESEARCH_MODEL
+    chosen_model = ctx.valves.models.synthesis_model or ctx.valves.models.research_model
     try:
         response = await ctx.client.chat_completions(
             chosen_model,
             [system, user],
             stream=False,
-            temperature=ctx.valves.SYNTHESIS_TEMPERATURE,
+            temperature=ctx.valves.models.synthesis_temperature,
         )
         content = ""
         if response and response.get("choices"):
             content = response["choices"][0].get("message", {}).get("content") or ""
-        p, c = extract_token_counts(response)
-        record_token_usage(ctx, "synthesis_time_kb_qa", p, c)
+        prompt_tokens, completion_tokens = extract_token_counts(response)
+        record_token_usage(ctx, "synthesis_time_kb_qa", prompt_tokens, completion_tokens)
         await checkpoint(ctx)
         return content or ""
     except Exception as e:

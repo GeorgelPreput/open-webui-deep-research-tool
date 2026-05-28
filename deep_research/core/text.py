@@ -123,8 +123,8 @@ async def clean_text_formatting(content: str) -> str:
         cleaned_lines.append(line)
 
     lines = cleaned_lines
-    merged_lines = []
-    short_line_group = []
+    merged_lines: list[str] = []
+    short_line_group: list[str] = []
     mixed_case_pattern = re.compile(r"[a-z][A-Z]")
 
     i = 0

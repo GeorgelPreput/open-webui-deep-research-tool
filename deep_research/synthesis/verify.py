@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from typing import Any
 
 from loguru import logger
 
@@ -146,7 +147,7 @@ async def verify_citations(
         return {"verified": [], "flagged": []}
 
     # Group citations by source URL for efficient verification
-    citations_by_source = {}
+    citations_by_source: dict[str, list[dict[str, Any]]] = {}
     for section_citations in citations_by_section.values():
         for citation in section_citations:
             url = citation.get("url")
@@ -169,7 +170,7 @@ async def verify_citations(
     # Process numeric citations directly from section content
     state = ctx.state
     compiled_sections = state.get("section_synthesized_content", {})
-    numeric_citations_by_url = {}
+    numeric_citations_by_url: dict[str, list[dict[str, Any]]] = {}
 
     # Extract all numeric citations directly from content
     for section, section_content in compiled_sections.items():
@@ -233,7 +234,7 @@ async def verify_citations(
             False,
         ))
 
-    verification_results = {"verified": [], "flagged": []}
+    verification_results: dict[str, list[dict[str, Any]]] = {"verified": [], "flagged": []}
 
     # Use a semaphore to limit concurrent verifications
     semaphore = asyncio.Semaphore(1)  # Process one source at a time

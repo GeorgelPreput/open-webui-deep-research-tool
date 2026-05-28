@@ -2,7 +2,7 @@ import json
 import os
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -44,11 +44,14 @@ async def _shutdown() -> None:
 
 @app.post("/research")
 async def research(req: ResearchRequest) -> EventSourceResponse:
+    if _coord is None:
+        raise HTTPException(status_code=503, detail="Coordinator not initialised")
+    coord = _coord
     api_key = os.environ.get("DR_OWUI_API_KEY", "")
     conv_id = req.conversation_id or f"api_{uuid4()}"
 
     async def event_stream():
-        async for event in _coord.stream(
+        async for event in coord.stream(
             user=RunUser(id=req.user_id, name=req.user_name),
             conversation_id=conv_id,
             chat_id=req.chat_id,

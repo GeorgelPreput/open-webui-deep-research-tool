@@ -23,13 +23,16 @@ jobs:
           queries: security-and-quality
       - uses: github/codeql-action/analyze@v3
 
-  semgrep:
+  opengrep:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: returntocorp/semgrep-action@v3
+      - uses: actions/setup-python@v5
         with:
-          config: >-
-            p/python
-            p/security-audit
-            p/owasp-top-ten
+          python-version: "3.11"
+      - run: pip install opengrep
+      # `--error` makes the action exit non-zero on findings; `--config=auto`
+      # resolves rules from registry metadata, matching what we run locally.
+      - run: opengrep scan --config=auto --error deep_research/

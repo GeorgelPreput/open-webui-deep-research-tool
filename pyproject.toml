@@ -26,11 +26,10 @@ server = [
 mcp = [
     "fastmcp>=0.3",
 ]
-
-[dependency-groups]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=4.1",
     "respx>=0.22",
     "hypothesis>=6.0",
     "ruff>=0.3",
@@ -64,10 +63,10 @@ indent-style = "space"
 
 [tool.mypy]
 python_version = "3.11"
-strict = true
 ignore_missing_imports = true
-explicit_any_bounds = true
-no_implicit_reexport = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

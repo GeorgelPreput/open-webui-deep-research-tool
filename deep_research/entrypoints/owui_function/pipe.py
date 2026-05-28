@@ -2,7 +2,8 @@ import asyncio
 import os
 from typing import Any
 
-from deep_research import Coordinator, Valves
+from deep_research import Coordinator
+from deep_research import Valves as DRValves
 from deep_research.adapter.auth import StaticToken
 from deep_research.core.types import ChatMessage, RunUser
 from deep_research.orchestrator.coordinator import RuntimeConfig
@@ -15,7 +16,7 @@ class Pipe:
     type = "manifold"
     name = "deep_research"
 
-    class Valves(Valves):
+    class Valves(DRValves):
         pass
 
     def __init__(self) -> None:

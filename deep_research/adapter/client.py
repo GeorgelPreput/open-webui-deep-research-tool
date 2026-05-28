@@ -147,9 +147,9 @@ class OWUIClient:
                 },
             ) as resp:
                 if resp.status_code >= 400:
-                    text = await resp.aread()
+                    body = (await resp.aread()).decode("utf-8", errors="replace")
                     raise OWUIClientError(
-                        f"POST {path} -> {resp.status_code}: {text[:500]}",
+                        f"POST {path} -> {resp.status_code}: {body[:500]}",
                         status=resp.status_code,
                     )
                 async for line in resp.aiter_lines():
