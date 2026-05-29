@@ -115,10 +115,7 @@ async def load_vocabulary(ctx: RunContext) -> list[str] | None:
 
 
 def vocab_embeddings_disk_path(ctx: RunContext) -> str:
-    try:
-        model_name = getattr(ctx.config, "embedding_model", "") or "default"
-    except Exception:
-        model_name = "default"
+    model_name = ctx.valves.models.embedding_model or "default"
     safe_model = re.sub(r"[^a-zA-Z0-9_-]", "_", model_name)[:64]
     cache_dir = ctx.config.data_dir / "deep_research"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -171,7 +168,7 @@ async def load_vocabulary_embeddings(ctx: RunContext) -> dict[str, list[float]]:
                 f"Generating embeddings for {len(vocab)} vocabulary words (batch_size={batch_size})"
             )
             all_embeddings = []
-            embedding_model = ctx.valves.models.research_model
+            embedding_model = ctx.valves.models.embedding_model
             for i in range(0, len(vocab), batch_size):
                 batch = vocab[i : i + batch_size]
                 batch_result = await ctx.client.embeddings(embedding_model, batch)

@@ -74,7 +74,10 @@ class Pipeline:
             with self._coord_lock:
                 if self._coord is None:
                     config = RuntimeConfig(
-                        data_dir=os.environ.get("DR_DATA_DIR", "/tmp/deep_research")
+                        data_dir=os.environ.get("DR_DATA_DIR", "/tmp/deep_research"),
+                        base_url=os.environ.get(
+                            "DR_OWUI_BASE_URL", self.valves.OWUI_BASE_URL
+                        ),
                     )
                     self._coord = Coordinator(valves=self.valves, config=config)
                     loop = asyncio.new_event_loop()

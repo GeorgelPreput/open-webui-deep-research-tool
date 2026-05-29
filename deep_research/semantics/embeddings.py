@@ -19,7 +19,7 @@ async def get_embedding(ctx: RunContext, text: str) -> list[float] | None:
         return cached_embedding
 
     try:
-        model = ctx.valves.models.research_model
+        model = ctx.valves.models.embedding_model
         result = await ctx.client.embeddings(model, [text])
         embedding = result[0] if result else None
         if embedding:

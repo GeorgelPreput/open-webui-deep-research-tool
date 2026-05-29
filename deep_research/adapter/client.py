@@ -198,9 +198,9 @@ class OWUIClient:
 
     async def chat_completions(
         self,
-        *,
         model: str,
         messages: list[dict],
+        *,
         stream: bool = False,
         temperature: float | None = None,
         chat_id: str | None = None,
@@ -221,9 +221,9 @@ class OWUIClient:
 
     async def stream_chat_completions(
         self,
-        *,
         model: str,
         messages: list[dict],
+        *,
         temperature: float | None = None,
     ) -> AsyncIterator[str]:
         body = {"model": model, "messages": messages, "stream": True}

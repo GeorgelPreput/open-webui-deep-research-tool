@@ -1,58 +1,23 @@
+import collections
+
 import numpy as np
 
 
 class ResearchStateManager:
+    MAX_CONVERSATIONS = 256
+
     def __init__(self):
-        self.conversation_states = {}
+        self.conversation_states: collections.OrderedDict[str, dict] = (
+            collections.OrderedDict()
+        )
 
     def get_state(self, conversation_id):
-        if conversation_id not in self.conversation_states:
-            self.conversation_states[conversation_id] = {
-                "research_completed": False,
-                "prev_comprehensive_summary": "",
-                "waiting_for_outline_feedback": False,
-                "outline_feedback_data": None,
-                "research_state": None,
-                "follow_up_mode": False,
-                "user_preferences": {"pdv": None, "strength": 0.0, "impact": 0.0},
-                "research_dimensions": None,
-                "research_trajectory": None,
-                "pdv_alignment_history": [],
-                "gap_coverage_history": [],
-                "semantic_transformations": None,
-                "section_synthesized_content": {},
-                "section_citations": {},
-                "url_selected_count": {},
-                "url_considered_count": {},
-                "url_token_counts": {},
-                "master_source_table": {},
-                "global_citation_map": {},
-                "verified_citations": [],
-                "flagged_citations": [],
-                "citation_fixes": [],
-                "memory_stats": {
-                    "results_tokens": 0,
-                    "section_tokens": {},
-                    "synthesis_tokens": 0,
-                    "total_tokens": 0,
-                },
-                "results_history": [],
-                "search_history": [],
-                "active_outline": [],
-                "cycle_summaries": [],
-                "completed_topics": [],
-                "irrelevant_topics": [],
-                "partial_topics": [],
-                "latest_new_topics": [],
-                "latest_completed_topics": [],
-                "latest_irrelevant_topics": [],
-                "all_topics": [],
-                "progress_cycle": 0,
-                "progress_embed_last_hash": "",
-                "progress_embed_revision": 0,
-                "progress_last_updated_at": "",
-                "current_cycle_queries": [],
-            }
+        if conversation_id in self.conversation_states:
+            self.conversation_states.move_to_end(conversation_id)
+            return self.conversation_states[conversation_id]
+        self.conversation_states[conversation_id] = self._new_state()
+        while len(self.conversation_states) > self.MAX_CONVERSATIONS:
+            self.conversation_states.popitem(last=False)
         return self.conversation_states[conversation_id]
 
     def update_state(self, conversation_id, key, value):
@@ -62,6 +27,55 @@ class ResearchStateManager:
     def reset_state(self, conversation_id):
         if conversation_id in self.conversation_states:
             del self.conversation_states[conversation_id]
+
+    @staticmethod
+    def _new_state() -> dict:
+        return {
+            "research_completed": False,
+            "prev_comprehensive_summary": "",
+            "waiting_for_outline_feedback": False,
+            "outline_feedback_data": None,
+            "research_state": None,
+            "follow_up_mode": False,
+            "user_preferences": {"pdv": None, "strength": 0.0, "impact": 0.0},
+            "research_dimensions": None,
+            "research_trajectory": None,
+            "pdv_alignment_history": [],
+            "gap_coverage_history": [],
+            "semantic_transformations": None,
+            "section_synthesized_content": {},
+            "section_citations": {},
+            "url_selected_count": {},
+            "url_considered_count": {},
+            "url_token_counts": {},
+            "master_source_table": {},
+            "global_citation_map": {},
+            "verified_citations": [],
+            "flagged_citations": [],
+            "citation_fixes": [],
+            "memory_stats": {
+                "results_tokens": 0,
+                "section_tokens": {},
+                "synthesis_tokens": 0,
+                "total_tokens": 0,
+            },
+            "results_history": [],
+            "search_history": [],
+            "active_outline": [],
+            "cycle_summaries": [],
+            "completed_topics": [],
+            "irrelevant_topics": [],
+            "partial_topics": [],
+            "latest_new_topics": [],
+            "latest_completed_topics": [],
+            "latest_irrelevant_topics": [],
+            "all_topics": [],
+            "progress_cycle": 0,
+            "progress_embed_last_hash": "",
+            "progress_embed_revision": 0,
+            "progress_last_updated_at": "",
+            "current_cycle_queries": [],
+        }
 
 
 class TrajectoryAccumulator:

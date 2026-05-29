@@ -1,11 +1,17 @@
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from deep_research.adapter.auth import BearerTokenProvider, StaticToken
+from deep_research.adapter.auth import (
+    BearerTokenProvider,
+    ContextTokenProvider,
+    reset_current_token,
+    set_current_token,
+)
 from deep_research.adapter.client import OWUIClient
 from deep_research.config.valves import Valves
 from deep_research.core.caches import EmbeddingCache, LRUBytesBoundedCache, TransformationCache
@@ -28,8 +34,13 @@ class AlreadyRunningError(RuntimeError):
 
 
 class RuntimeConfig:
-    def __init__(self, data_dir: str = "/tmp/deep_research"):
+    def __init__(
+        self,
+        data_dir: str = "/tmp/deep_research",
+        base_url: str = "http://localhost:8080",
+    ):
         self.data_dir = data_dir
+        self.base_url = base_url
 
 
 class CacheBundle:
@@ -65,8 +76,8 @@ class Coordinator:
         if self._started:
             return
         self._client = OWUIClient(
-            base_url="http://localhost:8080",
-            token_provider=StaticToken(""),
+            base_url=self._config.base_url,
+            token_provider=ContextTokenProvider(),
             timeout_seconds=self._valves.advanced.http_timeout_seconds,
             max_retries=self._valves.advanced.http_max_retries,
             llm_semaphore=asyncio.Semaphore(self._valves.advanced.llm_concurrency),
@@ -103,6 +114,8 @@ class Coordinator:
                 )
             self._inflight.add(inflight_key)
 
+        bearer = await token.get_token()
+        token_handle = set_current_token(bearer)
         try:
             ctx = await self._build_context(user, conversation_id, chat_id, token, prompt, history, sink)
             await ctx.events.start()
@@ -111,6 +124,7 @@ class Coordinator:
             finally:
                 await ctx.events.stop()
         finally:
+            reset_current_token(token_handle)
             async with self._inflight_lock:
                 self._inflight.discard(inflight_key)
 
@@ -163,7 +177,7 @@ class Coordinator:
             state=self._state_manager,
             executor=self._executor,
             mode=ResearchMode.FRESH,
-            started_at=__import__("time").time(),
+            started_at=time.time(),
         )
         return ctx
 

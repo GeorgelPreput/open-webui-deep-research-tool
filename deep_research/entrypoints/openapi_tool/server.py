@@ -30,7 +30,8 @@ async def _startup() -> None:
     global _coord
     valves = load_valves_from_env(prefix="DR_")
     config = RuntimeConfig(
-        data_dir=os.environ.get("DR_DATA_DIR", "/data/deep_research")
+        data_dir=os.environ.get("DR_DATA_DIR", "/data/deep_research"),
+        base_url=os.environ.get("DR_OWUI_BASE_URL", "http://localhost:8080"),
     )
     _coord = Coordinator(valves=valves, config=config)
     await _coord.start()

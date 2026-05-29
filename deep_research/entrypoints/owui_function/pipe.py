@@ -31,7 +31,10 @@ class Pipe:
         if self._coordinator is None:
             async with self._coord_lock:
                 if self._coordinator is None:
-                    config = RuntimeConfig(data_dir=os.environ.get("DR_DATA_DIR", "/tmp/deep_research"))
+                    config = RuntimeConfig(
+                        data_dir=os.environ.get("DR_DATA_DIR", "/tmp/deep_research"),
+                        base_url=os.environ.get("DR_OWUI_BASE_URL", "http://localhost:8080"),
+                    )
                     self._coordinator = Coordinator(valves=self.valves, config=config)
                     await self._coordinator.start()
         return self._coordinator

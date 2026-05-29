@@ -307,7 +307,7 @@ async def fetch_from_archive(
     close_session = False
     if session is None:
         close_session = True
-        session = httpx.AsyncClient(timeout=httpx.Timeout(20.0), verify=False)
+        session = httpx.AsyncClient(timeout=httpx.Timeout(20.0))
 
     try:
         wayback_api_url = f"https://archive.org/wayback/available?url={url}"

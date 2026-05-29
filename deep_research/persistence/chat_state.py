@@ -194,12 +194,9 @@ def set_dr_state(ctx: RunContext, dr_state: dict[str, Any]) -> None:
     ctx.state.update_state(ctx.conversation_id, "dr_state", dr_state)
 
 def resolve_chat_id(ctx: RunContext, body: dict[str, Any]) -> str | None:
-    """Pull the OWUI chat_id from body, nested metadata, or request.state."""
+    """Pull the OWUI chat_id from body or nested metadata."""
     md = body.get("metadata") or {}
-    chat_id = md.get("chat_id") or body.get("chat_id")
-    if not chat_id:
-        pass  # request metadata lookup removed
-    return chat_id
+    return md.get("chat_id") or body.get("chat_id")
 
 async def load_persisted_dr_state(
     ctx: RunContext, chat_id: str | None

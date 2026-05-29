@@ -1,4 +1,3 @@
-import asyncio
 import hashlib
 import logging
 import re
@@ -169,19 +168,19 @@ async def upload_markdown_to_kb(
 
     Returns the OWUI file_id on success, or None on failure. The upload
     is forced synchronous so embedding completes before we add to the collection.
+    The `metadata` parameter is accepted for caller compatibility but not
+    forwarded — OWUI's /api/v1/files/ endpoint derives file metadata server-side.
     """
+    del metadata  # accepted for caller compatibility; OWUI derives meta server-side
     payload = markdown_text.encode("utf-8", errors="replace")
-    upload_meta = dict(metadata or {})
-    upload_meta.setdefault("name", filename)
-    upload_meta.setdefault("content_type", "text/markdown")
-    upload_meta.setdefault("size", len(payload))
 
-    file_id = await ctx.client.upload_file(
-        filename=filename,
-        content=payload,
-        metadata=upload_meta,
-        process=True,
-    )
+    try:
+        upload = await ctx.client.upload_file(payload, filename, process=True)
+    except Exception as e:
+        logger.warning(f"upload_file failed for {filename}: {e}")
+        return None
+
+    file_id = getattr(upload, "id", None)
     if not file_id:
         logger.warning(f"upload returned no id for {filename}")
         return None
@@ -372,47 +371,33 @@ async def rehydrate_working_corpus_from_kb(ctx: RunContext) -> dict[str, str]:
 async def kb_search(
     ctx: RunContext, kb_id: str, query: str, k: int = 6
 ) -> list[dict[str, Any]]:
-    """Run a vector search against the research KB collection.
-
-    Uses Open WebUI's configured EMBEDDING_FUNCTION + VECTOR_DB_CLIENT.
-    Returns a list of {text, source, distance} dicts.
-    """
+    """Run a vector search against the research KB collection via OWUI REST."""
     if not kb_id or not query:
         return []
     try:
-        embedding = await ctx.client.embeddings(ctx.config.EMBEDDING_MODEL or "", [query])
-        if not embedding:
-            return []
-        vdb = getattr(ctx.config, "VECTOR_DB_CLIENT", None)
-        if vdb is None:
-            logger.warning("VECTOR_DB_CLIENT is not initialized")
-            return []
-        loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(
-            ctx.executor,
-            lambda: vdb.search(
-                collection_name=kb_id,
-                vectors=[embedding],
-                limit=int(k),
-            ),
+        resp = await ctx.client.query_collection(
+            collection_names=[kb_id],
+            query=query,
+            k=int(k),
+            hybrid=False,
         )
-        if not res:
-            return []
-        documents = getattr(res, "documents", None) or []
-        metadatas = getattr(res, "metadatas", None) or []
-        distances = getattr(res, "distances", None) or []
-        docs0 = documents[0] if documents and len(documents) > 0 else []
-        metas0 = metadatas[0] if metadatas and len(metadatas) > 0 else []
-        dists0 = distances[0] if distances and len(distances) > 0 else []
-        out: list[dict[str, Any]] = []
-        for i, txt in enumerate(docs0):
-            meta = metas0[i] if i < len(metas0) else {}
-            dist = dists0[i] if i < len(dists0) else None
-            out.append({"text": txt or "", "source": meta, "distance": dist})
-        return out
     except Exception as e:
         logger.warning(
             f"KB vector search failed (kb={kb_id}, q={query[:60]!r}): {e}"
         )
         return []
+
+    documents = getattr(resp, "documents", None) or [[]]
+    metadatas = getattr(resp, "metadatas", None) or [[]]
+    distances = getattr(resp, "distances", None) or [[]]
+    docs0 = documents[0] if documents else []
+    metas0 = metadatas[0] if metadatas else []
+    dists0 = distances[0] if distances else []
+
+    out: list[dict[str, Any]] = []
+    for i, txt in enumerate(docs0):
+        meta = metas0[i] if i < len(metas0) else {}
+        dist = dists0[i] if i < len(dists0) else None
+        out.append({"text": txt or "", "source": meta, "distance": dist})
+    return out
 

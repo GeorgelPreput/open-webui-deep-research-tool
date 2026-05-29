@@ -9,6 +9,10 @@ class ModelsValves(BaseModel):
     research_model: str = Field("gemma3:12b", description="Primary research LLM")
     synthesis_model: str = Field("gemma3:27b", description="Synthesis LLM (optional override)")
     quality_filter_model: str = Field("gemma3:4b", description="Relevance filter LLM")
+    embedding_model: str = Field(
+        "nomic-embed-text",
+        description="Embedding model ID; must match an OWUI-registered embedding model",
+    )
 
     research_context_window: int | None = Field(
         None, description="Override; None = auto-detect from /api/v1/models/list"

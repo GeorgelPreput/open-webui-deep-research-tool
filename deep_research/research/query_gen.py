@@ -36,12 +36,14 @@ Focus on core conceptual terms with targeted expansions and don't return heavy, 
 Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
 
 Format your response as a valid JSON object with the following structure:
-{"queries": [
-  "query": "search query 1", "topic": "related research topic",
-  "query": "search query 2", "topic": "related research topic",
-  "query": "search query 3", "topic": "related research topic",
-  "query": "search query 4", "topic": "related research topic"
-]}""",
+{
+  "queries": [
+    {"query": "search query 1", "topic": "related research topic"},
+    {"query": "search query 2", "topic": "related research topic"},
+    {"query": "search query 3", "topic": "related research topic"},
+    {"query": "search query 4", "topic": "related research topic"}
+  ]
+}""",
     }
 
     message = {

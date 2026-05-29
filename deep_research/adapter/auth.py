@@ -1,3 +1,4 @@
+import contextvars
 from typing import Protocol
 
 
@@ -19,3 +20,29 @@ class StaticToken:
 
     async def get_token(self) -> str:
         return self._token
+
+
+_current_token: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "deep_research_owui_token", default=""
+)
+
+
+class ContextTokenProvider:
+    """Per-request bearer token read from a contextvar.
+
+    Set the token at the start of a request via set_current_token(); the
+    OWUIClient reads it on every outbound call. This lets us share one
+    OWUIClient (and its connection pool) across many concurrent requests
+    while still scoping the bearer per-call.
+    """
+
+    async def get_token(self) -> str:
+        return _current_token.get()
+
+
+def set_current_token(token: str) -> contextvars.Token:
+    return _current_token.set(token)
+
+
+def reset_current_token(reset_token: contextvars.Token) -> None:
+    _current_token.reset(reset_token)
