@@ -8,6 +8,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from deep_research.budget.tokens import count_tokens
 from deep_research.config.constants import VERIFY_CITATIONS
+from deep_research.core.text import response_text
 from deep_research.progress.events import StatusEvent
 from deep_research.semantics.embeddings import get_embedding
 from deep_research.synthesis.verify import verify_citation_batch
@@ -33,7 +34,7 @@ async def generate_subtopic_content_with_citations(
         ctx.seen_subtopics.add(subtopic)
 
     # Get state
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
 
     # Get relevance cache or initialize it
     relevance_cache = state.get("subtopic_relevance_cache", {})
@@ -84,7 +85,7 @@ async def generate_subtopic_content_with_citations(
             try:
                 query_embedding = await get_embedding(ctx, original_query)
                 if query_embedding:
-                    ctx.state[query_embedding_key] = query_embedding
+                    state[query_embedding_key] = query_embedding
             except Exception as e:
                 logger.error(f"Error getting query embedding: {e}")
 
@@ -92,7 +93,7 @@ async def generate_subtopic_content_with_citations(
             try:
                 subtopic_embedding = await get_embedding(ctx, subtopic)
                 if subtopic_embedding:
-                    ctx.state[subtopic_embedding_key] = subtopic_embedding
+                    state[subtopic_embedding_key] = subtopic_embedding
             except Exception as e:
                 logger.error(f"Error getting subtopic embedding: {e}")
 
@@ -110,7 +111,7 @@ async def generate_subtopic_content_with_citations(
                     combined_array = combined_array / norm
                 combined_embedding = combined_array.tolist()
                 # Cache the combined embedding
-                ctx.state[combined_embedding_key] = combined_embedding
+                state[combined_embedding_key] = combined_embedding
             except Exception as e:
                 logger.error(f"Error creating combined embedding: {e}")
 
@@ -123,7 +124,7 @@ async def generate_subtopic_content_with_citations(
             subtopic_embedding = await get_embedding(ctx, subtopic)
             # Cache if successful
             if subtopic_embedding:
-                ctx.state[subtopic_embedding_key] = subtopic_embedding
+                state[subtopic_embedding_key] = subtopic_embedding
 
         combined_embedding = subtopic_embedding
 
@@ -133,7 +134,7 @@ async def generate_subtopic_content_with_citations(
 
     # Add the research outline for context
     subtopic_context += "## Research Outline Context:\n"
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
     synthesis_outline = state.get("research_state", {}).get("research_outline", [])
     if synthesis_outline:
         for topic_item in synthesis_outline:
@@ -184,7 +185,7 @@ async def generate_subtopic_content_with_citations(
                 content_embedding = await get_embedding(ctx, content[:2000])
                 # Cache the content embedding if valid
                 if content_embedding:
-                    ctx.state[result_key] = content_embedding
+                    state[result_key] = content_embedding
 
             if content_embedding:
                 similarity = cosine_similarity(
@@ -194,7 +195,7 @@ async def generate_subtopic_content_with_citations(
 
         # Cache the relevance scores for this subtopic
         relevance_cache[subtopic_key] = result_scores
-        ctx.state["subtopic_relevance_cache"] = relevance_cache
+        state["subtopic_relevance_cache"] = relevance_cache
 
         # Sort by relevance score (highest first)
         result_scores.sort(key=lambda x: x[1], reverse=True)
@@ -292,7 +293,7 @@ async def generate_subtopic_content_with_citations(
         )
 
         if response and "choices" in response and len(response["choices"]) > 0:
-            subtopic_content = response["choices"][0]["message"]["content"]
+            subtopic_content = response_text(response)
 
             # Count tokens in the subtopic content
             tokens = await count_tokens(ctx, subtopic_content)
@@ -302,12 +303,12 @@ async def generate_subtopic_content_with_citations(
                 "subtopic_synthesized_content", {}
             )
             subtopic_synthesized_content[subtopic] = subtopic_content
-            ctx.state["subtopic_synthesized_content"] = subtopic_synthesized_content
+            state["subtopic_synthesized_content"] = subtopic_synthesized_content
 
             # Store source mapping for this subtopic
             subtopic_sources = state.get("subtopic_sources", {})
             subtopic_sources[subtopic] = sources_for_subtopic
-            ctx.state["subtopic_sources"] = subtopic_sources
+            state["subtopic_sources"] = subtopic_sources
 
             # Identify citations in this subtopic content
             subtopic_citations = []
@@ -389,7 +390,7 @@ async def generate_section_content_with_citations(
         ctx.seen_sections.add(section_title)
 
     # Get state
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
 
     # Generate content for each subtopic independently
     subtopic_contents = {}
@@ -459,8 +460,8 @@ async def generate_section_content_with_citations(
             master_source_table[url]["cited_in_sections"].add(section_title)
 
     # Update state
-    ctx.state["global_citation_map"] = global_citation_map
-    ctx.state["master_source_table"] = master_source_table
+    state["global_citation_map"] = global_citation_map
+    state["master_source_table"] = master_source_table
 
     # Verify citations if enabled
     verified_citations = []
@@ -566,7 +567,7 @@ async def generate_section_content_with_citations(
                         "original_text": flagged_text,
                     }
                 )
-            ctx.state["citation_fixes"] = citation_fixes
+            state["citation_fixes"] = citation_fixes
 
         # Now replace all local citation IDs with global IDs using context-aware replacement
         # First handle single citations - standard pattern [n]
@@ -648,22 +649,22 @@ async def generate_section_content_with_citations(
     section_tokens = memory_stats.get("section_tokens", {})
     section_tokens[section_title] = total_tokens
     memory_stats["section_tokens"] = section_tokens
-    ctx.state["memory_stats"] = memory_stats
+    state["memory_stats"] = memory_stats
 
     # Store content for later use
     section_synthesized_content = state.get("section_synthesized_content", {})
     section_synthesized_content[section_title] = section_content
-    ctx.state["section_synthesized_content"] = section_synthesized_content
+    state["section_synthesized_content"] = section_synthesized_content
 
     # Store section sources for later citation correlation
     section_sources_map = state.get("section_sources_map", {})
     section_sources_map[section_title] = section_sources
-    ctx.state["section_sources_map"] = section_sources_map
+    state["section_sources_map"] = section_sources_map
 
     # Store all citations for this section
     section_citations = state.get("section_citations", {})
     section_citations[section_title] = all_section_citations
-    ctx.state["section_citations"] = section_citations
+    state["section_citations"] = section_citations
 
     # Show section completion status
     await ctx.events.emit(StatusEvent(
@@ -724,7 +725,7 @@ You may relocate or lightly edit sentences with in-text citations or strikethrou
     )
 
     # Add the research outline for better context
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
     research_outline = state.get("research_state", {}).get("research_outline", [])
     if research_outline:
         smoothing_context += "## Full Research Outline:\n"
@@ -760,7 +761,7 @@ You may relocate or lightly edit sentences with in-text citations or strikethrou
         )
 
         if response and "choices" in response and len(response["choices"]) > 0:
-            improved_content = response["choices"][0]["message"]["content"]
+            improved_content = response_text(response)
             return improved_content
         else:
             # Return original if synthesis fails

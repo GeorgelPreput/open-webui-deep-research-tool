@@ -2,6 +2,8 @@ import logging
 from datetime import datetime
 from typing import Any
 
+import httpx
+
 from deep_research.core.types import RunContext
 from deep_research.persistence.kb import persist_selected_source
 from deep_research.progress.events import StatusEvent
@@ -68,7 +70,7 @@ async def try_owui_search(ctx: RunContext, query: str, total_results: int) -> tu
 
         return results, None
 
-    except TimeoutError:
+    except (TimeoutError, httpx.TimeoutException):
         logger.error(f"OpenWebUI search timed out for query: {query}")
         return [], "timeout"
     except Exception as e:

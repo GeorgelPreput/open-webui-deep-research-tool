@@ -6,6 +6,7 @@ from loguru import logger
 from deep_research.budget.contexts import build_abstract_context, build_titles_context
 from deep_research.budget.tokens import count_tokens
 from deep_research.budget.windows import get_task_context_budget
+from deep_research.core.text import response_text
 from deep_research.core.types import BibliographyEntry
 from deep_research.progress.events import MessageEvent
 from deep_research.synthesis.utils import get_synthesis_model
@@ -89,7 +90,7 @@ async def generate_titles(
         )
 
         if response and "choices" in response and len(response["choices"]) > 0:
-            titles_content = response["choices"][0]["message"]["content"]
+            titles_content = response_text(response)
 
             try:
                 json_str = titles_content[
@@ -199,7 +200,7 @@ The abstract must NOT:
         )
 
         if response and "choices" in response and len(response["choices"]) > 0:
-            abstract = response["choices"][0]["message"]["content"]
+            abstract = response_text(response)
             if not ctx.valves.events.quiet_chat_mode:
                 await ctx.events.emit(MessageEvent("*Abstract generation complete.*\n"))
             return abstract

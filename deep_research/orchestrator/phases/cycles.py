@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Any
 
+from deep_research.core.text import response_text
 from deep_research.core.types import RunContext
 from deep_research.persistence.chat_state import checkpoint, update_token_counts
 from deep_research.progress.embed import refresh_progress_embed
@@ -77,7 +78,10 @@ async def run_cycles(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
             query = query_obj.get("query", "")
             query_embedding = await get_embedding(ctx, query)
             if not query_embedding:
-                query_embedding = [0.0] * 384
+                logger.warning(
+                    f"Skipping query with no embedding (cycle {cycle}): {query!r}"
+                )
+                continue
 
             semantic_transformations = conv_state.get("semantic_transformations")
             if semantic_transformations:
@@ -174,7 +178,7 @@ async def _analyze_cycle_results(ctx, conv_state, cycle, max_cycles, user_messag
         [analysis_prompt, analysis_msg],
         temperature=ctx.valves.models.temperature,
     )
-    content = response["choices"][0]["message"]["content"]
+    content = response_text(response)
     try:
         json_str = content[content.find("{"):content.rfind("}") + 1]
         data = json.loads(json_str)

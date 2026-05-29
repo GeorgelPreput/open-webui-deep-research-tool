@@ -1,6 +1,7 @@
 import logging
 from typing import Any
 
+from deep_research.core.text import response_text
 from deep_research.core.types import RunContext
 from deep_research.persistence.chat_state import initialize_research_state
 from deep_research.progress.events import MessageEvent, StatusEvent
@@ -118,7 +119,7 @@ async def _generate_outline_and_initial(ctx, user_message, summary_embedding=Non
         [system_msg, user_msg],
         temperature=ctx.valves.models.temperature,
     )
-    content = response["choices"][0]["message"]["content"]
+    content = response_text(response)
     try:
         json_str = content[content.find("{"):content.rfind("}") + 1]
         query_data = json.loads(json_str)
@@ -134,7 +135,8 @@ async def _generate_outline_and_initial(ctx, user_message, summary_embedding=Non
     for query in initial_queries:
         query_embedding = await get_embedding(ctx, query)
         if not query_embedding:
-            query_embedding = [0.0] * 384
+            logger.warning(f"Skipping initial query with no embedding: {query!r}")
+            continue
         results = await process_query(ctx, query, query_embedding, None, cycle_feedback=None, summary_embedding=summary_embedding)
         for r in results:
             url = r.get("url", "")
@@ -183,7 +185,7 @@ async def _generate_outline(ctx, user_message, initial_results, is_follow_up):
         temperature=ctx.valves.models.temperature,
     )
     import json
-    content = response["choices"][0]["message"]["content"]
+    content = response_text(response)
     try:
         json_str = content[content.find("{"):content.rfind("}") + 1]
         return json.loads(json_str)

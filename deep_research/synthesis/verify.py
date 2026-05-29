@@ -6,6 +6,7 @@ from typing import Any
 from loguru import logger
 
 from deep_research.config.constants import VERIFY_CITATIONS
+from deep_research.core.text import response_text
 from deep_research.progress.events import StatusEvent
 from deep_research.web.fetch import fetch_content
 
@@ -58,7 +59,7 @@ async def verify_citation_batch(ctx, url, citations, source_content):
         )
 
         if response and "choices" in response and len(response["choices"]) > 0:
-            result_content = response["choices"][0]["message"]["content"]
+            result_content = response_text(response)
 
             # Extract JSON array from the response
             try:
@@ -168,7 +169,7 @@ async def verify_citations(
                 citation["global_id"] = global_id
 
     # Process numeric citations directly from section content
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
     compiled_sections = state.get("section_synthesized_content", {})
     numeric_citations_by_url: dict[str, list[dict[str, Any]]] = {}
 
@@ -252,7 +253,7 @@ async def verify_citations(
 
                 try:
                     # Get state for cache access
-                    state = ctx.state
+                    state = ctx.state.get_state(ctx.conversation_id)
                     url_results_cache = state.get("url_results_cache", {})
 
                     # Check cache first
@@ -372,13 +373,13 @@ async def verify_citations(
         ))
 
     # Store verification results for later use
-    ctx.state["verification_results"] = verification_results
+    state["verification_results"] = verification_results
 
     return verification_results
 
 async def add_verification_note(ctx, comprehensive_answer):
     """Add a note about strikethrough citations if any were flagged"""
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
     verification_results = state.get("verification_results", {})
     flagged_citations = verification_results.get("flagged", [])
 

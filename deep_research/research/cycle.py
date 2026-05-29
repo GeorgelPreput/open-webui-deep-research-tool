@@ -115,6 +115,7 @@ async def process_query(
 
                 # Skip results with less than 200 tokens
                 if processed_result["tokens"] < 200:
+                    failed_count += 1
                     logger.info(
                         f"Skipping result with only {processed_result['tokens']} tokens (less than minimum 200)"
                     )

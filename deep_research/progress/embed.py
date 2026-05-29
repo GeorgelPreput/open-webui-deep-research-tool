@@ -108,7 +108,7 @@ new ResizeObserver(reportHeight).observe(document.body);
 async def refresh_progress_embed(
     ctx: RunContext, cycle: int | None = None, force: bool = False
 ) -> None:
-    if not ctx.valves.ENABLE_PROGRESS_EMBED:
+    if not ctx.valves.events.enable_progress_embed:
         return
     snapshot = build_progress_snapshot(ctx, cycle=cycle)
     html_content = render_progress_embed_html(snapshot)

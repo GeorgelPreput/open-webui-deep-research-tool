@@ -4,6 +4,7 @@ from typing import Any
 
 from loguru import logger
 
+from deep_research.core.text import response_text
 from deep_research.core.types import BibliographyData, BibliographyEntry
 
 
@@ -60,7 +61,7 @@ async def identify_and_correlate_citations(
             * 0.3,  # Lower temperature for precision
         )
 
-        citation_content = citation_response["choices"][0]["message"]["content"]
+        citation_content = response_text(citation_response)
 
         # Extract JSON from response
         try:
@@ -116,7 +117,7 @@ async def generate_bibliography(
         }
 
     # First, scan all compiled sections to find actually cited sources
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
     compiled_sections = state.get("section_synthesized_content", {})
 
     # Extract all citation numbers from the compiled text

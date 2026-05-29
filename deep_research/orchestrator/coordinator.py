@@ -4,6 +4,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 from deep_research.adapter.auth import (
@@ -39,7 +40,9 @@ class RuntimeConfig:
         data_dir: str = "/tmp/deep_research",
         base_url: str = "http://localhost:8080",
     ):
-        self.data_dir = data_dir
+        # Coerce to Path: the runtime shims pass str (from env), but the
+        # vocabulary disk-cache code uses `data_dir / "deep_research"`.
+        self.data_dir = Path(data_dir)
         self.base_url = base_url
 
 
@@ -66,6 +69,7 @@ class Coordinator:
         self._config = config
         self._inflight: set[str] = set()
         self._inflight_lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
         self._shared_caches = CacheBundle.create(valves, config)
         self._state_manager = ResearchStateManager()
         self._executor = ThreadPoolExecutor(max_workers=valves.advanced.executor_workers)
@@ -75,18 +79,21 @@ class Coordinator:
     async def start(self) -> None:
         if self._started:
             return
-        self._client = OWUIClient(
-            base_url=self._config.base_url,
-            token_provider=ContextTokenProvider(),
-            timeout_seconds=self._valves.advanced.http_timeout_seconds,
-            max_retries=self._valves.advanced.http_max_retries,
-            llm_semaphore=asyncio.Semaphore(self._valves.advanced.llm_concurrency),
-            embedding_semaphore=asyncio.Semaphore(self._valves.advanced.embedding_concurrency),
-            search_semaphore=asyncio.Semaphore(self._valves.web.search_concurrency),
-            fetch_semaphore=asyncio.Semaphore(self._valves.web.fetch_concurrency),
-        )
-        await self._client.start()
-        self._started = True
+        async with self._start_lock:
+            if self._started:
+                return
+            self._client = OWUIClient(
+                base_url=self._config.base_url,
+                token_provider=ContextTokenProvider(),
+                timeout_seconds=self._valves.advanced.http_timeout_seconds,
+                max_retries=self._valves.advanced.http_max_retries,
+                llm_semaphore=asyncio.Semaphore(self._valves.advanced.llm_concurrency),
+                embedding_semaphore=asyncio.Semaphore(self._valves.advanced.embedding_concurrency),
+                search_semaphore=asyncio.Semaphore(self._valves.web.search_concurrency),
+                fetch_semaphore=asyncio.Semaphore(self._valves.web.fetch_concurrency),
+            )
+            await self._client.start()
+            self._started = True
 
     async def close(self) -> None:
         if self._client is not None:
@@ -178,6 +185,8 @@ class Coordinator:
             executor=self._executor,
             mode=ResearchMode.FRESH,
             started_at=time.time(),
+            prompt=prompt,
+            history=history,
         )
         return ctx
 
@@ -196,13 +205,19 @@ class Coordinator:
             outline_feedback as of_phase,
         )
 
-        phase_state: dict[str, Any] = {}
+        phase_state: dict[str, Any] = {
+            "user_message": ctx.prompt,
+            "history": ctx.history,
+        }
+        ctx.state.update_state(ctx.conversation_id, "last_user_message", ctx.prompt)
         phase_state = await rehydrate.run_rehydrate(ctx, phase_state)
 
-        mode = ctx.state.get_state(ctx.conversation_id).get("mode", "fresh")
-        if mode == "post_report_user_qa":
+        if phase_state.get("post_report_mode"):
             from deep_research.persistence.sources import answer_post_report_user_qa
-            answer = await answer_post_report_user_qa(ctx, body={})
+            answer = await answer_post_report_user_qa(
+                ctx,
+                body={"messages": [{"role": "user", "content": ctx.prompt}]},
+            )
             return Report(content=answer, conversation_id=ctx.conversation_id)
 
         phase_state = await of_phase.run_outline_feedback(ctx, phase_state)

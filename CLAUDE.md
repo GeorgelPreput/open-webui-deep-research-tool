@@ -353,6 +353,93 @@ In `routers/openai.py::generate_chat_completion`, the bottom-level `except Excep
 - State persistence: `_load_persisted_dr_state` / `_save_persisted_dr_state` / `_checkpoint` (~L740–790).
 - Entry point: `async def pipe(self, body, __user__, __event_emitter__, ...)` at ~L11652. Returns `comprehensive_answer` string in QUIET mode (auto-appended as assistant message by OWUI).
 
+## `deep_research/` package — implementation notes
+
+These document non-obvious behavior in the refactored `deep_research/` package
+(the active code; `pipe.py` is the frozen pre-refactor monolith).
+
+### Citation marker replacement is first-occurrence only
+
+In `orchestrator/phases/synthesize.py`, after sections are generated, raw inline
+citation markers are rewritten to numbered references against the
+`global_citation_map`:
+
+```python
+modified = modified.replace(raw, f"[{global_citation_map[url]}]", 1)
+```
+
+The trailing `1` is deliberate — it replaces **only the first occurrence** of
+`raw` per citation entry, not all of them. `raw` is `cit.get("raw_text")`, the
+free-text citation fragment the LLM emitted; it can be a short phrase that also
+appears verbatim in running body text. An unbounded `.replace()` would rewrite
+those legitimate text occurrences into stray `[N]` markers and corrupt the prose.
+
+**Trade-off / known limitation:** if the *same* citation marker legitimately
+appears multiple times in one section and every instance should be numbered, this
+will only tag the first. That is the accepted behavior — prefer under-tagging to
+corrupting body text. If a future change needs all-occurrence tagging, do it with
+a bounded regex that matches only the marker shape, not a blanket
+`str.replace(raw, ...)`.
+
+### Model-response parsing goes through `response_text()`
+
+`core/text.py::response_text(response)` is the single safe accessor for OWUI chat
+completion responses. It returns `""` for any None / malformed / empty response
+instead of raising. Every site that needs the assistant content must use it — do
+**not** reintroduce raw `response["choices"][0]["message"]["content"]` subscripts,
+which crash the whole run on a single bad model reply.
+
+### No fabricated embedding vectors
+
+When `get_embedding()` returns nothing, callers (`orchestrator/phases/cycles.py`,
+`orchestrator/phases/initial_queries.py`) **skip the query with a logged warning**
+rather than injecting a placeholder vector. The old `[0.0] * 384` fallback was
+doubly wrong: a zero vector makes cosine similarity divide by zero (→ NaN that
+poisons all downstream ranking), and 384 ≠ the real embedding dimension
+(e.g. `nomic-embed-text` is 768), causing shape mismatches. `similarity.py`
+additionally guards every normalize/dot via `_safe_normalize()` (returns `None`
+for zero/empty/non-finite vectors), so any stray bad vector yields a `0.0`
+similarity instead of NaN. Do not reintroduce dimension-hardcoded fallbacks.
+
+### `ctx.state` is the manager, not the conversation dict
+
+`RunContext.state` is a `ResearchStateManager`. To read/write per-conversation
+state you MUST go through `ctx.state.get_state(ctx.conversation_id)` (returns the
+live dict you can mutate in place) or `ctx.state.update_state(conv_id, key, val)`.
+The manager has **no** `__getitem__`/`__setitem__`/`.get`, so `ctx.state[key]`,
+`ctx.state[key] = v`, and `ctx.state.get(...)` all raise at runtime. The
+synthesis modules had ~31 such sites (`state = ctx.state` followed by
+`state.get(...)`, plus `ctx.state[key] = ...`) that crashed the whole synthesis
+phase on every run; all now use `state = ctx.state.get_state(ctx.conversation_id)`
+and mutate that dict. Unit tests missed this because the test fixture happened to
+exercise only the manager API — see the smoke test note below.
+
+### `RuntimeConfig.data_dir` is coerced to `pathlib.Path`
+
+The runtime shims pass `DR_DATA_DIR` as a **str**, but the vocabulary disk-cache
+code does `ctx.config.data_dir / "deep_research"`. `RuntimeConfig.__init__` now
+coerces `self.data_dir = Path(data_dir)` so that works. Don't assume `data_dir`
+is a str elsewhere.
+
+### Vocabulary uses TWO locks (deadlock hazard)
+
+`load_vocabulary_embeddings()` calls `load_vocabulary()` *while holding its own
+lock*. `asyncio.Lock` is **not reentrant**, so they must use distinct locks
+(`_vocab_emb_load_lock` and `_vocab_load_lock`). A single shared lock deadlocks
+the whole run (hangs forever). Keep them separate.
+
+### Local smoke test (no live OWUI required)
+
+`scripts/smoke_test.py` drives `Coordinator.stream()` (the exact coroutine the
+OpenAPI `/research` endpoint uses) end-to-end through all 9 phases with every OWUI
+REST endpoint mocked via `respx`. It asserts: (a) the prompt reaches the outbound
+LLM call, (b) the KB is named from the prompt, (c) a same-conversation follow-up
+answers from the KB without a new search crawl, (d) a substantial report is
+produced. Run: `.venv/bin/python scripts/smoke_test.py`. This is the fast way to
+catch full-pipeline regressions that the unit tests (which don't cover the
+synthesis path end-to-end) miss — every bug in the four notes above was caught by
+it, not by `pytest`.
+
 ## Useful pod-side commands
 
 ```bash

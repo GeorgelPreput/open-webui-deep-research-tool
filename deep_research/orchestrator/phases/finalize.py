@@ -54,7 +54,6 @@ async def run_finalize(ctx: RunContext, ps: dict[str, Any]) -> Report:
         from deep_research.persistence.chat_state import set_dr_state
         set_dr_state(ctx, dr)
 
-    conv_state.get("prev_comprehensive_summary", "")
     conv_state["prev_comprehensive_summary"] = comprehensive_answer
 
     await refresh_progress_embed(ctx, force=True)

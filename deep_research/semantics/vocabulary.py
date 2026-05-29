@@ -11,7 +11,11 @@ logger = logging.getLogger("deep_research.semantics.vocabulary")
 
 _vocabulary_cache: list[str] | None = None
 _vocabulary_embeddings: dict[str, list[float]] | None = None
+# Two distinct locks: the embeddings loader calls the text-vocabulary loader
+# while holding its own lock, so they MUST NOT share one — asyncio.Lock is not
+# reentrant and a single shared lock deadlocks (nested acquire).
 _vocab_load_lock = asyncio.Lock()
+_vocab_emb_load_lock = asyncio.Lock()
 
 
 async def create_context_vocabulary(
@@ -127,7 +131,7 @@ async def load_vocabulary_embeddings(ctx: RunContext) -> dict[str, list[float]]:
     if _vocabulary_embeddings is not None:
         return _vocabulary_embeddings
 
-    async with _vocab_load_lock:
+    async with _vocab_emb_load_lock:
         if _vocabulary_embeddings is not None:
             return _vocabulary_embeddings
 

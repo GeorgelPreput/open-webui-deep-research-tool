@@ -5,6 +5,7 @@ from typing import Any
 
 from sklearn.metrics.pairwise import cosine_similarity
 
+from deep_research.core.text import response_text
 from deep_research.core.types import RunContext
 from deep_research.progress.events import MessageEvent, StatusEvent
 from deep_research.research.cycle import process_query
@@ -149,7 +150,7 @@ Don't allow your own biases or preferences to have any affect on your answer - p
             * 0.3,  # Low temperature for consistent interpretation
         )
 
-        result_content = response["choices"][0]["message"]["content"]
+        result_content = response_text(response)
 
         # Extract JSON from response
         try:

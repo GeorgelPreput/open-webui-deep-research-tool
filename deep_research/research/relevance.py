@@ -2,6 +2,7 @@ import logging
 import re
 from typing import Any
 
+from deep_research.core.text import response_text
 from deep_research.core.types import RunContext
 from deep_research.progress.events import MessageEvent, StatusEvent
 
@@ -57,7 +58,7 @@ async def extract_topic_relevant_info(ctx: RunContext, results, topics):
         )
 
         if response and "choices" in response and len(response["choices"]) > 0:
-            extracted_info = response["choices"][0]["message"]["content"]
+            extracted_info = response_text(response)
             return extracted_info
         else:
             return "No relevant information found."
@@ -113,7 +114,7 @@ You do not need to include justification along with your refined topics.""",
         )
 
         if response and "choices" in response and len(response["choices"]) > 0:
-            refined_content = response["choices"][0]["message"]["content"]
+            refined_content = response_text(response)
 
             # Extract topics using regex (looking for numbered or bulleted list items)
             refined_topics = re.findall(

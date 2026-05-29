@@ -1,6 +1,7 @@
 import json
 import logging
 
+from deep_research.core.text import response_text
 from deep_research.core.types import RunContext
 from deep_research.progress.events import MessageEvent, StatusEvent
 
@@ -59,7 +60,7 @@ Format your response as a valid JSON object with the following structure:
             temperature=ctx.valves.models.temperature,
         )
 
-        query_content = response["choices"][0]["message"]["content"]
+        query_content = response_text(response)
 
         # Extract JSON from response
         try:
@@ -139,7 +140,7 @@ async def generate_group_query(ctx: RunContext, topic_group, user_message):
             temperature=ctx.valves.models.temperature * 0.7,
         )
 
-        query = response["choices"][0]["message"]["content"].strip()
+        query = response_text(response).strip()
 
         # Clean up the query: remove quotes and ensure it's not too long
         query = query.replace('"', "").replace('"', "").replace('"', "")

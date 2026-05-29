@@ -120,7 +120,14 @@ class OWUIClient:
                     )
                 if not resp.content:
                     return None
-                return resp.json()
+                try:
+                    return resp.json()
+                except json.JSONDecodeError as e:
+                    raise OWUIClientError(
+                        f"{method} {path} -> 200 but body is not JSON: "
+                        f"{resp.text[:200]}",
+                        status=resp.status_code,
+                    ) from e
 
         return await with_retry(
             _do,

@@ -50,6 +50,9 @@ async def calculate_research_trajectory(
                     break
 
         if not sample_embedding:
+            # fallback only: no sample embedding was available, so the real
+            # dimension is unknown. add_cycle_data() no-ops on empty inputs,
+            # so this accumulator never actually receives 384-d data.
             traj_acc = TrajectoryAccumulator(384)
             _trajectory_accumulators[ctx.conversation_id] = traj_acc
 

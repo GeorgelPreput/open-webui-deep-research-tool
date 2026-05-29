@@ -4,6 +4,7 @@ from deep_research.core.text import (
     chunk_text,
     escape_html,
     materialize_embedding,
+    response_text,
     snapshot_embedding,
     stable_text_key,
 )
@@ -61,3 +62,25 @@ def test_snapshot_none_or_empty_returns_none():
 def test_escape_html_basic():
     assert "&lt;" in escape_html("<script>")
     assert "&amp;" in escape_html("a & b")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        {},
+        {"choices": []},
+        {"choices": [{}]},
+        {"choices": [{"message": {}}]},
+        {"choices": [{"message": {"content": None}}]},
+        "not a dict",
+        123,
+    ],
+)
+def test_response_text_returns_empty_on_malformed(response):
+    assert response_text(response) == ""
+
+
+def test_response_text_extracts_content():
+    response = {"choices": [{"message": {"content": "hello world"}}]}
+    assert response_text(response) == "hello world"

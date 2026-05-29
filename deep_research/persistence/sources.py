@@ -1,6 +1,7 @@
 import logging
 from typing import Any
 
+from deep_research.core.text import response_text
 from deep_research.core.types import RunContext
 from deep_research.persistence.chat_state import (
     checkpoint,
@@ -103,9 +104,7 @@ async def run_synthesis_time_kb_qa(
             stream=False,
             temperature=min(ctx.valves.models.temperature, 0.3),
         )
-        content = ""
-        if response and response.get("choices"):
-            content = response["choices"][0].get("message", {}).get("content") or ""
+        content = response_text(response)
         prompt_tokens, completion_tokens = extract_token_counts(response)
         record_token_usage(ctx, "synthesis_time_kb_qa", prompt_tokens, completion_tokens)
         await checkpoint(ctx)
@@ -182,9 +181,7 @@ async def answer_post_report_user_qa(ctx: RunContext, body: dict[str, Any]) -> s
             stream=False,
             temperature=ctx.valves.models.synthesis_temperature,
         )
-        content = ""
-        if response and response.get("choices"):
-            content = response["choices"][0].get("message", {}).get("content") or ""
+        content = response_text(response)
         prompt_tokens, completion_tokens = extract_token_counts(response)
         record_token_usage(ctx, "synthesis_time_kb_qa", prompt_tokens, completion_tokens)
         await checkpoint(ctx)

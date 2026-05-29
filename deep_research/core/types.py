@@ -71,3 +71,10 @@ class RunContext:
     mode: ResearchMode
     started_at: float
     trajectory_accumulator: Any = None
+    prompt: str = ""
+    history: list = field(default_factory=list)
+    # Per-call ephemeral dedupe sets for one-shot status emission during
+    # synthesis (ported from pipe.py's _seen_subtopics / _seen_sections
+    # ContextVars). Not persisted.
+    seen_subtopics: set = field(default_factory=set)
+    seen_sections: set = field(default_factory=set)

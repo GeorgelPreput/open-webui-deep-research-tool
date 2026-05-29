@@ -5,6 +5,7 @@ from typing import Any
 from loguru import logger
 from sklearn.metrics.pairwise import cosine_similarity
 
+from deep_research.core.text import response_text
 from deep_research.progress.events import StatusEvent
 from deep_research.semantics.dimensions import translate_dimensions_to_words
 from deep_research.semantics.embeddings import get_embedding
@@ -20,7 +21,7 @@ async def generate_synthesis_outline(
 ) -> list[dict[str, Any]]:
     """Generate a refined research outline for synthesis that better integrates additional research areas"""
 
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
 
     # Get the number of elapsed cycles
     elapsed_cycles = len(state.get("cycle_summaries", []))
@@ -63,7 +64,7 @@ The goal is to create a refined outline reflecting a logical narrative and infor
     )
 
     # Check if we have a cached outline embedding
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
     outline_embedding_key = f"outline_embedding_{hash(outline_text)}"
     outline_embedding = state.get(outline_embedding_key)
 
@@ -71,7 +72,7 @@ The goal is to create a refined outline reflecting a logical narrative and infor
         outline_embedding = await get_embedding(ctx, outline_text)
         if outline_embedding:
             # Cache the outline embedding
-            ctx.state[outline_embedding_key] = outline_embedding
+            state[outline_embedding_key] = outline_embedding
 
     # Initialize outline_context
     outline_context = ""
@@ -89,7 +90,7 @@ The goal is to create a refined outline reflecting a logical narrative and infor
                 content_embedding = await get_embedding(ctx, content[:2000])
                 if content_embedding:
                     # Cache the result embedding
-                    ctx.state[result_key] = content_embedding
+                    state[result_key] = content_embedding
 
             if content_embedding:
                 similarity = cosine_similarity(
@@ -116,7 +117,7 @@ The goal is to create a refined outline reflecting a logical narrative and infor
             outline_context += f"  - {subtopic}\n"
 
     # Add semantic dimensions if available
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
     research_dimensions = state.get("research_dimensions")
     if research_dimensions:
         try:
@@ -160,7 +161,7 @@ The goal is to create a refined outline reflecting a logical narrative and infor
         response = await ctx.client.chat_completions(
             synthesis_model, messages, temperature=ctx.valves.models.synthesis_temperature
         )
-        outline_content = response["choices"][0]["message"]["content"]
+        outline_content = response_text(response)
 
         # Extract JSON from response
         try:

@@ -260,3 +260,19 @@ async def clean_text_formatting(content: str) -> str:
 
 def escape_html(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
+
+
+def response_text(response: Any) -> str:
+    """Safely extract assistant content from an OWUI chat-completion response.
+
+    Returns "" for any malformed/None/empty response instead of raising, so a
+    single bad model reply never aborts the whole research run.
+    """
+    try:
+        choices = (response or {}).get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        return message.get("content") or ""
+    except (AttributeError, IndexError, TypeError):
+        return ""

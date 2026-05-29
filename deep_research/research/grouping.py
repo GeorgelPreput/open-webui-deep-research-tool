@@ -7,6 +7,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
+from deep_research.core.text import response_text
 from deep_research.core.types import RunContext
 from deep_research.progress.events import MessageEvent, StatusEvent
 from deep_research.semantics.eigendecomposition import create_semantic_transformation
@@ -152,7 +153,7 @@ Respond with ONLY the title (4-8 words).""",
             temperature=0.7,
         )
 
-        title = response["choices"][0]["message"]["content"].strip()
+        title = response_text(response).strip()
 
         # Remove quotes if present
         title = title.strip("\"'")
@@ -323,7 +324,7 @@ Please don't include any other text in your response but the replacement topics.
         )
 
         if response and "choices" in response and len(response["choices"]) > 0:
-            generated_text = response["choices"][0]["message"]["content"]
+            generated_text = response_text(response)
 
             # Parse the generated text to extract topics (numbered list format)
             lines = generated_text.split("\n")

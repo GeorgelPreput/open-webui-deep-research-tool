@@ -6,6 +6,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
 from deep_research.config.constants import RELEVANCY_SNIPPET_LENGTH
+from deep_research.core.text import response_text
 from deep_research.core.types import RunContext
 from deep_research.progress.events import MessageEvent, StatusEvent
 from deep_research.semantics.eigendecomposition import (
@@ -394,7 +395,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         )
 
         if response and "choices" in response and len(response["choices"]) > 0:
-            answer = response["choices"][0]["message"]["content"].strip().lower()
+            answer = response_text(response).strip().lower()
 
             # Parse the response to get yes/no
             is_relevant = "yes" in answer.lower() and "no" not in answer.lower()

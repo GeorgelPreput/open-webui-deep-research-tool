@@ -6,6 +6,7 @@ from loguru import logger
 from deep_research.budget.tokens import count_tokens
 from deep_research.budget.windows import get_task_context_budget
 from deep_research.config.constants import REVIEW_WINDOW_OVERLAP_RATIO
+from deep_research.core.text import response_text
 from deep_research.progress.events import StatusEvent
 
 
@@ -64,7 +65,7 @@ The find_text must be the EXACT text string as it appears in the document, and t
     review_context += "\n"
 
     review_context += "## Complete Report Content by Section:\n\n"
-    state = ctx.state
+    state = ctx.state.get_state(ctx.conversation_id)
     memory_stats = state.get("memory_stats", {})
     section_tokens_map = memory_stats.get("section_tokens", {})
 
@@ -74,7 +75,7 @@ The find_text must be the EXACT text string as it appears in the document, and t
             tokens = await count_tokens(ctx, content)
             section_tokens_map[section_title] = tokens
             memory_stats["section_tokens"] = section_tokens_map
-            ctx.state["memory_stats"] = memory_stats
+            state["memory_stats"] = memory_stats
 
         review_context += f"### {section_title} [{tokens} tokens]\n\n"
         review_context += f"{content}\n\n"
@@ -90,7 +91,7 @@ The find_text must be the EXACT text string as it appears in the document, and t
             synthesis_model, msgs, stream=False, temperature=review_temperature
         )
         if resp and "choices" in resp and len(resp["choices"]) > 0:
-            raw = resp["choices"][0]["message"]["content"]
+            raw = response_text(resp)
             try:
                 js = raw[raw.find("{") : raw.rfind("}") + 1]
                 return json.loads(js)

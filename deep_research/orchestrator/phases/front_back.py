@@ -2,6 +2,7 @@ import logging
 from typing import Any
 
 from deep_research.budget.tokens import count_tokens
+from deep_research.core.text import response_text
 from deep_research.core.types import RunContext
 from deep_research.progress.events import StatusEvent
 from deep_research.synthesis.front_back import generate_abstract, generate_titles
@@ -93,7 +94,7 @@ async def _generate_introduction(ctx, user_message, synthesis_outline, edited_se
             temperature=ctx.valves.models.synthesis_temperature * 0.83,
         )
         if response and response.get("choices"):
-            introduction = response["choices"][0]["message"]["content"]
+            introduction = response_text(response)
             return f"## Introduction\n\n{introduction}\n\n"
     except Exception as e:
         logger.error(f"Introduction generation failed: {e}")
@@ -123,7 +124,7 @@ async def _generate_conclusion(ctx, user_message, edited_sections, synthesis_mod
             temperature=ctx.valves.models.synthesis_temperature,
         )
         if response and response.get("choices"):
-            conclusion = response["choices"][0]["message"]["content"]
+            conclusion = response_text(response)
             return f"## Conclusion\n\n{conclusion}\n\n"
     except Exception as e:
         logger.error(f"Conclusion generation failed: {e}")

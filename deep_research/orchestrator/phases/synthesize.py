@@ -89,7 +89,7 @@ async def run_synthesize(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
             url = cit.get("url", "")
             raw = cit.get("raw_text", "")
             if url and url in global_citation_map and raw:
-                modified = modified.replace(raw, f"[{global_citation_map[url]}]")
+                modified = modified.replace(raw, f"[{global_citation_map[url]}]", 1)
         compiled_sections[section_title] = modified
 
     bibliography_table = await format_bibliography_list(ctx, bibliography_data.get("bibliography", []))
