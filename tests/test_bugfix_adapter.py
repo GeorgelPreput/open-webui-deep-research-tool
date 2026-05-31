@@ -15,12 +15,11 @@ import respx
 
 from deep_research.adapter.auth import StaticToken
 from deep_research.adapter.client import OWUIClient
+from deep_research.adapter.retry import with_retry
 from deep_research.core.errors import (
     _TRANSIENT_COMPLETION_CODES,
     classify_transient_completion_error,
 )
-from deep_research.adapter.retry import with_retry
-
 
 # --- BUG 25: classify_transient_completion_error -----------------------------
 
@@ -52,14 +51,14 @@ def test_httpx_connect_error_is_transient():
 
 
 def test_duck_typed_status_attribute():
-    class FakeErr(Exception):
+    class FakeError(Exception):
         status = 503
 
-    class FakeErr400(Exception):
+    class FakeStatus400Error(Exception):
         status = 400
 
-    assert classify_transient_completion_error(FakeErr()) == "http_status=503"
-    assert classify_transient_completion_error(FakeErr400()) is None
+    assert classify_transient_completion_error(FakeError()) == "http_status=503"
+    assert classify_transient_completion_error(FakeStatus400Error()) is None
 
 
 def test_fallback_phrase_matching():
@@ -69,11 +68,11 @@ def test_fallback_phrase_matching():
 
 # --- BUG 27 + general retry: with_retry -------------------------------------
 
-class _Transient(Exception):
+class _TransientError(Exception):
     status = 503
 
 
-class _Fatal(Exception):
+class _FatalError(Exception):
     status = 400
 
 
@@ -96,7 +95,7 @@ async def test_with_retry_retries_transient_then_succeeds():
     async def flaky():
         calls["n"] += 1
         if calls["n"] == 1:
-            raise _Transient()
+            raise _TransientError()
         return "ok"
 
     assert await with_retry(flaky, max_retries=3, base_delay=0) == "ok"
@@ -109,9 +108,9 @@ async def test_with_retry_non_transient_raises_immediately():
 
     async def fatal():
         calls["n"] += 1
-        raise _Fatal()
+        raise _FatalError()
 
-    with pytest.raises(_Fatal):
+    with pytest.raises(_FatalError):
         await with_retry(fatal, max_retries=3, base_delay=0)
     assert calls["n"] == 1
 
@@ -125,9 +124,9 @@ async def test_with_retry_negative_max_retries_raises_real_error_not_assertion()
 
     async def boom():
         calls["n"] += 1
-        raise _Transient()
+        raise _TransientError()
 
-    with pytest.raises(_Transient):
+    with pytest.raises(_TransientError):
         await with_retry(boom, max_retries=-1, base_delay=0)
     assert calls["n"] == 1
 
@@ -138,9 +137,9 @@ async def test_with_retry_exhausts_then_raises():
 
     async def boom():
         calls["n"] += 1
-        raise _Transient()
+        raise _TransientError()
 
-    with pytest.raises(_Transient):
+    with pytest.raises(_TransientError):
         await with_retry(boom, max_retries=2, base_delay=0)
     assert calls["n"] == 3  # initial + 2 retries
 

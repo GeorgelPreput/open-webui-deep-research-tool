@@ -39,12 +39,11 @@ async def run_cycles(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
     results_history = list(conv_state.get("results_history", [])) + initial_results
     cycle_summaries = list(conv_state.get("cycle_summaries", []))
     _seen: set[str] = set()
-    active_outline = [
-        t for t in all_topics
-        if t not in completed_topics
-        and t not in irrelevant_topics
-        and not (t in _seen or _seen.add(t))
-    ]
+    active_outline: list[str] = []
+    for _t in all_topics:
+        if _t not in completed_topics and _t not in irrelevant_topics and _t not in _seen:
+            _seen.add(_t)
+            active_outline.append(_t)
 
     await update_token_counts(ctx)
 

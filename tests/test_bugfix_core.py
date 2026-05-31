@@ -13,7 +13,6 @@ import pytest
 from deep_research.core.text import stable_text_key
 from deep_research.core.types import RunContext
 
-
 # --- BUG 37-40: stable_text_key ---------------------------------------------
 
 def test_stable_text_key_is_deterministic():

@@ -8,7 +8,6 @@ Covers:
 """
 import pytest
 
-
 # --- BUG 36: consistent return type -----------------------------------------
 
 @pytest.mark.asyncio

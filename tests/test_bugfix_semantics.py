@@ -13,7 +13,6 @@ import pytest
 from deep_research.core.state import TrajectoryAccumulator
 from deep_research.semantics import trajectory as traj_mod
 
-
 # --- BUG 8: TrajectoryAccumulator dimension safety --------------------------
 
 def test_accumulator_dimension_mismatch_raises_valueerror():

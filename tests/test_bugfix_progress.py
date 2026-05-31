@@ -13,7 +13,6 @@ import pytest
 from deep_research.progress.events import EventBus, MessageEvent, StatusEvent
 from deep_research.progress.snapshot import build_progress_snapshot
 
-
 # --- BUG 22: flush order ----------------------------------------------------
 
 @pytest.mark.asyncio
