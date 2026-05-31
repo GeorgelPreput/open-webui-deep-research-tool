@@ -63,6 +63,11 @@ async def run_synthesize(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
 
     conv_state["verification_results"] = {"verified": all_verified, "flagged": all_flagged}
 
+    # Sections populated the live state via their own get_state() handle;
+    # refresh our local copies so correlation + bibliography see all sources.
+    global_citation_map = dict(conv_state.get("global_citation_map", {}))
+    master_source_table = dict(conv_state.get("master_source_table", {}))
+
     additional_citations = []
     for section_title, content in list(compiled_sections.items()):
         section_cits = await identify_and_correlate_citations(ctx, section_title, content, master_source_table)

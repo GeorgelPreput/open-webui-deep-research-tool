@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
 from deep_research.config.constants import RELEVANCY_SNIPPET_LENGTH
-from deep_research.core.text import response_text
+from deep_research.core.text import response_text, stable_text_key
 from deep_research.core.types import RunContext
 from deep_research.progress.events import MessageEvent, StatusEvent
 from deep_research.semantics.eigendecomposition import (
@@ -568,49 +568,28 @@ async def rank_topics_by_research_priority(
     for topic, topic_embedding in topic_embeddings.items():
         component_scores = {}
 
-        # Factor 1: Alignment with trajectory (research direction)
+        # Factor 1: Alignment with trajectory (research direction).
+        # Not cached: research_trajectory/pdv/gap_vector change every cycle, and
+        # each topic is scored once per call, so caching by topic name only
+        # yields stale cross-cycle values with no intra-call benefit.
         if research_trajectory is not None and trajectory_weight > 0.0:
-            # Check cache first
-            cache_key = f"traj_{topic}"
-            if cache_key in topic_alignment_cache:
-                traj_alignment = topic_alignment_cache[cache_key]
-            else:
-                traj_alignment = np.dot(topic_embedding, research_trajectory)
-                # Normalize to 0-1 range
-                traj_alignment = (traj_alignment + 1) / 2
-                # Cache the result
-                topic_alignment_cache[cache_key] = traj_alignment
-
+            traj_alignment = np.dot(topic_embedding, research_trajectory)
+            # Normalize to 0-1 range
+            traj_alignment = (traj_alignment + 1) / 2
             component_scores["trajectory"] = traj_alignment * trajectory_weight
 
         # Factor 2: Alignment with user preference direction vector
         if pdv is not None and pdv_weight > 0.0:
-            # Check cache first
-            cache_key = f"pdv_{topic}"
-            if cache_key in topic_alignment_cache:
-                pdv_alignment = topic_alignment_cache[cache_key]
-            else:
-                pdv_alignment = np.dot(topic_embedding, pdv)
-                # Normalize to 0-1 range
-                pdv_alignment = (pdv_alignment + 1) / 2
-                # Cache the result
-                topic_alignment_cache[cache_key] = pdv_alignment
-
+            pdv_alignment = np.dot(topic_embedding, pdv)
+            # Normalize to 0-1 range
+            pdv_alignment = (pdv_alignment + 1) / 2
             component_scores["pdv"] = pdv_alignment * pdv_weight
 
         # Factor 3: Alignment with gap vector (unexplored areas)
         if gap_vector is not None and gap_weight > 0.0:
-            # Check cache first
-            cache_key = f"gap_{topic}"
-            if cache_key in topic_alignment_cache:
-                gap_alignment = topic_alignment_cache[cache_key]
-            else:
-                gap_alignment = np.dot(topic_embedding, gap_vector)
-                # Normalize to 0-1 range
-                gap_alignment = (gap_alignment + 1) / 2
-                # Cache the result
-                topic_alignment_cache[cache_key] = gap_alignment
-
+            gap_alignment = np.dot(topic_embedding, gap_vector)
+            # Normalize to 0-1 range
+            gap_alignment = (gap_alignment + 1) / 2
             component_scores["gap"] = gap_alignment * gap_weight
 
         # Factor 4: Topic novelty compared to completed research
@@ -651,7 +630,7 @@ async def rank_topics_by_research_priority(
 
             for result_id, result_embedding in result_embeddings.items():
                 # Create cache key using result ID
-                cache_key = f"res_{topic}_{hash(result_id) % 10000}"
+                cache_key = f"res_{topic}_{stable_text_key(result_id)}"
 
                 if cache_key in topic_alignment_cache:
                     rel = topic_alignment_cache[cache_key]

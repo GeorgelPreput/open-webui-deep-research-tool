@@ -38,7 +38,13 @@ async def run_cycles(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
     search_history = list(conv_state.get("search_history", []))
     results_history = list(conv_state.get("results_history", [])) + initial_results
     cycle_summaries = list(conv_state.get("cycle_summaries", []))
-    active_outline = list(set(all_topics) - completed_topics - irrelevant_topics)
+    _seen: set[str] = set()
+    active_outline = [
+        t for t in all_topics
+        if t not in completed_topics
+        and t not in irrelevant_topics
+        and not (t in _seen or _seen.add(t))
+    ]
 
     await update_token_counts(ctx)
 
@@ -107,7 +113,16 @@ async def run_cycles(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
             await ctx.events.emit(StatusEvent(description="All research topics addressed", level="info", done=False))
             break
 
-        coverage_ratio = len(completed_topics) / max(len(all_topics), 1)
+        top_level_topics = [
+            item.get("topic", "")
+            for item in ps.get("research_outline", [])
+            if item.get("topic")
+        ]
+        resolved = sum(
+            1 for t in top_level_topics
+            if t in completed_topics or t in irrelevant_topics
+        )
+        coverage_ratio = resolved / max(len(top_level_topics), 1)
         if cycle >= min_cycles and coverage_ratio > 0.7:
             await ctx.events.emit(StatusEvent(description="Most topics addressed. Finalizing...", level="info", done=False))
             break

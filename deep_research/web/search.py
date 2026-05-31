@@ -250,6 +250,7 @@ async def process_search_result(ctx: RunContext, result: dict[str, Any], query: 
             ctx, result, query_embedding, pdv
         )
 
+        source_registered = False
         if content_tokens > max_tokens:
             try:
                 await ctx.events.emit(StatusEvent(description="Truncating content to token limit...", level="info", done=False))
@@ -275,6 +276,7 @@ async def process_search_result(ctx: RunContext, result: dict[str, Any], query: 
                         url_token_counts=url_token_counts,
                         content_tokens=content_tokens,
                     )
+                    source_registered = True
 
                     if newly_registered:
                         # Truncation branch performs these only on first registration,
@@ -315,17 +317,20 @@ async def process_search_result(ctx: RunContext, result: dict[str, Any], query: 
                 logger.error(f"Error in token-based truncation: {e}")
                 # Fall through to non-truncation path with hard limit
 
-        title, _source_type, _newly = _register_source(
-            ctx,
-            url=url,
-            title=title,
-            query=query,
-            content_preview=snippet,
-            master_source_table=master_source_table,
-            url_selected_count=url_selected_count,
-            url_token_counts=url_token_counts,
-            content_tokens=content_tokens,
-        )
+        # Skip if the truncation branch already registered this URL (it may have
+        # fallen through here via its except handler), to avoid double-counting.
+        if not source_registered:
+            title, _source_type, _newly = _register_source(
+                ctx,
+                url=url,
+                title=title,
+                query=query,
+                content_preview=snippet,
+                master_source_table=master_source_table,
+                url_selected_count=url_selected_count,
+                url_token_counts=url_token_counts,
+                content_tokens=content_tokens,
+            )
 
         if isinstance(snippet, str) and snippet.strip():
             try:

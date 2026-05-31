@@ -430,15 +430,20 @@ the whole run (hangs forever). Keep them separate.
 
 ### Local smoke test (no live OWUI required)
 
-`scripts/smoke_test.py` drives `Coordinator.stream()` (the exact coroutine the
+`tests/test_smoke_e2e.py` drives `Coordinator.stream()` (the exact coroutine the
 OpenAPI `/research` endpoint uses) end-to-end through all 9 phases with every OWUI
 REST endpoint mocked via `respx`. It asserts: (a) the prompt reaches the outbound
 LLM call, (b) the KB is named from the prompt, (c) a same-conversation follow-up
 answers from the KB without a new search crawl, (d) a substantial report is
-produced. Run: `.venv/bin/python scripts/smoke_test.py`. This is the fast way to
-catch full-pipeline regressions that the unit tests (which don't cover the
-synthesis path end-to-end) miss — every bug in the four notes above was caught by
-it, not by `pytest`.
+produced, (e) no error-level events are emitted. It now runs **in-process** as
+part of the normal `pytest` suite (a module-scoped fixture runs the two-turn
+scenario once via `asyncio.run`; individual behaviors are separate test
+functions), so the synthesis/research/web paths it drives are counted under
+coverage. Run the whole suite with `.venv/bin/python -m pytest`, or just this
+module with `make smoke` (= `pytest tests/test_smoke_e2e.py -v`). This is the fast
+way to catch full-pipeline regressions that the narrower unit tests miss — every
+bug in the four notes above was caught by this end-to-end scenario, not by the
+narrower per-function tests.
 
 ## Useful pod-side commands
 

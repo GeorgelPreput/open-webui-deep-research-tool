@@ -1,25 +1,32 @@
-"""Local smoke test for the deep_research engine.
+"""End-to-end smoke test for the deep_research engine (pytest-integrated).
 
 No live OWUI is required: every OWUI REST endpoint is mocked with respx, and we
 drive the exact coroutine the OpenAPI `/research` endpoint uses
-(``Coordinator.stream``). This exercises all 9 phases end-to-end and asserts the
-three behaviors the README smoke test checks for:
+(``Coordinator.stream``). This exercises all 9 phases end-to-end in-process, so
+the synthesis / research / web / orchestrator modules are counted under
+coverage (unlike the old out-of-process script).
+
+The scenario is run once (module-scoped fixture) and individual behaviors are
+asserted by separate test functions:
 
   (a) the user's prompt actually reaches the outbound search/query LLM call
   (b) the research KB is named from the prompt (dr-<ts>-<slug>), not dr-<ts>-research
   (c) a same-conversation follow-up answers from the KB and does NOT start a new
       search crawl (post-report mode)
-
-Run: .venv/bin/python scripts/smoke_test.py
+  (d) turn 1 produces a substantial report (not just an outline footer)
+  (e) no error-level status events are emitted
 """
-
 import asyncio
 import hashlib
 import json
 import os
 
 import httpx
+import pytest
 import respx
+
+from deep_research.adapter.auth import StaticToken
+from deep_research.core.types import RunUser
 
 BASE = "http://mock-owui:8080"
 
@@ -27,6 +34,19 @@ BASE = "http://mock-owui:8080"
 PROMPT = "Explain the mambazz architecture in detail"
 
 LONG_TEXT = ("Mambazz is a state-space sequence model. " * 80).strip()
+
+# Short, hermetic run configuration applied for the duration of the scenario.
+SMOKE_ENV = {
+    "DR_CYCLES_MIN_CYCLES": "1",
+    "DR_CYCLES_MAX_CYCLES": "1",
+    "DR_WEB_SEARCH_RESULTS_PER_QUERY": "1",
+    "DR_WEB_SUCCESSFUL_RESULTS_PER_QUERY": "1",
+    "DR_WEB_QUALITY_FILTER_ENABLED": "false",
+    "DR_PERSISTENCE_INTERACTIVE_RESEARCH": "false",
+    "DR_PERSISTENCE_EXPORT_RESEARCH_DATA": "false",
+    "DR_EVENTS_ENABLE_PROGRESS_EMBED": "false",
+    "DR_EVENTS_FLUSH_INTERVAL_MS": "10",
+}
 
 # One combined JSON blob: each phase's parser extracts only the key it needs and
 # ignores the rest, so a single canned chat response satisfies every call site.
@@ -49,10 +69,9 @@ CHAT_JSON = json.dumps(
 )
 
 
-def install_mocks(router: respx.Router, state: dict) -> None:
+def _install_mocks(router: respx.Router, state: dict) -> None:
     def chat_handler(request: httpx.Request) -> httpx.Response:
-        body = request.content.decode("utf-8", "replace")
-        state["chat_bodies"].append(body)
+        state["chat_bodies"].append(request.content.decode("utf-8", "replace"))
         return httpx.Response(
             200,
             json={
@@ -81,7 +100,8 @@ def install_mocks(router: respx.Router, state: dict) -> None:
         name = payload.get("name", "")
         state["kb_names"].append(name)
         return httpx.Response(
-            200, json={"id": "kb-1", "name": name, "description": payload.get("description", "")}
+            200,
+            json={"id": "kb-1", "name": name, "description": payload.get("description", "")},
         )
 
     def embeddings_handler(request: httpx.Request) -> httpx.Response:
@@ -141,9 +161,10 @@ def install_mocks(router: respx.Router, state: dict) -> None:
         )
     )
     # vocabulary wordlist fetch (semantics/vocabulary.py) — keep it tiny & hermetic.
-    wordlist = "\n".join(
-        f"word{i}" for i in range(60)
-    ) + "\nstate\nspace\nmodel\nselective\narchitecture\ntransformer\n"
+    wordlist = (
+        "\n".join(f"word{i}" for i in range(60))
+        + "\nstate\nspace\nmodel\nselective\narchitecture\ntransformer\n"
+    )
     router.get("https://www.mit.edu/~ecprice/wordlist.10000").mock(
         return_value=httpx.Response(200, text=wordlist)
     )
@@ -155,13 +176,10 @@ def install_mocks(router: respx.Router, state: dict) -> None:
     )
 
 
-async def consume(coord, conversation_id, prompt, token):
-    from deep_research.adapter.auth import StaticToken
-    from deep_research.core.types import RunUser
-
+async def _consume(coord, conversation_id, prompt, token):
     last_message = ""
     events = 0
-    errors = []
+    errors: list[str] = []
     async for event in coord.stream(
         user=RunUser(id="smoke", name="Smoke"),
         conversation_id=conversation_id,
@@ -176,100 +194,84 @@ async def consume(coord, conversation_id, prompt, token):
             last_message = getattr(event, "content", "") or last_message
         elif name == "StatusEvent" and getattr(event, "level", "") == "error":
             errors.append(getattr(event, "description", ""))
-    for err in errors:
-        print(f"  [error event] {err}")
-    return last_message, events
+    return last_message, events, errors
 
 
-async def main() -> int:
-    # Keep the run short and non-interactive.
-    os.environ.update(
-        {
-            "DR_CYCLES_MIN_CYCLES": "1",
-            "DR_CYCLES_MAX_CYCLES": "1",
-            "DR_WEB_SEARCH_RESULTS_PER_QUERY": "1",
-            "DR_WEB_SUCCESSFUL_RESULTS_PER_QUERY": "1",
-            "DR_WEB_QUALITY_FILTER_ENABLED": "false",
-            "DR_PERSISTENCE_INTERACTIVE_RESEARCH": "false",
-            "DR_PERSISTENCE_EXPORT_RESEARCH_DATA": "false",
-            "DR_EVENTS_ENABLE_PROGRESS_EMBED": "false",
-            "DR_EVENTS_FLUSH_INTERVAL_MS": "10",
-        }
-    )
-
+async def _run_scenario(data_dir: str) -> dict:
     from deep_research import Coordinator
     from deep_research.config.env import load_valves_from_env
     from deep_research.orchestrator.coordinator import RuntimeConfig
 
     valves = load_valves_from_env(prefix="DR_")
-    config = RuntimeConfig(data_dir="/tmp/dr_smoke", base_url=BASE)
+    config = RuntimeConfig(data_dir=data_dir, base_url=BASE)
     coord = Coordinator(valves=valves, config=config)
     await coord.start()
 
     state = {"chat_bodies": [], "search_calls": 0, "kb_names": []}
-    results = {}
-
+    out: dict = {}
     try:
         with respx.mock(assert_all_called=False) as router:
-            install_mocks(router, state)
+            _install_mocks(router, state)
 
             # ---- Turn 1: fresh research ----
-            msg1, ev1 = await consume(coord, "smoke-conv", PROMPT, "sk-smoke")
-            results["turn1_message_len"] = len(msg1)
-            results["turn1_events"] = ev1
-            searches_after_turn1 = state["search_calls"]
+            msg1, ev1, err1 = await _consume(coord, "smoke-conv", PROMPT, "sk-smoke")
+            out["turn1_message_len"] = len(msg1)
+            out["turn1_events"] = ev1
+            out["searches_after_turn1"] = state["search_calls"]
 
             # ---- Turn 2: follow-up (same conversation) ----
-            msg2, ev2 = await consume(
+            msg2, ev2, err2 = await _consume(
                 coord, "smoke-conv", "What about its selectivity mechanism?", "sk-smoke"
             )
-            results["turn2_message_len"] = len(msg2)
-            searches_after_turn2 = state["search_calls"]
+            out["turn2_message_len"] = len(msg2)
+            out["searches_after_turn2"] = state["search_calls"]
     finally:
         await coord.close()
 
-    # ---- Assertions ----
-    checks = []
-
-    # (a) prompt reached an outbound LLM call
-    prompt_in_request = any("mambazz" in b for b in state["chat_bodies"])
-    checks.append(("(a) prompt reaches outbound LLM call", prompt_in_request))
-
-    # (b) KB named from the prompt slug
-    kb_named_from_prompt = any("mambazz" in name for name in state["kb_names"])
-    checks.append(
-        (f"(b) KB named from prompt (names={state['kb_names']})", kb_named_from_prompt)
-    )
-
-    # (c) follow-up did not start a new search crawl
-    no_new_search = searches_after_turn2 == searches_after_turn1
-    checks.append(
-        (
-            f"(c) follow-up runs no new search "
-            f"(turn1={searches_after_turn1}, turn2={searches_after_turn2})",
-            no_new_search,
-        )
-    )
-
-    # sanity: turn 1 actually produced a substantial report (not just an
-    # outline footer). A bare > 0 check false-passes on the ~32-char footer.
-    checks.append(
-        (
-            f"substantial report produced in turn 1 (chars={results['turn1_message_len']})",
-            results["turn1_message_len"] > 500,
-        )
-    )
-
-    print("\n=== Deep Research smoke test ===")
-    print(f"turn1 events={results['turn1_events']} report_chars={results['turn1_message_len']}")
-    print(f"chat calls={len(state['chat_bodies'])} search calls total={state['search_calls']}")
-    all_ok = True
-    for label, ok in checks:
-        print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
-        all_ok = all_ok and ok
-    print("=== {} ===".format("ALL PASS" if all_ok else "FAILURES PRESENT"))
-    return 0 if all_ok else 1
+    out["chat_bodies"] = state["chat_bodies"]
+    out["kb_names"] = state["kb_names"]
+    out["errors"] = err1 + err2
+    return out
 
 
-if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+@pytest.fixture(scope="module")
+def smoke_run(tmp_path_factory) -> dict:
+    """Run the two-turn research scenario once for the whole module.
+
+    Uses a sync fixture + asyncio.run so the coordinator's httpx client and
+    semaphores live entirely inside one short-lived event loop, independent of
+    the per-test loop pytest-asyncio manages.
+    """
+    data_dir = str(tmp_path_factory.mktemp("dr_smoke"))
+    saved = {k: os.environ.get(k) for k in SMOKE_ENV}
+    os.environ.update(SMOKE_ENV)
+    try:
+        return asyncio.run(_run_scenario(data_dir))
+    finally:
+        for key, prev in saved.items():
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+
+def test_prompt_reaches_outbound_llm(smoke_run):
+    assert any("mambazz" in body for body in smoke_run["chat_bodies"])
+
+
+def test_kb_named_from_prompt(smoke_run):
+    assert any("mambazz" in name for name in smoke_run["kb_names"]), smoke_run["kb_names"]
+
+
+def test_followup_starts_no_new_search(smoke_run):
+    # Post-report mode: a same-conversation follow-up answers from the KB.
+    assert smoke_run["searches_after_turn2"] == smoke_run["searches_after_turn1"]
+
+
+def test_turn1_produces_substantial_report(smoke_run):
+    # A bare > 0 check false-passes on the ~32-char outline footer.
+    assert smoke_run["turn1_message_len"] > 500
+
+
+def test_no_error_events(smoke_run):
+    assert smoke_run["errors"] == []

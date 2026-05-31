@@ -46,10 +46,12 @@ async def compress_content_with_eigendecomposition(
         return content
 
     chunk_embeddings = []
+    kept_chunks = []
     for chunk in chunks:
         embedding = await get_embedding(ctx, chunk)
         if embedding:
             chunk_embeddings.append(embedding)
+            kept_chunks.append(chunk)
 
     if len(chunk_embeddings) <= 2:
         return content
@@ -70,7 +72,9 @@ async def compress_content_with_eigendecomposition(
         level = ctx.valves.compression.compression_level
         ratio = compress_ratios.get(level, 0.5)
 
-    n_chunks = len(chunks)
+    # Index everything by kept_chunks (aligned with chunk_embeddings); chunks that
+    # failed to embed are excluded so scoring indices map back to the right text.
+    n_chunks = len(kept_chunks)
     n_keep = max(1, min(n_chunks - 1, int(n_chunks * ratio)))
 
     if n_keep >= n_chunks:
@@ -78,7 +82,7 @@ async def compress_content_with_eigendecomposition(
 
     try:
         eigendecomposition = await compute_semantic_eigendecomposition(
-            ctx, chunks, chunk_embeddings
+            ctx, kept_chunks, chunk_embeddings
         )
 
         if eigendecomposition:
@@ -166,7 +170,7 @@ async def compress_content_with_eigendecomposition(
             else:
                 query_relevance = [0.5] * len(projected_chunks)
 
-            for i in range(len(chunks)):
+            for i in range(len(kept_chunks)):
                 if i >= len(local_coherence) or i >= len(query_relevance):
                     continue
 
@@ -213,7 +217,7 @@ async def compress_content_with_eigendecomposition(
             selected_indices.sort()
 
             selected_chunks = [
-                chunks[i] for i in selected_indices if i < len(chunks)
+                kept_chunks[i] for i in selected_indices if i < len(kept_chunks)
             ]
 
             chunk_level = ctx.valves.compression.chunk_level

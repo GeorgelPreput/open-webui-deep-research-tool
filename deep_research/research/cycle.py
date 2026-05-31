@@ -220,9 +220,15 @@ async def process_query(
                     result_text += f"*Search query: {query}*\n\n"
 
                     # Format content with short line merging
-                    content_to_display = processed_result["content"][
-                        : ctx.valves.web.max_result_tokens
-                    ]
+                    _full_content = processed_result["content"]
+                    _max_tokens = ctx.valves.web.max_result_tokens
+                    _content_tokens = await count_tokens(ctx, _full_content)
+                    if _content_tokens > _max_tokens:
+                        _char_ratio = _max_tokens / max(_content_tokens, 1)
+                        _char_limit = int(len(_full_content) * _char_ratio)
+                        content_to_display = _full_content[:_char_limit]
+                    else:
+                        content_to_display = _full_content
                     formatted_content = await clean_text_formatting(
                         content_to_display
                     )

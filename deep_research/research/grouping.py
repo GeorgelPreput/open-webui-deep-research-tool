@@ -92,13 +92,17 @@ async def group_replacement_topics(ctx: RunContext, replacement_topics):
                 # Re-sort
                 groups_list.sort(key=len)
 
-            # Split any very large groups (more than 5 topics)
-            for i, group in enumerate(groups_list):
-                if len(group) > 5:
-                    # Simple split at midpoint
+            # Split any group larger than 5, re-examining halves until none exceed 5.
+            i = 0
+            while i < len(groups_list):
+                if len(groups_list[i]) > 5:
+                    group = groups_list[i]
                     midpoint = len(group) // 2
                     groups_list[i] = group[:midpoint]  # First half
                     groups_list.append(group[midpoint:])  # Second half
+                    # do NOT advance i: the shrunk first half may still be > 5
+                else:
+                    i += 1
 
         return groups_list
 

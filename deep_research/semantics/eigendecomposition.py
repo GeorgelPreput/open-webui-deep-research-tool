@@ -3,6 +3,7 @@ import logging
 import numpy as np
 
 from deep_research.config.constants import SEMANTIC_TRANSFORMATION_STRENGTH
+from deep_research.core.text import stable_text_key
 from deep_research.core.types import RunContext
 
 logger = logging.getLogger("deep_research.semantics.eigendecomposition")
@@ -19,7 +20,7 @@ async def compute_semantic_eigendecomposition(
             embeddings[: min(5, len(embeddings))], axis=0
         )
         fingerprint = np.mean(embeddings_concat, axis=0)
-        cache_key = hash(str(fingerprint.round(2)))
+        cache_key = stable_text_key(str(fingerprint.round(2)))
 
     conv_state = ctx.state.get_state(ctx.conversation_id)
     eigendecomposition_cache = conv_state.get("eigendecomposition_cache", {})
@@ -91,9 +92,9 @@ async def create_semantic_transformation(
 
     conv_state = ctx.state.get_state(ctx.conversation_id)
     transformation_id = (
-        f"transform_{str(hash(str(pdv)))[:8]}_"
-        f"{str(hash(str(trajectory)))[:8]}_"
-        f"{str(hash(str(gap_vector)))[:8]}"
+        f"transform_{stable_text_key(str(pdv))[:8]}_"
+        f"{stable_text_key(str(trajectory))[:8]}_"
+        f"{stable_text_key(str(gap_vector))[:8]}"
     )
 
     try:
@@ -103,7 +104,11 @@ async def create_semantic_transformation(
         embedding_dim = eigenvectors.shape[0]
         transformation = np.eye(embedding_dim)
 
-        variance_importance = eigenvalues / np.sum(eigenvalues)
+        eigenvalues = np.clip(eigenvalues, 0.0, None)
+        ev_sum = float(np.sum(eigenvalues))
+        if ev_sum <= 1e-12:
+            return None
+        variance_importance = eigenvalues / ev_sum
 
         for i, importance in enumerate(variance_importance):
             eigenvector = eigenvectors[:, i]

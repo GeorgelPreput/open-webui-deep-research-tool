@@ -179,23 +179,31 @@ class OWUIClient:
 
         attempt = 0
         last_exc: Exception | None = None
+        yielded_any = False
         while attempt <= self._max_retries:
             try:
                 async for chunk in _stream():
+                    yielded_any = True
                     yield chunk
                 return
             except OWUIClientError as e:
-                if e.status in {429, 502, 503, 504} and attempt < self._max_retries:
+                # Once any chunk has reached the caller, retrying would re-yield
+                # from the start and duplicate already-emitted content.
+                if (
+                    not yielded_any
+                    and e.status in {429, 502, 503, 504}
+                    and attempt < self._max_retries
+                ):
                     last_exc = e
+                    await asyncio.sleep(min(1.5 * (2**attempt), 30.0))
                     attempt += 1
-                    await asyncio.sleep(1.5 * (2**attempt))
                     continue
                 raise
             except httpx.HTTPError as e:
-                if attempt < self._max_retries:
+                if not yielded_any and attempt < self._max_retries:
                     last_exc = e
+                    await asyncio.sleep(min(1.5 * (2**attempt), 30.0))
                     attempt += 1
-                    await asyncio.sleep(1.5 * (2**attempt))
                     continue
                 raise OWUIClientError(f"stream failed: {e}") from e
         if last_exc:
@@ -304,20 +312,6 @@ class OWUIClient:
         )
         return ProcessFileResponse.model_validate(data)
 
-    async def process_text(
-        self, name: str, content: str, collection_name: str | None = None
-    ) -> ProcessFileResponse:
-        body = {"name": name, "content": content}
-        if collection_name is not None:
-            body["collection_name"] = collection_name
-        data = await self._request(
-            "POST",
-            "/api/v1/retrieval/process/text",
-            json_body=body,
-            semaphore=self._fetch_sem,
-        )
-        return ProcessFileResponse.model_validate(data)
-
     # ---- Files ----
 
     async def upload_file(
@@ -350,24 +344,6 @@ class OWUIClient:
     async def get_file(self, file_id: str) -> FileUploadResponse:
         data = await self._request("GET", f"/api/v1/files/{file_id}")
         return FileUploadResponse.model_validate(data)
-
-    async def get_file_content(self, file_id: str) -> bytes:
-        url = f"{self._base_url}/api/v1/files/{file_id}"
-        token = await self._token_provider.get_token()
-        resp = await self.client.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if resp.status_code >= 400:
-            raise OWUIClientError(
-                f"GET /api/v1/files/{file_id} -> {resp.status_code}",
-                status=resp.status_code,
-            )
-        data = resp.json()
-        content_b64 = data.get("data", {}).get("content", "")
-        if isinstance(content_b64, str):
-            return content_b64.encode("utf-8")
-        return content_b64
 
     # ---- KB ----
 

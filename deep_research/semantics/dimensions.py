@@ -4,6 +4,7 @@ from typing import Any
 import numpy as np
 from sklearn.decomposition import PCA
 
+from deep_research.core.text import stable_text_key
 from deep_research.core.types import RunContext
 from deep_research.semantics.embeddings import get_embedding
 from deep_research.semantics.vocabulary import load_vocabulary_embeddings
@@ -92,7 +93,7 @@ async def update_dimension_coverage(
         for i in range(min(len(contribution), len(coverage_array))):
             current_value = coverage_array[i]
             new_contribution = contribution[i] * (1 - current_value / 2)
-            coverage_array[i] += new_contribution
+            coverage_array[i] = min(1.0, current_value + new_contribution)
 
         research_dimensions["coverage"] = coverage_array.tolist()
 
@@ -141,8 +142,8 @@ async def translate_dimensions_to_words(
     conv_state = ctx.state.get_state(ctx.conversation_id)
     dimensions_cache = conv_state.get("dimensions_translation_cache", {})
 
-    dim_hash = hash(str(dimensions.get("eigenvectors", [])[:3]))
-    coverage_hash = hash(str(coverage))
+    dim_hash = stable_text_key(str(dimensions.get("eigenvectors", [])[:3]))
+    coverage_hash = stable_text_key(str(coverage))
     cache_key = f"dim_{dim_hash}_{coverage_hash}"
 
     if cache_key in dimensions_cache:

@@ -169,6 +169,12 @@ Don't allow your own biases or preferences to have any affect on your answer - p
             if not isinstance(remove_indices, list):
                 remove_indices = []
 
+            # An index claimed by both lists is ambiguous; keep wins (do not
+            # remove an item the model also asked to keep).
+            conflicting = set(keep_indices) & set(remove_indices)
+            if conflicting:
+                remove_indices = [i for i in remove_indices if i not in conflicting]
+
             # Ensure each index is in either keep or remove
             all_indices = set(range(len(flat_items)))
             missing_indices = all_indices - set(keep_indices) - set(remove_indices)

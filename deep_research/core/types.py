@@ -71,6 +71,7 @@ class RunContext:
     mode: ResearchMode
     started_at: float
     trajectory_accumulator: Any = None
+    research_date: str = ""
     prompt: str = ""
     history: list = field(default_factory=list)
     # Per-call ephemeral dedupe sets for one-shot status emission during

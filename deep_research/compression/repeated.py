@@ -74,6 +74,11 @@ async def handle_repeated_content(
             f"Repeat URL {url} (count: {selected_count}): applying compression/centering for content already within token limit"
         )
 
+        # Re-centering is purely relevance-driven; with no query vector there is
+        # nothing to center on, so return the content unchanged.
+        if query_embedding is None:
+            return content
+
         content_embedding = await get_embedding(ctx, content[:2000])
         if not content_embedding:
             return content

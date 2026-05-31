@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from deep_research.core.text import stable_text_key
 from deep_research.core.types import RunContext
 
 logger = logging.getLogger("deep_research.web.paywall")
@@ -161,7 +162,7 @@ async def fetch_pdf_via_legacy_download(ctx: RunContext, url: str) -> str:
         search_terms = [term for term in search_terms if len(term.strip()) > 3]
 
         # Choose a referrer and term - use hash of domain for consistency while still appearing varied
-        domain_hash = hash(domain)
+        domain_hash = int(stable_text_key(domain)[:8], 16)
         chosen_referrer = referrers[domain_hash % len(referrers)]
         search_term = search_terms[0] if search_terms else domain
         if len(search_terms) > 1:
@@ -183,7 +184,7 @@ async def fetch_pdf_via_legacy_download(ctx: RunContext, url: str) -> str:
         cookie_dict = domain_session_map[domain].get("cookies", {})
 
         async with httpx.AsyncClient(
-            verify=False,
+            verify=ctx.valves.advanced.pdf_legacy_tls_verify,
             cookies=cookie_dict,
             timeout=httpx.Timeout(20.0),
             follow_redirects=True,

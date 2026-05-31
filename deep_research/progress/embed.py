@@ -1,4 +1,5 @@
 import hashlib
+import json
 from typing import Any
 
 from deep_research.core.text import escape_html
@@ -112,7 +113,13 @@ async def refresh_progress_embed(
         return
     snapshot = build_progress_snapshot(ctx, cycle=cycle)
     html_content = render_progress_embed_html(snapshot)
-    digest = hashlib.sha256(html_content.encode("utf-8")).hexdigest()
+    # Dedup on the meaningful content only: updated_at (a fresh timestamp) and
+    # revision (incremented every call) would otherwise change the hash every
+    # time and defeat the de-duplication entirely.
+    stable = {k: v for k, v in snapshot.items() if k not in ("updated_at", "revision")}
+    digest = hashlib.sha256(
+        json.dumps(stable, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
     state = ctx.state.get_state(ctx.conversation_id)
     if not force and state.get("progress_embed_last_hash") == digest:
         return

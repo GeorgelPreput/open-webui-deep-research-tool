@@ -12,7 +12,7 @@ _TRANSIENT_HTTPX_TYPES: tuple[type[BaseException], ...] = (
     httpx.NetworkError,
 )
 
-_TRANSIENT_COMPLETION_CODES = frozenset({429, 502, 504})
+_TRANSIENT_COMPLETION_CODES = frozenset({429, 500, 502, 503, 504})
 _OWUI_TRANSIENT_DETAIL = "open webui: server connection error"
 _TRANSIENT_FALLBACK_PHRASES = (
     "server disconnected",
@@ -25,7 +25,7 @@ _TRANSIENT_FALLBACK_PHRASES = (
 def classify_transient_completion_error(e: BaseException) -> str | None:
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
-        if status in _TRANSIENT_COMPLETION_CODES or status in {500, 503}:
+        if status in _TRANSIENT_COMPLETION_CODES:
             return f"http_status={status}"
         return None
     if isinstance(e, _TRANSIENT_HTTPX_TYPES):
@@ -33,9 +33,7 @@ def classify_transient_completion_error(e: BaseException) -> str | None:
     # Duck-typed: any exception carrying a `status` attribute (e.g. the
     # OWUIClient adapter's OWUIClientError) is inspected for a transient code.
     duck_status = getattr(e, "status", None)
-    if isinstance(duck_status, int) and (
-        duck_status in _TRANSIENT_COMPLETION_CODES or duck_status in {500, 503}
-    ):
+    if isinstance(duck_status, int) and duck_status in _TRANSIENT_COMPLETION_CODES:
         return f"http_status={duck_status}"
     err_str = str(e).lower()
     for phrase in _TRANSIENT_FALLBACK_PHRASES:

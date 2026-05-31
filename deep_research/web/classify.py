@@ -1,4 +1,5 @@
 import logging
+import time
 from urllib.parse import urlparse
 
 from deep_research.config.constants import MIN_EXTRACTION_LENGTH, REQUIRE_EXTRACTION_QUALITY
@@ -6,7 +7,11 @@ from deep_research.core.types import RunContext
 
 logger = logging.getLogger("deep_research.web.classify")
 
-_owui_ext_cap: dict[str, bool | None] = {"web": None, "doc": None}
+# (base_url, token) -> (verdict, monotonic_expiry). A short TTL so a transient
+# failure expires instead of latching off for the process lifetime, and distinct
+# OWUI instances / tokens get independent verdicts.
+_owui_ext_cap: dict[tuple[str, str], tuple[bool, float]] = {}
+_OWUI_EXT_CAP_TTL_SECONDS = 300.0
 
 
 def classify_url(ctx: RunContext, url: str) -> str:
@@ -56,14 +61,24 @@ def check_extraction_quality(ctx: RunContext, text: str) -> bool:
 async def owui_extraction_available(ctx: RunContext, kind: str) -> bool:
     """Check whether OWUI extraction endpoints are reachable.
 
-    Both kinds share the same liveness signal (ctx.client connectivity).
-    Cached per process: a single list_models() ping is enough to tell us
-    the OWUI URL is reachable and the token is valid; if it is, both
-    process_web and process_file/upload_file will be available too.
+    Both kinds share the same liveness signal (ctx.client connectivity), so
+    ``kind`` is accepted for call-site compatibility but does not key the cache.
+    Cached briefly per (base_url, token): a single list_models() ping tells us
+    the OWUI URL is reachable and the token is valid; if it is, both process_web
+    and process_file/upload_file will be available too. The TTL means a transient
+    failure re-probes instead of latching off, and distinct instances/tokens get
+    independent verdicts.
     """
-    cached = _owui_ext_cap.get(kind)
-    if cached is not None:
-        return cached
+    base_url = getattr(ctx.client, "_base_url", "")
+    try:
+        token = await ctx.client._token_provider.get_token()
+    except Exception:
+        token = ""
+    cache_key = (base_url, token)
+
+    cached = _owui_ext_cap.get(cache_key)
+    if cached is not None and cached[1] > time.monotonic():
+        return cached[0]
 
     available = False
     try:
@@ -72,10 +87,9 @@ async def owui_extraction_available(ctx: RunContext, kind: str) -> bool:
     except Exception as e:
         logger.info(
             f"OWUI extraction unavailable ({type(e).__name__}: {e}); "
-            f"primary-path extraction disabled"
+            f"primary-path extraction disabled (will re-probe after TTL)"
         )
         available = False
 
-    _owui_ext_cap["web"] = available
-    _owui_ext_cap["doc"] = available
+    _owui_ext_cap[cache_key] = (available, time.monotonic() + _OWUI_EXT_CAP_TTL_SECONDS)
     return available

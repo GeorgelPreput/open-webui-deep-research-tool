@@ -78,7 +78,11 @@ async def extract_token_window(
         start_char = int(start_token * chars_per_token)
         window_chars = int(window_size * chars_per_token)
 
-        start_char = max(0, min(start_char, len(content) - 1))
+        if start_char >= len(content):
+            # Requested start is past the end: fall back to the final window.
+            start_char = max(0, len(content) - window_chars)
+        else:
+            start_char = max(0, start_char)
         end_char = min(len(content), start_char + window_chars)
 
         window_content = content[start_char:end_char]

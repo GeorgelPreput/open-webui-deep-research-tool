@@ -4,6 +4,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -185,6 +186,7 @@ class Coordinator:
             executor=self._executor,
             mode=ResearchMode.FRESH,
             started_at=time.time(),
+            research_date=datetime.now().strftime("%Y-%m-%d"),
             prompt=prompt,
             history=history,
         )

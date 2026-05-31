@@ -11,3 +11,14 @@ repos:
       - id: mypy
         args: [--strict]
         additional_dependencies: [pydantic>=2.0, httpx>=0.27]
+  - repo: https://github.com/pypa/pip-audit
+    rev: v2.10.0
+    hooks:
+      - id: pip-audit
+        # Audit the project's pyproject.toml dependency tree.
+        args: ["."]
+
+ci:
+  # Leave pip-audit to only run locally and not in CI;
+  # pre-commit.ci does not allow the network calls it needs.
+  skip: [pip-audit]

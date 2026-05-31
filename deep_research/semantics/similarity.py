@@ -3,6 +3,7 @@ from typing import Any
 
 import numpy as np
 
+from deep_research.core.text import stable_text_key
 from deep_research.core.types import RunContext
 from deep_research.semantics.embeddings import get_embedding
 
@@ -47,15 +48,15 @@ async def calculate_query_similarity(
     conv_state = ctx.state.get_state(ctx.conversation_id)
     similarity_cache = conv_state.get("similarity_cache", {})
 
-    content_key = hash(str(np.array(content_embedding).round(2)))
-    query_key = hash(str(np.array(query_embedding).round(2)))
+    content_key = stable_text_key(str(np.array(content_embedding).round(2)))
+    query_key = stable_text_key(str(np.array(query_embedding).round(2)))
 
     combined_key = f"combined_{content_key}_{query_key}"
     if outline_embedding:
-        outline_key = hash(str(np.array(outline_embedding).round(2)))
+        outline_key = stable_text_key(str(np.array(outline_embedding).round(2)))
         combined_key += f"_{outline_key}"
     if summary_embedding:
-        summary_key = hash(str(np.array(summary_embedding).round(2)))
+        summary_key = stable_text_key(str(np.array(summary_embedding).round(2)))
         combined_key += f"_{summary_key}"
 
     if combined_key in similarity_cache:
@@ -80,7 +81,7 @@ async def calculate_query_similarity(
 
     outline_sim = 0.0
     if outline_embedding is not None:
-        outline_key = hash(str(np.array(outline_embedding).round(2)))
+        outline_key = stable_text_key(str(np.array(outline_embedding).round(2)))
         outline_cache_key = f"{content_key}_{outline_key}"
 
         if outline_cache_key in similarity_cache:
@@ -95,7 +96,7 @@ async def calculate_query_similarity(
 
     summary_sim = 0.0
     if summary_embedding is not None:
-        summary_key = hash(str(np.array(summary_embedding).round(2)))
+        summary_key = stable_text_key(str(np.array(summary_embedding).round(2)))
         summary_cache_key = f"{content_key}_{summary_key}"
 
         if summary_cache_key in similarity_cache:

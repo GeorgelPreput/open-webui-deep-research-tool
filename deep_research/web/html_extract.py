@@ -126,7 +126,7 @@ async def extract_text_from_html(ctx: RunContext, html_content: str) -> str:
 
             # Run in executor to avoid blocking
             loop = asyncio.get_running_loop()
-            bs4_extraction_task = loop.run_in_executor(None, extract_with_bs4)
+            bs4_extraction_task = loop.run_in_executor(ctx.executor, extract_with_bs4)
             bs4_result = await asyncio.wait_for(bs4_extraction_task, timeout=5.0)
 
             # If BS4 extraction gave substantial content, use it

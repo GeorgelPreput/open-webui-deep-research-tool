@@ -86,13 +86,6 @@ def _extract_bearer(request: Any) -> str:
     return ""
 
 
-def _resolve_conversation_id(body: dict, request: Any) -> str:
-    chat_id = body.get("metadata", {}).get("chat_id", "")
-    if chat_id:
-        return str(chat_id)
-    return ""
-
-
 async def _translate_event(event: Event, emitter: Any) -> None:
     if isinstance(event, StatusEvent):
         await emitter({

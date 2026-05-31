@@ -1,8 +1,10 @@
-import contextlib
+import logging
 import os
 from typing import Any
 
 from deep_research.config.valves import Valves
+
+logger = logging.getLogger("deep_research.config.env")
 
 
 def load_valves_from_env(prefix: str = "DR_") -> Valves:
@@ -22,8 +24,13 @@ def load_valves_from_env(prefix: str = "DR_") -> Valves:
         if field not in VALVES_GROUP_MAP[group]:
             continue
         target_type = VALVES_GROUP_MAP[group][field]
-        with contextlib.suppress(ValueError, TypeError):
+        try:
             env_data.setdefault(group, {})[field] = _coerce(raw, target_type)
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                f"Ignoring env var {key}={raw!r}: cannot coerce to "
+                f"{target_type.__name__} ({e}); using default"
+            )
 
     raw_valves = {}
     for group, fields in env_data.items():
@@ -49,6 +56,7 @@ VALVES_GROUP_MAP: dict[str, dict[str, type]] = {
         "research_model": str,
         "synthesis_model": str,
         "quality_filter_model": str,
+        "embedding_model": str,
         "research_context_window": int,
         "synthesis_context_window": int,
         "temperature": float,
@@ -96,5 +104,6 @@ VALVES_GROUP_MAP: dict[str, dict[str, type]] = {
         "executor_workers": int,
         "http_timeout_seconds": int,
         "http_max_retries": int,
+        "pdf_legacy_tls_verify": bool,
     },
 }

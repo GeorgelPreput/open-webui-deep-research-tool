@@ -93,15 +93,15 @@ class EventBus:
 
             now = time.monotonic()
             if now - last_flush >= self._flush_interval and (last_status is not None or pending or last_embed is not None):
-                if last_status is not None:
-                    await self._sink(last_status)
-                    last_status = None
                 for ev in pending:
                     await self._sink(ev)
                 pending.clear()
                 if last_embed is not None:
                     await self._sink(last_embed)
                     last_embed = None
+                if last_status is not None:
+                    await self._sink(last_status)
+                    last_status = None
                 last_flush = now
 
             self._wake_event.clear()
@@ -109,9 +109,9 @@ class EventBus:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._wake_event.wait(), timeout=wait)
 
-        if last_status is not None:
-            await self._sink(last_status)
         for ev in pending:
             await self._sink(ev)
         if last_embed is not None:
             await self._sink(last_embed)
+        if last_status is not None:
+            await self._sink(last_status)

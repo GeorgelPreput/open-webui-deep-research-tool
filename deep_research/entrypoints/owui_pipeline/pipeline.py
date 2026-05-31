@@ -56,8 +56,6 @@ class Pipeline:
     def __init__(self) -> None:
         self.valves = self.Valves()
         self.type = "manifold"
-        self._coord: Coordinator | None = None
-        self._coord_lock = threading.Lock()
 
     def pipelines(self) -> list[dict]:
         return [{"id": "deep_research", "name": "Deep Research"}]
@@ -66,24 +64,10 @@ class Pipeline:
         pass
 
     async def on_shutdown(self) -> None:
-        if self._coord is not None:
-            await self._coord.close()
-
-    def _ensure_coordinator(self) -> Coordinator:
-        if self._coord is None:
-            with self._coord_lock:
-                if self._coord is None:
-                    config = RuntimeConfig(
-                        data_dir=os.environ.get("DR_DATA_DIR", "/tmp/deep_research"),
-                        base_url=os.environ.get(
-                            "DR_OWUI_BASE_URL", self.valves.OWUI_BASE_URL
-                        ),
-                    )
-                    self._coord = Coordinator(valves=self.valves, config=config)
-                    loop = asyncio.new_event_loop()
-                    loop.run_until_complete(self._coord.start())
-                    loop.close()
-        return self._coord
+        # The Coordinator is built and torn down per call inside the worker
+        # loop (its httpx client/semaphores are loop-bound), so there is no
+        # long-lived coordinator to close here.
+        pass
 
     def pipe(self, user_message: str, model_id: str, messages: list, body: dict) -> Iterator[str]:
         sink = _BridgeSink()
@@ -108,46 +92,61 @@ class Pipeline:
     async def _async_run(
         self, sink: _BridgeSink, user_message: str, messages: list, body: dict
     ) -> None:
-        coord = self._ensure_coordinator()
-        token = StaticToken(self.valves.OWUI_API_KEY)
-        user = RunUser(id="pipeline_user", name="Pipeline User")
-
-        chat_id = body.get("chat_id") if isinstance(body, dict) else None
-        conversation_id = str(chat_id or "pipeline_conv")
-
-        history = [
-            ChatMessage(role=m.get("role", "user"), content=m.get("content", ""))
-            for m in (messages or [])[:-1]
-        ]
-
         reasoning = _ReasoningBlock(summary="Deep Research")
+        try:
+            # Build + start the Coordinator on THIS (per-call worker) loop: its
+            # httpx client and semaphores are bound to the loop they're created
+            # on, so a shared/long-lived coordinator from another loop is unusable.
+            config = RuntimeConfig(
+                data_dir=os.environ.get("DR_DATA_DIR", "/tmp/deep_research"),
+                base_url=os.environ.get("DR_OWUI_BASE_URL", self.valves.OWUI_BASE_URL),
+            )
+            coord = Coordinator(valves=self.valves, config=config)
+            await coord.start()
+            try:
+                token = StaticToken(self.valves.OWUI_API_KEY)
+                user = RunUser(id="pipeline_user", name="Pipeline User")
 
-        async def event_sink(event: Event) -> None:
-            if isinstance(event, StatusEvent):
-                reasoning.add(f"- {event.description}")
-                if time.monotonic() - reasoning._opened_at > 4.0:
-                    sink.put(reasoning.render(done=False))
-                    reasoning._parts = []
-                    reasoning._opened_at = time.monotonic()
-            elif isinstance(event, MessageEvent):
+                chat_id = body.get("chat_id") if isinstance(body, dict) else None
+                conversation_id = str(chat_id or "pipeline_conv")
+
+                history = [
+                    ChatMessage(role=m.get("role", "user"), content=m.get("content", ""))
+                    for m in (messages or [])[:-1]
+                ]
+
+                async def event_sink(event: Event) -> None:
+                    if isinstance(event, StatusEvent):
+                        reasoning.add(f"- {event.description}")
+                        if time.monotonic() - reasoning._opened_at > 4.0:
+                            sink.put(reasoning.render(done=False))
+                            reasoning._parts = []
+                            reasoning._opened_at = time.monotonic()
+                    elif isinstance(event, MessageEvent):
+                        if reasoning._parts:
+                            duration = time.monotonic() - reasoning._opened_at
+                            sink.put(reasoning.render(done=True, duration=duration))
+                            reasoning._parts = []
+                        sink.put(event.content)
+
+                result = await coord.run(
+                    user=user,
+                    conversation_id=conversation_id,
+                    chat_id=chat_id,
+                    token=token,
+                    prompt=user_message,
+                    history=history,
+                    sink=event_sink,
+                )
+
                 if reasoning._parts:
-                    duration = time.monotonic() - reasoning._opened_at
-                    sink.put(reasoning.render(done=True, duration=duration))
-                    reasoning._parts = []
-                sink.put(event.content)
-
-        result = await coord.run(
-            user=user,
-            conversation_id=conversation_id,
-            chat_id=chat_id,
-            token=token,
-            prompt=user_message,
-            history=history,
-            sink=event_sink,
-        )
-
-        if reasoning._parts:
-            sink.put(reasoning.render(done=True, duration=time.monotonic() - reasoning._opened_at))
-        if result and result.content:
-            sink.put(result.content)
-        sink.done()
+                    sink.put(reasoning.render(done=True, duration=time.monotonic() - reasoning._opened_at))
+                if result and result.content:
+                    sink.put(result.content)
+            finally:
+                await coord.close()
+        except Exception as e:
+            sink.put(f"\n\n**Research failed:** {e}\n")
+        finally:
+            # Always enqueue the sentinel, or _BridgeSink.__iter__ blocks forever.
+            sink.done()

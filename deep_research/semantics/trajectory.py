@@ -1,14 +1,30 @@
+import collections
 import logging
 
 import numpy as np
 
 from deep_research.core.state import TrajectoryAccumulator
+from deep_research.core.text import stable_text_key
 from deep_research.core.types import RunContext
 from deep_research.semantics.embeddings import get_embedding
 
 logger = logging.getLogger("deep_research.semantics.trajectory")
 
-_trajectory_accumulators: dict[str, TrajectoryAccumulator] = {}
+# Bounded LRU, mirroring ResearchStateManager.MAX_CONVERSATIONS, so this
+# process-global does not grow without limit over a long-lived instance.
+_TRAJ_MAX_CONVERSATIONS = 256
+_trajectory_accumulators: "collections.OrderedDict[str, TrajectoryAccumulator]" = (
+    collections.OrderedDict()
+)
+
+
+def _store_trajectory_accumulator(
+    conversation_id: str, acc: TrajectoryAccumulator
+) -> None:
+    _trajectory_accumulators[conversation_id] = acc
+    _trajectory_accumulators.move_to_end(conversation_id)
+    while len(_trajectory_accumulators) > _TRAJ_MAX_CONVERSATIONS:
+        _trajectory_accumulators.popitem(last=False)
 
 
 async def calculate_research_trajectory(
@@ -20,14 +36,14 @@ async def calculate_research_trajectory(
     conv_state = ctx.state.get_state(ctx.conversation_id)
     trajectory_cache = conv_state.get("trajectory_cache", {})
 
-    recent_query_key = hash(
+    recent_query_key = stable_text_key(
         str(
             previous_queries[-3:]
             if len(previous_queries) >= 3
             else previous_queries
         )
     )
-    recent_result_key = hash(
+    recent_result_key = stable_text_key(
         str([r.get("url", "") for r in successful_results[-5:] if "url" in r])
     )
     cache_key = f"{recent_query_key}_{recent_result_key}"
@@ -37,6 +53,8 @@ async def calculate_research_trajectory(
         return trajectory_cache[cache_key]
 
     traj_acc = _trajectory_accumulators.get(ctx.conversation_id)
+    if traj_acc is not None:
+        _trajectory_accumulators.move_to_end(ctx.conversation_id)
     if traj_acc is None:
         sample_embedding = None
         for result in successful_results[:6]:
@@ -46,19 +64,13 @@ async def calculate_research_trajectory(
                 if sample_embedding:
                     embedding_dim = len(sample_embedding)
                     traj_acc = TrajectoryAccumulator(embedding_dim)
-                    _trajectory_accumulators[ctx.conversation_id] = traj_acc
+                    _store_trajectory_accumulator(ctx.conversation_id, traj_acc)
                     break
 
-        if not sample_embedding:
-            # fallback only: no sample embedding was available, so the real
-            # dimension is unknown. add_cycle_data() no-ops on empty inputs,
-            # so this accumulator never actually receives 384-d data.
-            traj_acc = TrajectoryAccumulator(384)
-            _trajectory_accumulators[ctx.conversation_id] = traj_acc
-
-    # The branches above always assign traj_acc; mypy can't see that
-    # through the for/else flow, so make the invariant explicit.
-    assert traj_acc is not None
+        # If no sample embedding was available, do NOT create an accumulator
+        # with a guessed dimension: a wrongly-sized accumulator cached here
+        # would crash with a numpy broadcast error once real embeddings arrive.
+        # Defer creation until the cycle embeddings below reveal the real dim.
 
     try:
         max_history_cycles = 5
@@ -100,6 +112,12 @@ async def calculate_research_trajectory(
 
         if not query_embeddings or not result_embeddings:
             return None
+
+        # Lazily create the accumulator now that we know the real embedding
+        # dimension from an actual vector (the fallback path leaves it None).
+        if traj_acc is None:
+            traj_acc = TrajectoryAccumulator(len(result_embeddings[0]))
+            _store_trajectory_accumulator(ctx.conversation_id, traj_acc)
 
         traj_acc.add_cycle_data(query_embeddings, result_embeddings)
 

@@ -8,7 +8,7 @@ def build_progress_snapshot(ctx: RunContext, cycle: int | None = None) -> dict[s
     state = ctx.state.get_state(ctx.conversation_id)
     research_state = state.get("research_state") or {}
     user_message = research_state.get("user_message", "")
-    max_cycles = getattr(ctx.valves, "MAX_CYCLES", 0)
+    max_cycles = ctx.valves.cycles.max_cycles
 
     memory_stats = state.get("memory_stats", {}) or {}
     results_tokens = memory_stats.get("results_tokens", 0)

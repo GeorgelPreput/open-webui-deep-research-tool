@@ -1,5 +1,6 @@
 import math
 import re
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -8,7 +9,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from deep_research.budget.tokens import count_tokens
 from deep_research.config.constants import VERIFY_CITATIONS
-from deep_research.core.text import response_text
+from deep_research.core.text import response_text, stable_text_key
 from deep_research.progress.events import StatusEvent
 from deep_research.semantics.embeddings import get_embedding
 from deep_research.synthesis.verify import verify_citation_batch
@@ -40,10 +41,10 @@ async def generate_subtopic_content_with_citations(
     relevance_cache = state.get("subtopic_relevance_cache", {})
 
     # Create embedding cache keys for efficiency
-    query_embedding_key = f"query_embedding_{hash(original_query)}"
-    subtopic_embedding_key = f"subtopic_embedding_{hash(subtopic)}"
+    query_embedding_key = f"query_embedding_{stable_text_key(original_query)}"
+    subtopic_embedding_key = f"subtopic_embedding_{stable_text_key(subtopic)}"
     combined_embedding_key = (
-        f"combined_embedding_{hash(original_query)}_{hash(subtopic)}"
+        f"combined_embedding_{stable_text_key(original_query)}_{stable_text_key(subtopic)}"
     )
 
     # Create a prompt specific to this subtopic
@@ -178,7 +179,7 @@ async def generate_subtopic_content_with_citations(
                 continue
 
             # Create a cache key for this result's embedding
-            result_key = f"result_{hash(result.get('url', ''))}"
+            result_key = f"result_{stable_text_key(result.get('url', ''))}"
             content_embedding = state.get(result_key)
 
             if not content_embedding:
@@ -450,7 +451,7 @@ async def generate_section_content_with_citations(
                 "title": source_data.get("title", "Untitled Source"),
                 "content_preview": "",
                 "source_type": "web" if not url.endswith(".pdf") else "pdf",
-                "accessed_date": ctx.research_date,
+                "accessed_date": ctx.research_date or datetime.now().strftime("%Y-%m-%d"),
                 "cited_in_sections": set([section_title]),
             }
         elif section_title not in master_source_table[url].get(

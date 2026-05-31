@@ -207,3 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 .claude
+
+# Quality/security scan artifacts (Makefile: make all)
+reports/
+*.sarif

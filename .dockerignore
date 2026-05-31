@@ -19,6 +19,12 @@ CLAUDE.md
 tests/
 .pre-commit-config.yaml
 
+# Generated scan/coverage artifacts and local caches
+reports/
+.coverage
+.coverage.*
+htmlcov/
+
 # Lockfile (not needed for pip-based image build)
 uv.lock
 

@@ -65,8 +65,8 @@ async def try_primary_web_flow(ctx: RunContext, url: str) -> str | None:
             if cleaned and cleaned.strip():
                 result["text"] = cleaned
                 text = cleaned
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"POST_CLEAN_PRIMARY_OUTPUT cleanup failed for {url}: {e}")
 
     if not result.get("title"):
         result["title"] = url_fallback_title(ctx, url)

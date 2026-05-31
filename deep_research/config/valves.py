@@ -72,6 +72,9 @@ class AdvancedValves(BaseModel):
     executor_workers: int = 2
     http_timeout_seconds: int = 600
     http_max_retries: int = 3
+    # Verify TLS certs on legacy PDF downloads. Disable only for trusted hosts
+    # with self-signed certs; leaving it on is the secure default.
+    pdf_legacy_tls_verify: bool = True
 
 
 class Valves(BaseModel):

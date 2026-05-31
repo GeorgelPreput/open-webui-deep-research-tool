@@ -1,0 +1,13 @@
+# Open WebUI Pipelines sidecar with the deep_research pipeline preloaded.
+#
+# The pipeline (deep_research/entrypoints/owui_pipeline/pipeline.py) imports the
+# `deep_research` package, so we install the package into the image and then drop
+# the plugin file where the Pipelines runtime auto-discovers it (/app/pipelines).
+FROM ghcr.io/open-webui/pipelines:main
+
+COPY pyproject.toml /opt/deep_research/pyproject.toml
+COPY deep_research /opt/deep_research/deep_research
+RUN pip install --no-cache-dir "/opt/deep_research[server,mcp]"
+
+COPY deep_research/entrypoints/owui_pipeline/pipeline.py \
+     /app/pipelines/deep_research_pipeline.py

@@ -15,6 +15,7 @@ async def with_retry(
     max_delay: float = 30.0,
     label: str = "request",
 ) -> T:
+    max_retries = max(0, max_retries)
     last_exc: BaseException | None = None
     for attempt in range(max_retries + 1):
         try:

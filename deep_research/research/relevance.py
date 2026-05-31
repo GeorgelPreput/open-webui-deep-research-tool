@@ -17,10 +17,10 @@ async def _emit_message(ctx: RunContext, content: str) -> None:
     await ctx.events.emit(MessageEvent(content=content))
 
 
-async def extract_topic_relevant_info(ctx: RunContext, results, topics):
+async def extract_topic_relevant_info(ctx: RunContext, results, topics) -> str:
     """Extract information from search results specifically relevant to given topics"""
     if not results:
-        return []
+        return ""
 
     # Create a prompt for extracting relevant information
     extraction_prompt = {

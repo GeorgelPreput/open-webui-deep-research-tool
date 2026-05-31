@@ -26,13 +26,6 @@ class FileUploadResponse(BaseModel):
     data: dict
 
 
-class FileContentResponse(BaseModel):
-    id: str
-    filename: str
-    meta: dict
-    data: dict
-
-
 class KBResponse(BaseModel):
     id: str
     name: str
@@ -44,21 +37,3 @@ class ModelInfo(BaseModel):
     name: str
     context_window: int | None = None
     meta: dict | None = None
-
-
-class ChatCompletionMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChatCompletionChoice(BaseModel):
-    message: ChatCompletionMessage
-
-
-class ChatCompletionResponse(BaseModel):
-    choices: list[ChatCompletionChoice]
-
-
-class WebSearchResponse(BaseModel):
-    results: list[dict] | None = None
-    items: list[dict] | None = None

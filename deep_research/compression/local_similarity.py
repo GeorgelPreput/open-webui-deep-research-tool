@@ -113,9 +113,10 @@ async def compress_content_with_local_similarity(
                 0
             ]
 
-            query_similarity = cosine_similarity([embedding], [query_embedding])[0][
-                0
-            ]
+            if query_embedding is not None:
+                query_similarity = cosine_similarity([embedding], [query_embedding])[0][0]
+            else:
+                query_similarity = 0.5
 
             summary_similarity = 0.0
             if summary_embedding is not None:

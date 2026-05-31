@@ -5,7 +5,7 @@ from typing import Any
 from loguru import logger
 from sklearn.metrics.pairwise import cosine_similarity
 
-from deep_research.core.text import response_text
+from deep_research.core.text import response_text, stable_text_key
 from deep_research.progress.events import StatusEvent
 from deep_research.semantics.dimensions import translate_dimensions_to_words
 from deep_research.semantics.embeddings import get_embedding
@@ -65,7 +65,7 @@ The goal is to create a refined outline reflecting a logical narrative and infor
 
     # Check if we have a cached outline embedding
     state = ctx.state.get_state(ctx.conversation_id)
-    outline_embedding_key = f"outline_embedding_{hash(outline_text)}"
+    outline_embedding_key = f"outline_embedding_{stable_text_key(outline_text)}"
     outline_embedding = state.get(outline_embedding_key)
 
     if not outline_embedding:
@@ -83,7 +83,7 @@ The goal is to create a refined outline reflecting a logical narrative and infor
                 continue
 
             # Check cache first for result embedding
-            result_key = f"result_embedding_{hash(result.get('url', ''))}"
+            result_key = f"result_embedding_{stable_text_key(result.get('url', ''))}"
             content_embedding = state.get(result_key)
 
             if not content_embedding:
@@ -109,7 +109,7 @@ The goal is to create a refined outline reflecting a logical narrative and infor
             outline_context += f"Content: {result.get('content', '')}\n\n"
 
     # Build context from the original outline and research results
-    outline_context = "### Original Research Outline:\n\n"
+    outline_context += "### Original Research Outline:\n\n"
 
     for topic_item in original_outline:
         outline_context += f"- {topic_item['topic']}\n"

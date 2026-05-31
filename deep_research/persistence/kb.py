@@ -1,7 +1,6 @@
 import hashlib
 import logging
 import re
-import time
 from datetime import datetime
 from typing import Any
 
@@ -135,14 +134,6 @@ async def ensure_research_kb(ctx: RunContext, title_hint: str) -> tuple[str, str
             else "Deep Research run"
         )
         knowledge = await ctx.client.create_kb(kb_name, description)
-        if knowledge is None:
-            # Retry once with a numeric suffix if name collided
-            kb_name_alt = f"{kb_name}-{int(time.time()) % 10000:04d}"
-            knowledge = await ctx.client.create_kb(kb_name_alt, description)
-            if knowledge is None:
-                logger.warning(f"Failed to create research KB '{kb_name}'")
-                return None
-            kb_name = kb_name_alt
         kb_id = knowledge.id
         if dr is None:
             dr = new_dr_state(ctx)

@@ -90,6 +90,10 @@ class TrajectoryAccumulator:
             return
         query_centroid = np.mean(query_embeddings, axis=0)
         result_centroid = np.mean(result_embeddings, axis=0)
+        if query_centroid.shape[0] != self.embedding_dim:
+            raise ValueError(
+                f"TrajectoryAccumulator dim {self.embedding_dim} != embedding dim {query_centroid.shape[0]}"
+            )
         self.query_sum += query_centroid * weight
         self.result_sum += result_centroid * weight
         self.count += 1

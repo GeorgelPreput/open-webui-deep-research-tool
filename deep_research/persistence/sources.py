@@ -126,7 +126,11 @@ async def answer_post_report_user_qa(ctx: RunContext, body: dict[str, Any]) -> s
     kb_name = dr.get("kb_name") or kb_id
 
     messages = body.get("messages") or []
-    user_message = (messages[-1].get("content") or "").strip() if messages else ""
+    user_message = (
+        (messages[-1].get("content") or "").strip()
+        if messages and isinstance(messages[-1], dict)
+        else ""
+    )
     if not user_message:
         return ""
 
