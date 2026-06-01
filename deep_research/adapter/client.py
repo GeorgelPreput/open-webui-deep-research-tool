@@ -318,9 +318,7 @@ class OWUIClient:
             return False
         if err.status == 404:
             return True
-        if err.status == 400 and _INCOMPATIBILITY_SIGNATURE in str(err):
-            return True
-        return False
+        return err.status == 400 and _INCOMPATIBILITY_SIGNATURE in str(err)
 
     def _lock_chat_path(self, path: str) -> None:
         self._chat_path_locked = path
