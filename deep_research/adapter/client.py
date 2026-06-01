@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -15,6 +17,28 @@ from deep_research.adapter.models import (
     QueryCollectionResponse,
 )
 from deep_research.adapter.retry import with_retry
+
+logger = logging.getLogger("deep_research.adapter.client")
+
+
+def _truncate(text: str, limit: int = 500) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
+
+
+def _body_model(json_body: Any) -> str:
+    if isinstance(json_body, dict):
+        m = json_body.get("model")
+        if isinstance(m, str) and m:
+            return m
+    return "-"
+
+
+def _body_keys(json_body: Any) -> list[str]:
+    if isinstance(json_body, dict):
+        return list(json_body.keys())
+    return []
 
 
 class OWUIClientError(Exception):
@@ -96,12 +120,23 @@ class OWUIClient:
         if headers:
             request_headers.update(headers)
 
+        model = _body_model(json_body)
+        body_keys = _body_keys(json_body)
+
         async def _do() -> Any:
             sem = semaphore
             if sem is None:
                 sem = self._llm_sem
 
             async with sem:
+                logger.debug(
+                    "HTTP %s %s body_keys=%s model=%s",
+                    method,
+                    path,
+                    body_keys,
+                    model,
+                )
+                t0 = time.monotonic()
                 resp = await self.client.request(
                     method,
                     url,
@@ -109,20 +144,45 @@ class OWUIClient:
                     params=params or {},
                     headers=request_headers,
                 )
+                elapsed = time.monotonic() - t0
                 if resp.status_code >= 400:
                     try:
                         text = resp.text
                     except Exception:
                         text = ""
+                    log_fn = logger.error if resp.status_code >= 500 else logger.warning
+                    log_fn(
+                        "HTTP %s %s -> %d model=%s elapsed_s=%.2f body=%s",
+                        method,
+                        path,
+                        resp.status_code,
+                        model,
+                        elapsed,
+                        _truncate(text, 500),
+                    )
                     raise OWUIClientError(
                         f"{method} {path} -> {resp.status_code}: {text[:500]}",
                         status=resp.status_code,
                     )
+                logger.debug(
+                    "HTTP %s %s -> %d in %.2fs",
+                    method,
+                    path,
+                    resp.status_code,
+                    elapsed,
+                )
                 if not resp.content:
                     return None
                 try:
                     return resp.json()
                 except json.JSONDecodeError as e:
+                    logger.error(
+                        "HTTP %s %s -> %d non-JSON body: %s",
+                        method,
+                        path,
+                        resp.status_code,
+                        _truncate(resp.text, 200),
+                    )
                     raise OWUIClientError(
                         f"{method} {path} -> 200 but body is not JSON: "
                         f"{resp.text[:200]}",
@@ -142,8 +202,15 @@ class OWUIClient:
     ) -> AsyncIterator[str]:
         url = f"{self._base_url}{path}"
         token = await self._token_provider.get_token()
+        model = _body_model(json_body)
 
         async def _stream() -> AsyncIterator[str]:
+            logger.debug(
+                "HTTP POST %s (stream) body_keys=%s model=%s",
+                path,
+                _body_keys(json_body),
+                model,
+            )
             async with self._llm_sem, self.client.stream(
                 "POST",
                 url,
@@ -155,6 +222,14 @@ class OWUIClient:
             ) as resp:
                 if resp.status_code >= 400:
                     body = (await resp.aread()).decode("utf-8", errors="replace")
+                    log_fn = logger.error if resp.status_code >= 500 else logger.warning
+                    log_fn(
+                        "HTTP POST %s (stream) -> %d model=%s body=%s",
+                        path,
+                        resp.status_code,
+                        model,
+                        _truncate(body, 500),
+                    )
                     raise OWUIClientError(
                         f"POST {path} -> {resp.status_code}: {body[:500]}",
                         status=resp.status_code,
@@ -195,6 +270,13 @@ class OWUIClient:
                     and attempt < self._max_retries
                 ):
                     last_exc = e
+                    logger.warning(
+                        "Stream retry POST %s: attempt=%d/%d status=%d yielded_any=False",
+                        path,
+                        attempt + 1,
+                        self._max_retries,
+                        e.status,
+                    )
                     await asyncio.sleep(min(1.5 * (2**attempt), 30.0))
                     attempt += 1
                     continue
@@ -202,6 +284,13 @@ class OWUIClient:
             except httpx.HTTPError as e:
                 if not yielded_any and attempt < self._max_retries:
                     last_exc = e
+                    logger.warning(
+                        "Stream retry POST %s: attempt=%d/%d exc=%s yielded_any=False",
+                        path,
+                        attempt + 1,
+                        self._max_retries,
+                        type(e).__name__,
+                    )
                     await asyncio.sleep(min(1.5 * (2**attempt), 30.0))
                     attempt += 1
                     continue

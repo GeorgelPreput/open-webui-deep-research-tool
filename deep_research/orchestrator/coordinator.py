@@ -15,6 +15,7 @@ from deep_research.adapter.auth import (
     set_current_token,
 )
 from deep_research.adapter.client import OWUIClient
+from deep_research.config.logging import reset_log_context, set_log_context
 from deep_research.config.valves import Valves
 from deep_research.core.caches import EmbeddingCache, LRUBytesBoundedCache, TransformationCache
 from deep_research.core.state import ResearchStateManager
@@ -83,6 +84,17 @@ class Coordinator:
         async with self._start_lock:
             if self._started:
                 return
+            logger.info(
+                "Coordinator starting: base_url=%s data_dir=%s "
+                "llm_concurrency=%d embedding_concurrency=%d "
+                "http_timeout=%ds http_max_retries=%d",
+                self._config.base_url,
+                self._config.data_dir,
+                self._valves.advanced.llm_concurrency,
+                self._valves.advanced.embedding_concurrency,
+                self._valves.advanced.http_timeout_seconds,
+                self._valves.advanced.http_max_retries,
+            )
             self._client = OWUIClient(
                 base_url=self._config.base_url,
                 token_provider=ContextTokenProvider(),
@@ -95,8 +107,10 @@ class Coordinator:
             )
             await self._client.start()
             self._started = True
+            logger.info("Coordinator started")
 
     async def close(self) -> None:
+        logger.info("Coordinator shutting down")
         if self._client is not None:
             await self._client.close()
             self._client = None
@@ -124,14 +138,35 @@ class Coordinator:
 
         bearer = await token.get_token()
         token_handle = set_current_token(bearer)
+        run_started = time.monotonic()
+        log_handle = None
         try:
             ctx = await self._build_context(user, conversation_id, chat_id, token, prompt, history, sink)
+            log_handle = set_log_context(
+                conversation_id=ctx.conversation_id,
+                chat_id=ctx.chat_id or "-",
+                run_id=ctx.run_id,
+                request_id=ctx.request_id,
+            )
+            logger.info(
+                "Run started: conversation_id=%s prompt_chars=%d",
+                ctx.conversation_id,
+                len(prompt or ""),
+            )
             await ctx.events.start()
             try:
                 return await self._run_phases(ctx)
             finally:
                 await ctx.events.stop()
         finally:
+            elapsed = time.monotonic() - run_started
+            logger.info(
+                "Run finished: conversation_id=%s elapsed_s=%.2f",
+                conversation_id,
+                elapsed,
+            )
+            if log_handle is not None:
+                reset_log_context(log_handle)
             reset_current_token(token_handle)
             async with self._inflight_lock:
                 self._inflight.discard(inflight_key)
@@ -207,23 +242,48 @@ class Coordinator:
             outline_feedback as of_phase,
         )
 
+        async def _phase(name: str, coro):
+            logger.info("Phase start: %s", name)
+            t0 = time.monotonic()
+            try:
+                result = await coro
+                logger.info(
+                    "Phase done: %s elapsed_s=%.2f",
+                    name,
+                    time.monotonic() - t0,
+                )
+                return result
+            except Exception:
+                logger.exception("Phase failed: %s", name)
+                raise
+
         phase_state: dict[str, Any] = {
             "user_message": ctx.prompt,
             "history": ctx.history,
         }
         ctx.state.update_state(ctx.conversation_id, "last_user_message", ctx.prompt)
-        phase_state = await rehydrate.run_rehydrate(ctx, phase_state)
+        phase_state = await _phase("rehydrate", rehydrate.run_rehydrate(ctx, phase_state))
 
         if phase_state.get("post_report_mode"):
             from deep_research.persistence.sources import answer_post_report_user_qa
+            logger.info("Phase start: post_report_qa")
+            t0 = time.monotonic()
             answer = await answer_post_report_user_qa(
                 ctx,
                 body={"messages": [{"role": "user", "content": ctx.prompt}]},
             )
+            logger.info(
+                "Phase done: post_report_qa elapsed_s=%.2f",
+                time.monotonic() - t0,
+            )
             return Report(content=answer, conversation_id=ctx.conversation_id)
 
-        phase_state = await of_phase.run_outline_feedback(ctx, phase_state)
-        phase_state = await initial_queries.run_initial_queries(ctx, phase_state)
+        phase_state = await _phase(
+            "outline_feedback", of_phase.run_outline_feedback(ctx, phase_state)
+        )
+        phase_state = await _phase(
+            "initial_queries", initial_queries.run_initial_queries(ctx, phase_state)
+        )
 
         if phase_state.get("awaiting_outline_feedback"):
             return Report(
@@ -231,10 +291,10 @@ class Coordinator:
                 conversation_id=ctx.conversation_id,
             )
 
-        phase_state = await outline.run_outline(ctx, phase_state)
-        phase_state = await cycles.run_cycles(ctx, phase_state)
-        phase_state = await compress.run_compress(ctx, phase_state)
-        phase_state = await synthesize.run_synthesize(ctx, phase_state)
-        phase_state = await front_back.run_front_back(ctx, phase_state)
-        report = await finalize.run_finalize(ctx, phase_state)
+        phase_state = await _phase("outline", outline.run_outline(ctx, phase_state))
+        phase_state = await _phase("cycles", cycles.run_cycles(ctx, phase_state))
+        phase_state = await _phase("compress", compress.run_compress(ctx, phase_state))
+        phase_state = await _phase("synthesize", synthesize.run_synthesize(ctx, phase_state))
+        phase_state = await _phase("front_back", front_back.run_front_back(ctx, phase_state))
+        report = await _phase("finalize", finalize.run_finalize(ctx, phase_state))
         return report

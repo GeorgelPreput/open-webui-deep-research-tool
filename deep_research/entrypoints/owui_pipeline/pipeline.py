@@ -4,10 +4,16 @@ import queue
 import threading
 import time
 from collections.abc import Iterator
+from uuid import uuid4
 
 from deep_research import Coordinator
 from deep_research import Valves as BaseValves
 from deep_research.adapter.auth import StaticToken
+from deep_research.config.logging import (
+    configure_logging,
+    reset_log_context,
+    set_log_context,
+)
 from deep_research.core.types import ChatMessage, RunUser
 from deep_research.orchestrator.coordinator import RuntimeConfig
 from deep_research.progress.events import Event, MessageEvent, StatusEvent
@@ -93,7 +99,9 @@ class Pipeline:
         self, sink: _BridgeSink, user_message: str, messages: list, body: dict
     ) -> None:
         reasoning = _ReasoningBlock(summary="Deep Research")
+        log_handle: object | None = None
         try:
+            configure_logging(self.valves)
             # Build + start the Coordinator on THIS (per-call worker) loop: its
             # httpx client and semaphores are bound to the loop they're created
             # on, so a shared/long-lived coordinator from another loop is unusable.
@@ -109,6 +117,12 @@ class Pipeline:
 
                 chat_id = body.get("chat_id") if isinstance(body, dict) else None
                 conversation_id = str(chat_id or "pipeline_conv")
+
+                log_handle = set_log_context(
+                    conversation_id=conversation_id,
+                    chat_id=str(chat_id) if chat_id else "-",
+                    request_id=str(uuid4()),
+                )
 
                 history = [
                     ChatMessage(role=m.get("role", "user"), content=m.get("content", ""))
@@ -148,5 +162,7 @@ class Pipeline:
         except Exception as e:
             sink.put(f"\n\n**Research failed:** {e}\n")
         finally:
+            if log_handle is not None:
+                reset_log_context(log_handle)
             # Always enqueue the sentinel, or _BridgeSink.__iter__ blocks forever.
             sink.done()

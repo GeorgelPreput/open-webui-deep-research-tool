@@ -171,8 +171,48 @@ Every knob is grouped on the `Valves` Pydantic model. In OWUI runtimes (Function
 | `persistence` | `export_research_data` (True), `interactive_research` (True), `user_preference_throughout` (True) |
 | `events` | `enable_progress_embed` (True), `flush_interval_ms` (400), `quiet_chat_mode` (True) |
 | `advanced` | `query_weight` (0.5), `llm_concurrency` (4), `embedding_concurrency` (8), `executor_workers` (2), `http_timeout_seconds` (600), `http_max_retries` (3) |
+| `logging` | `level` (`INFO`), `format` (`text` \| `json`), `include_tracebacks` (True) |
 
 Engineering knobs that aren't user-facing (PDF page caps, extraction-quality thresholds, eigendecomposition radii, etc.) live in `deep_research/config/constants.py` — edit the source if you really need to tune them.
+
+### Logging
+
+Deep Research configures its own logger tree (`deep_research.*`) at every entry point — OpenAPI server, OWUI Function, Pipelines plugin, and MCP server. Output goes to `stderr` and does not propagate into the host's root logger, so it coexists with uvicorn / OWUI logging without duplicates.
+
+Configure via env (shorthand) or valves (long form). Precedence: explicit valve > env > default.
+
+| Setting | Env (shorthand) | Env (valve form) | Valve | Default | Notes |
+|---|---|---|---|---|---|
+| Level | `DR_LOG_LEVEL` | `DR_LOGGING_LEVEL` | `logging.level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| Format | `DR_LOG_FORMAT` | `DR_LOGGING_FORMAT` | `logging.format` | `text` | `text` (human-readable) or `json` (one JSON object per line) |
+| Tracebacks | `DR_LOG_INCLUDE_TRACEBACKS` | `DR_LOGGING_INCLUDE_TRACEBACKS` | `logging.include_tracebacks` | `true` | Set false to strip stack traces while keeping the error message |
+
+Every record carries the active `conversation_id`, `chat_id`, `run_id`, and `request_id` (propagated via `contextvars`, surfaced as record fields in both formats). API keys and bearer tokens are redacted to first 4 + last 4 (`sk-a…0xyz`) wherever they would otherwise appear in logs; values under 9 characters render as `********`.
+
+At `DEBUG` level you get:
+- Coordinator startup with model IDs and concurrency settings.
+- Each of the 9 research phases — `Phase start: <name>` / `Phase done: <name> elapsed_s=…` / `Phase failed: <name>` with traceback.
+- Every OWUI HTTP call: method, path, model id, body keys, status, elapsed time. Non-2xx responses include a 500-char truncated body — exactly the place the K8s-sidecar `400: 'NoneType' object has no attribute 'startswith'` failures surface.
+- Each retry attempt from `adapter/retry.py` with attempt number, delay, classified reason, and exception type.
+
+Example for the OpenAPI Tool runtime:
+
+```bash
+DR_LOG_LEVEL=DEBUG DR_LOG_FORMAT=text \
+  DR_OWUI_BASE_URL=http://owui:8080 DR_OWUI_API_KEY=sk-xxxxxxxx \
+  uvicorn deep_research.entrypoints.openapi_tool.server:app --port 8000
+```
+
+Sample of one failing chat-completions call:
+
+```
+2026-06-01 12:00:05,002 INFO deep_research.orchestrator [conv=api_abc run=r-9f req=req-77] Run started: conversation_id=api_abc prompt_chars=128
+2026-06-01 12:00:05,003 INFO deep_research.orchestrator [conv=api_abc run=r-9f req=req-77] Phase start: outline_feedback
+2026-06-01 12:00:05,051 DEBUG deep_research.adapter.client [conv=api_abc run=r-9f req=req-77] HTTP POST /api/chat/completions body_keys=['model', 'messages', 'stream', 'temperature'] model=gemma3:12b
+2026-06-01 12:00:05,402 WARNING deep_research.adapter.client [conv=api_abc run=r-9f req=req-77] HTTP POST /api/chat/completions -> 400 model=gemma3:12b elapsed_s=0.35 body={"detail":"'NoneType' object has no attribute 'startswith'"}
+```
+
+For structured ingestion (Loki, ELK, Datadog) set `DR_LOG_FORMAT=json` — each line is a JSON object with `ts`, `level`, `logger`, `message`, `conversation_id`, `chat_id`, `run_id`, `request_id`, and optional `exception`.
 
 ### Required environment variables (Docker runtimes only)
 

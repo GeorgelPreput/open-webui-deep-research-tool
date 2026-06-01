@@ -1,10 +1,16 @@
 import asyncio
 import os
 from typing import Any
+from uuid import uuid4
 
 from deep_research import Coordinator
 from deep_research import Valves as DRValves
 from deep_research.adapter.auth import StaticToken
+from deep_research.config.logging import (
+    configure_logging,
+    reset_log_context,
+    set_log_context,
+)
 from deep_research.core.types import ChatMessage, RunUser
 from deep_research.orchestrator.coordinator import RuntimeConfig
 from deep_research.progress.events import EmbedEvent, Event, MessageEvent, StatusEvent
@@ -31,6 +37,7 @@ class Pipe:
         if self._coordinator is None:
             async with self._coord_lock:
                 if self._coordinator is None:
+                    configure_logging(self.valves)
                     config = RuntimeConfig(
                         data_dir=os.environ.get("DR_DATA_DIR", "/tmp/deep_research"),
                         base_url=os.environ.get("DR_OWUI_BASE_URL", "http://localhost:8080"),
@@ -61,19 +68,28 @@ class Pipe:
             for m in messages_raw[:-1]
         ]
 
+        log_handle = set_log_context(
+            conversation_id=conversation_id or "-",
+            chat_id=str(chat_id) if chat_id else "-",
+            request_id=str(uuid4()),
+        )
+
         async def sink(event: Event) -> None:
             await _translate_event(event, __event_emitter__)
 
-        report = await coord.run(
-            user=user,
-            conversation_id=conversation_id,
-            chat_id=chat_id,
-            token=token,
-            prompt=prompt,
-            history=history,
-            sink=sink,
-        )
-        return report.content
+        try:
+            report = await coord.run(
+                user=user,
+                conversation_id=conversation_id,
+                chat_id=chat_id,
+                token=token,
+                prompt=prompt,
+                history=history,
+                sink=sink,
+            )
+            return report.content
+        finally:
+            reset_log_context(log_handle)
 
 
 def _extract_bearer(request: Any) -> str:

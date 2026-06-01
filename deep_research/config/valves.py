@@ -65,6 +65,12 @@ class EventsValves(BaseModel):
     quiet_chat_mode: bool = True
 
 
+class LoggingValves(BaseModel):
+    level: str = "INFO"
+    format: str = "text"
+    include_tracebacks: bool = True
+
+
 class AdvancedValves(BaseModel):
     query_weight: float = 0.5
     llm_concurrency: int = 4
@@ -90,3 +96,4 @@ class Valves(BaseModel):
     persistence: PersistenceValves = Field(default_factory=PersistenceValves)
     events: EventsValves = Field(default_factory=EventsValves)
     advanced: AdvancedValves = Field(default_factory=AdvancedValves)
+    logging: LoggingValves = Field(default_factory=LoggingValves)

@@ -36,7 +36,28 @@ def load_valves_from_env(prefix: str = "DR_") -> Valves:
     for group, fields in env_data.items():
         raw_valves[group] = fields
 
+    if env_data:
+        logger.debug("Loaded DR_* env overrides: %s", _summarize(env_data))
+
     return Valves.model_validate(raw_valves)
+
+
+_SENSITIVE_FIELD_HINTS = ("key", "token", "secret", "password")
+
+
+def _summarize(env_data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    from deep_research.config.logging import redact_secret
+
+    out: dict[str, dict[str, Any]] = {}
+    for group, fields in env_data.items():
+        out[group] = {}
+        for field, value in fields.items():
+            lower = field.lower()
+            if any(hint in lower for hint in _SENSITIVE_FIELD_HINTS):
+                out[group][field] = redact_secret(str(value))
+            else:
+                out[group][field] = value
+    return out
 
 
 def _coerce(value: str, target: type) -> Any:
@@ -105,5 +126,10 @@ VALVES_GROUP_MAP: dict[str, dict[str, type]] = {
         "http_timeout_seconds": int,
         "http_max_retries": int,
         "pdf_legacy_tls_verify": bool,
+    },
+    "logging": {
+        "level": str,
+        "format": str,
+        "include_tracebacks": bool,
     },
 }

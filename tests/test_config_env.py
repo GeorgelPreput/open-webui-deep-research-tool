@@ -61,3 +61,13 @@ def test_env_loader_bool_coercion(monkeypatch, raw, expected):
     monkeypatch.setenv("DR_PERSISTENCE_INTERACTIVE_RESEARCH", raw)
     valves = load_valves_from_env()
     assert valves.persistence.interactive_research is expected
+
+
+def test_env_loader_picks_up_logging_group(monkeypatch):
+    monkeypatch.setenv("DR_LOGGING_LEVEL", "DEBUG")
+    monkeypatch.setenv("DR_LOGGING_FORMAT", "json")
+    monkeypatch.setenv("DR_LOGGING_INCLUDE_TRACEBACKS", "false")
+    valves = load_valves_from_env()
+    assert valves.logging.level == "DEBUG"
+    assert valves.logging.format == "json"
+    assert valves.logging.include_tracebacks is False

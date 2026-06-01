@@ -7,10 +7,12 @@ from fastmcp import FastMCP
 from deep_research import Coordinator
 from deep_research.adapter.auth import StaticToken
 from deep_research.config.env import load_valves_from_env
+from deep_research.config.logging import configure_logging
 from deep_research.core.types import RunUser
 from deep_research.orchestrator.coordinator import RuntimeConfig
 from deep_research.progress.events import Event
 
+configure_logging()
 mcp = FastMCP("deep_research")
 _coord: Coordinator | None = None
 _coord_lock = asyncio.Lock()
@@ -24,6 +26,7 @@ async def deep_research(prompt: str, conversation_id: str | None = None) -> str:
         async with _coord_lock:
             if _coord is None:
                 valves = load_valves_from_env(prefix="DR_")
+                configure_logging(valves)
                 config = RuntimeConfig(
                     data_dir=os.environ.get("DR_DATA_DIR", "/data/deep_research"),
                     base_url=os.environ.get("DR_OWUI_BASE_URL", "http://localhost:8080"),
