@@ -21,7 +21,7 @@ import logging
 import os
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -69,7 +69,7 @@ class _JSONFormatter(logging.Formatter):
         self._include_tracebacks = include_tracebacks
 
     def format(self, record: logging.LogRecord) -> str:
-        ts = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
+        ts = datetime.fromtimestamp(record.created, tz=UTC).isoformat()
         payload: dict[str, Any] = {
             "ts": ts,
             "level": record.levelname,
@@ -115,7 +115,7 @@ def _coerce_bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _resolve_settings(valves: "Valves | None") -> tuple[int, str, bool]:
+def _resolve_settings(valves: Valves | None) -> tuple[int, str, bool]:
     env_level = os.environ.get("DR_LOG_LEVEL")
     env_format = os.environ.get("DR_LOG_FORMAT")
     env_tb = os.environ.get("DR_LOG_INCLUDE_TRACEBACKS")
@@ -128,13 +128,9 @@ def _resolve_settings(valves: "Valves | None") -> tuple[int, str, bool]:
         lv = getattr(valves, "logging", None)
         if lv is not None:
             # Valves win when explicitly set away from default.
-            if lv.level and lv.level != _DEFAULT_LEVEL:
+            if lv.level and lv.level != _DEFAULT_LEVEL or not env_level and lv.level:
                 level_str = lv.level
-            elif not env_level and lv.level:
-                level_str = lv.level
-            if lv.format and lv.format != _DEFAULT_FORMAT:
-                format_str = lv.format
-            elif not env_format and lv.format:
+            if lv.format and lv.format != _DEFAULT_FORMAT or not env_format and lv.format:
                 format_str = lv.format
             if env_tb is None:
                 include_tb = lv.include_tracebacks
@@ -143,7 +139,7 @@ def _resolve_settings(valves: "Valves | None") -> tuple[int, str, bool]:
 
 
 def configure_logging(
-    valves: "Valves | None" = None,
+    valves: Valves | None = None,
     *,
     force: bool = False,
 ) -> None:
