@@ -1,6 +1,6 @@
 [project]
 name = "deep-research"
-version = "0.2.5"
+version = "0.2.6"
 description = "Multi-cycle deep research engine — single core, four runtimes (OWUI Function, Pipeline, OpenAPI Tool, MCP)"
 requires-python = ">=3.11"
 dependencies = [
