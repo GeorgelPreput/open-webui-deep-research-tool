@@ -132,4 +132,14 @@ VALVES_GROUP_MAP: dict[str, dict[str, type]] = {
         "format": str,
         "include_tracebacks": bool,
     },
+    "llm": {
+        "base_url": str,
+        "api_key": str,
+        "chat_path": str,
+    },
+    "embeddings": {
+        "base_url": str,
+        "api_key": str,
+        "embeddings_path": str,
+    },
 }

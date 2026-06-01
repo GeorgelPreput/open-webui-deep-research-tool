@@ -25,7 +25,6 @@ logger = logging.getLogger("deep_research.entrypoints.openapi")
 app = FastAPI(title="Deep Research Tool")
 _coord: Coordinator | None = None
 
-
 class ResearchRequest(BaseModel):
     prompt: str
     user_id: str = "api_user"
@@ -43,17 +42,25 @@ async def _startup() -> None:
     config = RuntimeConfig(
         data_dir=os.environ.get("DR_DATA_DIR", "/data/deep_research"),
         base_url=os.environ.get("DR_OWUI_BASE_URL", "http://localhost:8080"),
-        chat_completions_path=os.environ.get(
-            "DR_OWUI_CHAT_COMPLETIONS_PATH", "/api/chat/completions"
-        ),
-        chat_completions_fallback_path=os.environ.get(
-            "DR_OWUI_CHAT_COMPLETIONS_FALLBACK_PATH", ""
-        ),
+        llm_base_url=valves.llm.base_url,
+        llm_api_key=valves.llm.api_key,
+        llm_chat_path=valves.llm.chat_path,
+        embeddings_base_url=valves.embeddings.base_url,
+        embeddings_api_key=valves.embeddings.api_key,
+        embeddings_path=valves.embeddings.embeddings_path,
     )
     logger.info(
-        "OpenAPI server startup: base_url=%s data_dir=%s "
-        "research_model=%s synthesis_model=%s embedding_model=%s api_key=%s",
+        "OpenAPI server startup: owui_base=%s llm_base=%s llm_chat=%s "
+        "llm_key=%s embeddings_base=%s embeddings_path=%s embeddings_key=%s "
+        "data_dir=%s research_model=%s synthesis_model=%s embedding_model=%s "
+        "owui_key=%s",
         config.base_url,
+        config.llm_base_url,
+        config.llm_chat_path,
+        redact_secret(config.llm_api_key),
+        config.embeddings_base_url,
+        config.embeddings_path,
+        redact_secret(config.embeddings_api_key),
         config.data_dir,
         valves.models.research_model,
         valves.models.synthesis_model,

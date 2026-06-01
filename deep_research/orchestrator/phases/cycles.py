@@ -187,7 +187,7 @@ async def _analyze_cycle_results(ctx, conv_state, cycle, max_cycles, user_messag
     analysis_context = _build_analysis_context(cycle_results, active_outline,
                                                 completed_topics, irrelevant_topics, cycle_summaries)
     analysis_msg = {"role": "user", "content": f"Original query: {user_message}\n\n{analysis_context}\n\nAnalyze."}
-    response = await ctx.client.chat_completions(
+    response = await ctx.llm.chat_completions(
         ctx.valves.models.research_model,
         [analysis_prompt, analysis_msg],
         temperature=ctx.valves.models.temperature,

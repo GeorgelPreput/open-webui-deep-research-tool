@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -11,7 +10,6 @@ from deep_research.adapter.auth import BearerTokenProvider
 from deep_research.adapter.models import (
     FileUploadResponse,
     KBResponse,
-    ModelInfo,
     ProcessFileResponse,
     ProcessWebResponse,
     QueryCollectionResponse,
@@ -41,13 +39,10 @@ def _body_keys(json_body: Any) -> list[str]:
     return []
 
 
-class OWUIClientError(Exception):
+class AdapterError(Exception):
     def __init__(self, message: str, status: int = 0) -> None:
         self.status = status
         super().__init__(message)
-
-
-_INCOMPATIBILITY_SIGNATURE = "'NoneType' object has no attribute 'startswith'"
 
 
 class OWUIClient:
@@ -58,25 +53,16 @@ class OWUIClient:
         token_provider: BearerTokenProvider,
         timeout_seconds: int = 600,
         max_retries: int = 3,
-        llm_semaphore: asyncio.Semaphore | None = None,
-        embedding_semaphore: asyncio.Semaphore | None = None,
         search_semaphore: asyncio.Semaphore | None = None,
         fetch_semaphore: asyncio.Semaphore | None = None,
-        chat_completions_path: str = "/api/chat/completions",
-        chat_completions_fallback_path: str = "",
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._token_provider = token_provider
         self._timeout = timeout_seconds
         self._max_retries = max_retries
-        self._llm_sem = llm_semaphore or asyncio.Semaphore(4)
-        self._embedding_sem = embedding_semaphore or asyncio.Semaphore(8)
         self._search_sem = search_semaphore or asyncio.Semaphore(2)
         self._fetch_sem = fetch_semaphore or asyncio.Semaphore(4)
         self._client: httpx.AsyncClient | None = None
-        self._chat_path = chat_completions_path
-        self._chat_fallback_path = chat_completions_fallback_path
-        self._chat_path_locked: str | None = None
 
     async def start(self) -> None:
         if self._client is not None:
@@ -105,7 +91,7 @@ class OWUIClient:
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
-            raise OWUIClientError("OWUIClient not started; call start() first")
+            raise AdapterError("OWUIClient not started; call start() first")
         return self._client
 
     async def _request(
@@ -134,7 +120,7 @@ class OWUIClient:
         async def _do() -> Any:
             sem = semaphore
             if sem is None:
-                sem = self._llm_sem
+                sem = self._fetch_sem
 
             async with sem:
                 logger.debug(
@@ -168,7 +154,7 @@ class OWUIClient:
                         elapsed,
                         _truncate(text, 500),
                     )
-                    raise OWUIClientError(
+                    raise AdapterError(
                         f"{method} {path} -> {resp.status_code}: {text[:500]}",
                         status=resp.status_code,
                     )
@@ -191,7 +177,7 @@ class OWUIClient:
                         resp.status_code,
                         _truncate(resp.text, 200),
                     )
-                    raise OWUIClientError(
+                    raise AdapterError(
                         f"{method} {path} -> 200 but body is not JSON: "
                         f"{resp.text[:200]}",
                         status=resp.status_code,
@@ -203,239 +189,21 @@ class OWUIClient:
             label=f"{method} {path}",
         )
 
-    async def _request_stream(
-        self,
-        path: str,
-        json_body: dict,
-    ) -> AsyncIterator[str]:
-        url = f"{self._base_url}{path}"
-        token = await self._token_provider.get_token()
-        model = _body_model(json_body)
+    # ---- Models (OWUI connectivity probe) ----
 
-        async def _stream() -> AsyncIterator[str]:
-            logger.debug(
-                "HTTP POST %s (stream) body_keys=%s model=%s",
-                path,
-                _body_keys(json_body),
-                model,
-            )
-            async with self._llm_sem, self.client.stream(
-                "POST",
-                url,
-                json=json_body,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "text/event-stream",
-                },
-            ) as resp:
-                if resp.status_code >= 400:
-                    body = (await resp.aread()).decode("utf-8", errors="replace")
-                    log_fn = logger.error if resp.status_code >= 500 else logger.warning
-                    log_fn(
-                        "HTTP POST %s (stream) -> %d model=%s body=%s",
-                        path,
-                        resp.status_code,
-                        model,
-                        _truncate(body, 500),
-                    )
-                    raise OWUIClientError(
-                        f"POST {path} -> {resp.status_code}: {body[:500]}",
-                        status=resp.status_code,
-                    )
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    payload = line[len("data:"):].strip()
-                    if payload == "[DONE]":
-                        return
-                    try:
-                        obj = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = obj.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    content = delta.get("content")
-                    if content:
-                        yield content
+    async def list_models(self) -> list:
+        """Lightweight OWUI connectivity probe used by owui_extraction_available.
 
-        attempt = 0
-        last_exc: Exception | None = None
-        yielded_any = False
-        while attempt <= self._max_retries:
-            try:
-                async for chunk in _stream():
-                    yielded_any = True
-                    yield chunk
-                return
-            except OWUIClientError as e:
-                # Once any chunk has reached the caller, retrying would re-yield
-                # from the start and duplicate already-emitted content.
-                if (
-                    not yielded_any
-                    and e.status in {429, 502, 503, 504}
-                    and attempt < self._max_retries
-                ):
-                    last_exc = e
-                    logger.warning(
-                        "Stream retry POST %s: attempt=%d/%d status=%d yielded_any=False",
-                        path,
-                        attempt + 1,
-                        self._max_retries,
-                        e.status,
-                    )
-                    await asyncio.sleep(min(1.5 * (2**attempt), 30.0))
-                    attempt += 1
-                    continue
-                raise
-            except httpx.HTTPError as e:
-                if not yielded_any and attempt < self._max_retries:
-                    last_exc = e
-                    logger.warning(
-                        "Stream retry POST %s: attempt=%d/%d exc=%s yielded_any=False",
-                        path,
-                        attempt + 1,
-                        self._max_retries,
-                        type(e).__name__,
-                    )
-                    await asyncio.sleep(min(1.5 * (2**attempt), 30.0))
-                    attempt += 1
-                    continue
-                raise OWUIClientError(f"stream failed: {e}") from e
-        if last_exc:
-            raise OWUIClientError(f"stream exhausted retries: {last_exc}") from last_exc
-
-    # ---- LLM ----
-
-    def _current_chat_path(self) -> str:
-        return self._chat_path_locked or self._chat_path
-
-    def _should_try_fallback(self, err: "OWUIClientError") -> bool:
-        if self._chat_path_locked is not None:
-            return False
-        if not self._chat_fallback_path:
-            return False
-        if err.status == 404:
-            return True
-        return err.status == 400 and _INCOMPATIBILITY_SIGNATURE in str(err)
-
-    def _lock_chat_path(self, path: str) -> None:
-        self._chat_path_locked = path
-        logger.info("Locked chat completions path to %s for this client", path)
-
-    async def chat_completions(
-        self,
-        model: str,
-        messages: list[dict],
-        *,
-        stream: bool = False,
-        temperature: float | None = None,
-        chat_id: str | None = None,
-    ) -> dict:
-        body = {"model": model, "messages": messages, "stream": stream}
-        if temperature is not None:
-            body["temperature"] = temperature
-        if chat_id is not None:
-            body["chat_id"] = chat_id
-
-        primary = self._current_chat_path()
-
-        if not stream:
-            try:
-                return await self._request("POST", primary, json_body=body)
-            except OWUIClientError as e:
-                if not self._should_try_fallback(e):
-                    raise
-                fallback = self._chat_fallback_path
-                logger.warning(
-                    "Chat completions path %s returned %d (%s); falling back to %s",
-                    primary,
-                    e.status,
-                    _truncate(str(e), 200),
-                    fallback,
-                )
-                result = await self._request("POST", fallback, json_body=body)
-                self._lock_chat_path(fallback)
-                return result
-
-        chunks: list[str] = []
-        async for delta in self._chat_stream(body, primary):
-            chunks.append(delta)
-        return {"choices": [{"message": {"content": "".join(chunks)}}]}
-
-    async def stream_chat_completions(
-        self,
-        model: str,
-        messages: list[dict],
-        *,
-        temperature: float | None = None,
-    ) -> AsyncIterator[str]:
-        body = {"model": model, "messages": messages, "stream": True}
-        if temperature is not None:
-            body["temperature"] = temperature
-        async for delta in self._chat_stream(body, self._current_chat_path()):
-            yield delta
-
-    async def _chat_stream(
-        self,
-        body: dict,
-        primary: str,
-    ) -> AsyncIterator[str]:
-        yielded_any = False
-        try:
-            async for delta in self._request_stream(primary, body):
-                yielded_any = True
-                yield delta
-            return
-        except OWUIClientError as e:
-            if yielded_any or not self._should_try_fallback(e):
-                raise
-            fallback = self._chat_fallback_path
-            logger.warning(
-                "Chat completions path %s returned %d (%s); falling back to %s",
-                primary,
-                e.status,
-                _truncate(str(e), 200),
-                fallback,
-            )
-            locked = False
-            async for delta in self._request_stream(fallback, body):
-                if not locked:
-                    self._lock_chat_path(fallback)
-                    locked = True
-                yield delta
-
-    async def embeddings(self, model: str, inputs: list[str]) -> list[list[float]]:
-        resp = await self._request(
-            "POST",
-            "/api/embeddings",
-            json_body={"model": model, "input": inputs},
-            semaphore=self._embedding_sem,
-        )
-        data = (resp or {}).get("data") or []
-        return [d.get("embedding") or [] for d in data]
-
-    async def list_models(self, refresh: bool = False) -> list[ModelInfo]:
+        Returns the raw list of model dicts from OWUI's /api/v1/models/list.
+        Use ctx.llm.list_models() (LLMProviderClient) for actual model metadata
+        such as context-window sizes; this method is only for liveness checks.
+        """
         resp = await self._request("GET", "/api/v1/models/list")
-        items: list[dict] = []
         if isinstance(resp, dict):
-            items = resp.get("data") or []
-        elif isinstance(resp, list):
-            items = resp
-        models: list[ModelInfo] = []
-        for item in items:
-            meta = item.get("meta") or item.get("details") or {}
-            ctx_window = meta.get("context_length") or meta.get("num_ctx") or None
-            models.append(
-                ModelInfo(
-                    id=item.get("id") or item.get("name", ""),
-                    name=item.get("name", ""),
-                    context_window=ctx_window,
-                    meta=meta,
-                )
-            )
-        return models
+            return resp.get("data") or []
+        if isinstance(resp, list):
+            return resp
+        return []
 
     # ---- Web ----
 
@@ -491,7 +259,7 @@ class OWUIClient:
                     files={"file": (filename, content, "application/octet-stream")},
                 )
                 if resp.status_code >= 400:
-                    raise OWUIClientError(
+                    raise AdapterError(
                         f"POST /api/v1/files/ -> {resp.status_code}",
                         status=resp.status_code,
                     )
@@ -551,7 +319,7 @@ class OWUIClient:
     async def get_chat(self, chat_id: str) -> dict | None:
         try:
             return await self._request("GET", f"/api/v1/chats/{chat_id}")
-        except OWUIClientError as e:
+        except AdapterError as e:
             if e.status == 404:
                 return None
             raise

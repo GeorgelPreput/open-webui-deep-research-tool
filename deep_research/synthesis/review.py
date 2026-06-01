@@ -87,7 +87,7 @@ The find_text must be the EXACT text string as it appears in the document, and t
     async def _run_single_review(window_text: str) -> dict[str, Any]:
         """Run the review prompt against one verbatim context string."""
         msgs = [review_prompt, {"role": "user", "content": window_text}]
-        resp = await ctx.client.chat_completions(
+        resp = await ctx.llm.chat_completions(
             synthesis_model, msgs, stream=False, temperature=review_temperature
         )
         if resp and "choices" in resp and len(resp["choices"]) > 0:

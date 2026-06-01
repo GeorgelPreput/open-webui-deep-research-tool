@@ -387,7 +387,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Use quality filter model
         quality_model = ctx.valves.models.quality_filter_model
 
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             quality_model,
             [relevance_prompt, {"role": "user", "content": context}],
             temperature=ctx.valves.models.temperature

@@ -31,7 +31,7 @@ def classify_transient_completion_error(e: BaseException) -> str | None:
     if isinstance(e, _TRANSIENT_HTTPX_TYPES):
         return f"httpx_type={type(e).__name__}"
     # Duck-typed: any exception carrying a `status` attribute (e.g. the
-    # OWUIClient adapter's OWUIClientError) is inspected for a transient code.
+    # adapter layer's AdapterError) is inspected for a transient code.
     duck_status = getattr(e, "status", None)
     if isinstance(duck_status, int) and duck_status in _TRANSIENT_COMPLETION_CODES:
         return f"http_status={duck_status}"

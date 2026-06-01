@@ -1,22 +1,28 @@
 # Makefile for deep-research
 #
 # Quality/security suite:
+#   make lint      - ruff check on package + tests (matches CI)
+#   make typecheck - mypy on the package (matches CI)
 #   make test      - pytest with coverage (term + xml + html) + end-to-end smoke test
 #   make codeql    - build a CodeQL database for the package and analyze it (SARIF)
 #   make opengrep  - run OpenGrep static analysis (JSON)
 #   make scan      - codeql + opengrep
-#   make all       - test + codeql + opengrep  (full suite)
+#   make all       - lint + typecheck + test + scan (full suite)
 #   make clean     - remove generated reports and caches
 #
-# Scans are informational: they write reports and print a summary but do not
-# fail the build on findings. Test failures DO fail the build.
+# Lint, typecheck, and test failures DO fail the build (same as CI).
+# Security scans (codeql, opengrep) are informational and never fail the target.
 
 # bash is required for the ANSI-C quoted LGTM_INDEX_FILTERS below.
 SHELL := /bin/bash
 
 PYTHON      ?= .venv/bin/python
 PKG         := deep_research
+TESTS       := tests
 REPORTS_DIR := reports
+
+RUFF        ?= $(PYTHON) -m ruff
+MYPY        ?= $(PYTHON) -m mypy
 
 CODEQL         ?= codeql
 CODEQL_DB      := $(REPORTS_DIR)/codeql-db
@@ -28,19 +34,29 @@ OPENGREP_CONFIG := p/python
 OPENGREP_JSON   := $(REPORTS_DIR)/opengrep.json
 
 .DEFAULT_GOAL := help
-.PHONY: all test coverage smoke codeql opengrep scan clean help
+.PHONY: all lint typecheck test coverage smoke codeql opengrep scan clean help
 
 help:
 	@echo "deep-research quality/security targets:"
+	@echo "  make lint      - ruff check on $(PKG)/ and $(TESTS)/"
+	@echo "  make typecheck - mypy on $(PKG)/"
 	@echo "  make test      - pytest + coverage (term/xml/html) and the smoke test"
 	@echo "  make codeql    - CodeQL database build + analysis -> $(CODEQL_SARIF)"
 	@echo "  make opengrep  - OpenGrep static analysis -> $(OPENGREP_JSON)"
 	@echo "  make scan      - codeql + opengrep"
-	@echo "  make all       - test + scan (full suite)"
+	@echo "  make all       - lint + typecheck + test + scan (full suite)"
 	@echo "  make clean     - remove $(REPORTS_DIR)/ and test/coverage caches"
 
 $(REPORTS_DIR):
 	@mkdir -p $(REPORTS_DIR)
+
+# --- Lint -------------------------------------------------------------------
+lint:
+	$(RUFF) check $(PKG)/ $(TESTS)/
+
+# --- Type check -------------------------------------------------------------
+typecheck:
+	$(MYPY) $(PKG)/
 
 # --- Tests + coverage -------------------------------------------------------
 # `coverage` is a convenience alias for `test`.
@@ -83,7 +99,7 @@ opengrep: | $(REPORTS_DIR)
 # --- Aggregates -------------------------------------------------------------
 scan: codeql opengrep
 
-all: test scan
+all: lint typecheck test scan
 	@echo ">> All checks complete. Reports in $(REPORTS_DIR)/"
 
 clean:

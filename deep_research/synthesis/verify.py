@@ -46,7 +46,7 @@ async def verify_citation_batch(ctx, url, citations, source_content):
         verify_context += "\nVerify each citation context against the source content. Provide a JSON array with verification results."
 
         # Generate verification assessment using the research model
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             ctx.valves.models.research_model,
             [verify_prompt, {"role": "user", "content": verify_context}],
             temperature=ctx.valves.models.temperature

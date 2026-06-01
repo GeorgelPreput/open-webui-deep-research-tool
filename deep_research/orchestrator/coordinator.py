@@ -15,7 +15,8 @@ from deep_research.adapter.auth import (
     set_current_token,
 )
 from deep_research.adapter.client import OWUIClient
-from deep_research.config.logging import reset_log_context, set_log_context
+from deep_research.adapter.llm_provider import EmbeddingProviderClient, LLMProviderClient
+from deep_research.config.logging import redact_secret, reset_log_context, set_log_context
 from deep_research.config.valves import Valves
 from deep_research.core.caches import EmbeddingCache, LRUBytesBoundedCache, TransformationCache
 from deep_research.core.state import ResearchStateManager
@@ -41,15 +42,25 @@ class RuntimeConfig:
         self,
         data_dir: str = "/tmp/deep_research",
         base_url: str = "http://localhost:8080",
-        chat_completions_path: str = "/api/chat/completions",
-        chat_completions_fallback_path: str = "",
+        # Chat provider
+        llm_base_url: str = "",
+        llm_api_key: str = "",
+        llm_chat_path: str = "/chat/completions",
+        # Embeddings provider — fully independent of the chat provider
+        embeddings_base_url: str = "",
+        embeddings_api_key: str = "",
+        embeddings_path: str = "/embeddings",
     ):
         # Coerce to Path: the runtime shims pass str (from env), but the
         # vocabulary disk-cache code uses `data_dir / "deep_research"`.
         self.data_dir = Path(data_dir)
         self.base_url = base_url
-        self.chat_completions_path = chat_completions_path
-        self.chat_completions_fallback_path = chat_completions_fallback_path
+        self.llm_base_url = llm_base_url
+        self.llm_api_key = llm_api_key
+        self.llm_chat_path = llm_chat_path
+        self.embeddings_base_url = embeddings_base_url
+        self.embeddings_api_key = embeddings_api_key
+        self.embeddings_path = embeddings_path
 
 
 class CacheBundle:
@@ -80,6 +91,8 @@ class Coordinator:
         self._state_manager = ResearchStateManager()
         self._executor = ThreadPoolExecutor(max_workers=valves.advanced.executor_workers)
         self._client: OWUIClient | None = None
+        self._llm: LLMProviderClient | None = None
+        self._embeddings: EmbeddingProviderClient | None = None
         self._started = False
 
     async def start(self) -> None:
@@ -88,33 +101,78 @@ class Coordinator:
         async with self._start_lock:
             if self._started:
                 return
+            if not self._config.base_url:
+                raise ValueError(
+                    "RuntimeConfig.base_url is required (OWUI base URL for "
+                    "retrieval/files/KB/chats)"
+                )
+            if not self._config.llm_base_url:
+                raise ValueError(
+                    "RuntimeConfig.llm_base_url is required. Set DR_LLM_BASE_URL "
+                    "or valves.llm.base_url to the OpenAI-compatible chat provider base."
+                )
+            if not self._config.llm_api_key:
+                raise ValueError(
+                    "RuntimeConfig.llm_api_key is required. Set DR_LLM_API_KEY "
+                    "or valves.llm.api_key to the chat provider bearer token."
+                )
+            if not self._config.embeddings_base_url:
+                raise ValueError(
+                    "RuntimeConfig.embeddings_base_url is required. Set "
+                    "DR_EMBEDDINGS_BASE_URL or valves.embeddings.base_url to the "
+                    "OpenAI-compatible embedding provider base."
+                )
+            if not self._config.embeddings_api_key:
+                raise ValueError(
+                    "RuntimeConfig.embeddings_api_key is required. Set "
+                    "DR_EMBEDDINGS_API_KEY or valves.embeddings.api_key to the "
+                    "embedding provider bearer token."
+                )
             logger.info(
-                "Coordinator starting: base_url=%s data_dir=%s "
-                "llm_concurrency=%d embedding_concurrency=%d "
-                "http_timeout=%ds http_max_retries=%d "
-                "chat_completions_path=%s chat_completions_fallback_path=%s",
+                "Coordinator starting: owui_base=%s llm_base=%s llm_chat=%s "
+                "llm_key=%s embeddings_base=%s embeddings_path=%s embeddings_key=%s "
+                "data_dir=%s llm_concurrency=%d embedding_concurrency=%d "
+                "http_timeout=%ds http_max_retries=%d",
                 self._config.base_url,
+                self._config.llm_base_url,
+                self._config.llm_chat_path,
+                redact_secret(self._config.llm_api_key),
+                self._config.embeddings_base_url,
+                self._config.embeddings_path,
+                redact_secret(self._config.embeddings_api_key),
                 self._config.data_dir,
                 self._valves.advanced.llm_concurrency,
                 self._valves.advanced.embedding_concurrency,
                 self._valves.advanced.http_timeout_seconds,
                 self._valves.advanced.http_max_retries,
-                self._config.chat_completions_path,
-                self._config.chat_completions_fallback_path or "(disabled)",
             )
             self._client = OWUIClient(
                 base_url=self._config.base_url,
                 token_provider=ContextTokenProvider(),
                 timeout_seconds=self._valves.advanced.http_timeout_seconds,
                 max_retries=self._valves.advanced.http_max_retries,
-                llm_semaphore=asyncio.Semaphore(self._valves.advanced.llm_concurrency),
-                embedding_semaphore=asyncio.Semaphore(self._valves.advanced.embedding_concurrency),
                 search_semaphore=asyncio.Semaphore(self._valves.web.search_concurrency),
                 fetch_semaphore=asyncio.Semaphore(self._valves.web.fetch_concurrency),
-                chat_completions_path=self._config.chat_completions_path,
-                chat_completions_fallback_path=self._config.chat_completions_fallback_path,
+            )
+            self._llm = LLMProviderClient(
+                base_url=self._config.llm_base_url,
+                api_key=self._config.llm_api_key,
+                chat_path=self._config.llm_chat_path,
+                timeout_seconds=self._valves.advanced.http_timeout_seconds,
+                max_retries=self._valves.advanced.http_max_retries,
+                llm_semaphore=asyncio.Semaphore(self._valves.advanced.llm_concurrency),
+            )
+            self._embeddings = EmbeddingProviderClient(
+                base_url=self._config.embeddings_base_url,
+                api_key=self._config.embeddings_api_key,
+                embeddings_path=self._config.embeddings_path,
+                timeout_seconds=self._valves.advanced.http_timeout_seconds,
+                max_retries=self._valves.advanced.http_max_retries,
+                embedding_semaphore=asyncio.Semaphore(self._valves.advanced.embedding_concurrency),
             )
             await self._client.start()
+            await self._llm.start()
+            await self._embeddings.start()
             self._started = True
             logger.info("Coordinator started")
 
@@ -123,6 +181,12 @@ class Coordinator:
         if self._client is not None:
             await self._client.close()
             self._client = None
+        if self._llm is not None:
+            await self._llm.close()
+            self._llm = None
+        if self._embeddings is not None:
+            await self._embeddings.close()
+            self._embeddings = None
         self._executor.shutdown(wait=False)
         self._started = False
 
@@ -224,6 +288,8 @@ class Coordinator:
             valves=self._valves,
             config=self._config,
             client=self._client,
+            llm=self._llm,
+            embeddings=self._embeddings,
             events=event_bus,
             caches=self._shared_caches,
             state=self._state_manager,

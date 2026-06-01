@@ -54,7 +54,7 @@ Format your response as a valid JSON object with the following structure:
 
     # Generate the queries first, without any embedding operations
     try:
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             ctx.valves.models.research_model,
             [query_prompt, message],
             temperature=ctx.valves.models.temperature,
@@ -134,7 +134,7 @@ async def generate_group_query(ctx: RunContext, topic_group, user_message):
 
     # Generate the query
     try:
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             ctx.valves.models.research_model,
             [prompt, message],
             temperature=ctx.valves.models.temperature * 0.7,

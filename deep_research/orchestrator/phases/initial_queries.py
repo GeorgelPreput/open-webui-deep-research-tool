@@ -114,7 +114,7 @@ async def _generate_outline_and_initial(ctx, user_message, summary_embedding=Non
     import json
     system_msg = {"role": "system", "content": "You generate search queries as JSON."}
     user_msg = {"role": "user", "content": prompt_text}
-    response = await ctx.client.chat_completions(
+    response = await ctx.llm.chat_completions(
         ctx.valves.models.research_model,
         [system_msg, user_msg],
         temperature=ctx.valves.models.temperature,
@@ -179,7 +179,7 @@ async def _generate_outline(ctx, user_message, initial_results, is_follow_up):
         "role": "user",
         "content": f"Query: {user_message}\n\nResults:\n{context}\n\nCreate outline.",
     }
-    response = await ctx.client.chat_completions(
+    response = await ctx.llm.chat_completions(
         ctx.valves.models.research_model,
         [prompt, msg],
         temperature=ctx.valves.models.temperature,

@@ -20,8 +20,7 @@ def _build_ctx(valves=None, models_cache=None):
         cb.models = models_cache
     client = OWUIClient(
         base_url="http://x", token_provider=StaticToken("t"), timeout_seconds=1,
-        max_retries=1, llm_semaphore=asyncio.Semaphore(1),
-        embedding_semaphore=asyncio.Semaphore(1),
+        max_retries=1,
         search_semaphore=asyncio.Semaphore(1),
         fetch_semaphore=asyncio.Semaphore(1),
     )
@@ -29,7 +28,7 @@ def _build_ctx(valves=None, models_cache=None):
         user=RunUser(id="u", name="u"),
         conversation_id=str(uuid.uuid4()),
         chat_id=None, request_id="r", run_id="r",
-        valves=v, config=cfg, client=client,
+        valves=v, config=cfg, client=client, llm=None, embeddings=None,
         events=None, caches=cb, state=ResearchStateManager(),
         executor=None, mode=ResearchMode.FRESH, started_at=time.monotonic(),
     )

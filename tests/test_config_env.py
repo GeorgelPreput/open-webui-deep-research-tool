@@ -71,3 +71,143 @@ def test_env_loader_picks_up_logging_group(monkeypatch):
     assert valves.logging.level == "DEBUG"
     assert valves.logging.format == "json"
     assert valves.logging.include_tracebacks is False
+
+
+# ---- LLM provider env loading ----
+
+def test_env_loader_picks_up_llm_group(monkeypatch):
+    monkeypatch.setenv("DR_LLM_BASE_URL", "http://my-llm:8000")
+    monkeypatch.setenv("DR_LLM_API_KEY", "sk-abc123")
+    monkeypatch.setenv("DR_LLM_CHAT_PATH", "/v1/chat/completions")
+    valves = load_valves_from_env()
+    assert valves.llm.base_url == "http://my-llm:8000"
+    assert valves.llm.api_key == "sk-abc123"
+    assert valves.llm.chat_path == "/v1/chat/completions"
+
+
+def test_env_loader_llm_defaults(monkeypatch):
+    for key in ("DR_LLM_BASE_URL", "DR_LLM_API_KEY", "DR_LLM_CHAT_PATH"):
+        monkeypatch.delenv(key, raising=False)
+    valves = load_valves_from_env()
+    assert valves.llm.base_url == ""
+    assert valves.llm.api_key == ""
+    assert valves.llm.chat_path == "/chat/completions"
+
+
+def test_env_loader_picks_up_embeddings_group(monkeypatch):
+    monkeypatch.setenv("DR_EMBEDDINGS_BASE_URL", "http://my-emb:9000")
+    monkeypatch.setenv("DR_EMBEDDINGS_API_KEY", "sk-emb")
+    monkeypatch.setenv("DR_EMBEDDINGS_EMBEDDINGS_PATH", "/v1/embeddings")
+    valves = load_valves_from_env()
+    assert valves.embeddings.base_url == "http://my-emb:9000"
+    assert valves.embeddings.api_key == "sk-emb"
+    assert valves.embeddings.embeddings_path == "/v1/embeddings"
+
+
+def test_env_loader_embeddings_defaults(monkeypatch):
+    for key in ("DR_EMBEDDINGS_BASE_URL", "DR_EMBEDDINGS_API_KEY", "DR_EMBEDDINGS_EMBEDDINGS_PATH"):
+        monkeypatch.delenv(key, raising=False)
+    valves = load_valves_from_env()
+    assert valves.embeddings.base_url == ""
+    assert valves.embeddings.api_key == ""
+    assert valves.embeddings.embeddings_path == "/embeddings"
+
+
+def test_embeddings_api_key_redacted_in_summary(monkeypatch, caplog):
+    import logging
+    monkeypatch.setenv("DR_EMBEDDINGS_BASE_URL", "http://emb:9000")
+    monkeypatch.setenv("DR_EMBEDDINGS_API_KEY", "sk-emb-secret")
+    with caplog.at_level(logging.DEBUG, logger="deep_research.config.env"):
+        load_valves_from_env()
+    assert "sk-emb-secret" not in caplog.text
+    assert any("embeddings" in r.message.lower() for r in caplog.records)
+
+
+def test_llm_api_key_redacted_in_summary(monkeypatch, caplog):
+    import logging
+    monkeypatch.setenv("DR_LLM_BASE_URL", "http://llm:8000")
+    monkeypatch.setenv("DR_LLM_API_KEY", "sk-supersecret")
+    with caplog.at_level(logging.DEBUG, logger="deep_research.config.env"):
+        load_valves_from_env()
+    assert "sk-supersecret" not in caplog.text
+    assert any("llm" in r.message.lower() for r in caplog.records)
+
+
+# ---- Coordinator fail-fast on missing LLM config ----
+
+@pytest.mark.asyncio
+async def test_coordinator_fails_fast_without_llm_base_url():
+    from deep_research import Coordinator
+    from deep_research.config.valves import Valves
+    from deep_research.orchestrator.coordinator import RuntimeConfig
+
+    config = RuntimeConfig(
+        data_dir="/tmp/dr_test",
+        base_url="http://owui:8080",
+        llm_base_url="",
+        llm_api_key="sk-x",
+        embeddings_base_url="http://emb:9000",
+        embeddings_api_key="sk-emb",
+    )
+    coord = Coordinator(valves=Valves(), config=config)
+    with pytest.raises(ValueError, match="llm_base_url"):
+        await coord.start()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_fails_fast_without_llm_api_key():
+    from deep_research import Coordinator
+    from deep_research.config.valves import Valves
+    from deep_research.orchestrator.coordinator import RuntimeConfig
+
+    config = RuntimeConfig(
+        data_dir="/tmp/dr_test",
+        base_url="http://owui:8080",
+        llm_base_url="http://llm:8000",
+        llm_api_key="",
+        embeddings_base_url="http://emb:9000",
+        embeddings_api_key="sk-emb",
+    )
+    coord = Coordinator(valves=Valves(), config=config)
+    with pytest.raises(ValueError, match="llm_api_key"):
+        await coord.start()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_fails_fast_without_embeddings_base_url():
+    from deep_research import Coordinator
+    from deep_research.config.valves import Valves
+    from deep_research.orchestrator.coordinator import RuntimeConfig
+
+    config = RuntimeConfig(
+        data_dir="/tmp/dr_test",
+        base_url="http://owui:8080",
+        llm_base_url="http://llm:8000",
+        llm_api_key="sk-x",
+        embeddings_base_url="",
+        embeddings_api_key="sk-emb",
+    )
+    coord = Coordinator(valves=Valves(), config=config)
+    with pytest.raises(ValueError, match="embeddings_base_url"):
+        await coord.start()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_fails_fast_without_embeddings_api_key():
+    from deep_research import Coordinator
+    from deep_research.config.valves import Valves
+    from deep_research.orchestrator.coordinator import RuntimeConfig
+
+    config = RuntimeConfig(
+        data_dir="/tmp/dr_test",
+        base_url="http://owui:8080",
+        llm_base_url="http://llm:8000",
+        llm_api_key="sk-x",
+        embeddings_base_url="http://emb:9000",
+        embeddings_api_key="",
+    )
+    coord = Coordinator(valves=Valves(), config=config)
+    with pytest.raises(ValueError, match="embeddings_api_key"):
+        await coord.start()
+
+

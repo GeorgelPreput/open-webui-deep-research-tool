@@ -54,7 +54,7 @@ async def identify_and_correlate_citations(
     # Generate identification and correlation
     try:
         # Use research model for citation identification with appropriate temperature
-        citation_response = await ctx.client.chat_completions(
+        citation_response = await ctx.llm.chat_completions(
             ctx.valves.models.research_model,
             [citation_prompt, {"role": "user", "content": citation_context}],
             temperature=ctx.valves.models.temperature

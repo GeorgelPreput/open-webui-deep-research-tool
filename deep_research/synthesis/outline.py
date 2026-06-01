@@ -158,7 +158,7 @@ The goal is to create a refined outline reflecting a logical narrative and infor
 
         # Use synthesis model for this task
         synthesis_model = get_synthesis_model(ctx)
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             synthesis_model, messages, temperature=ctx.valves.models.synthesis_temperature
         )
         outline_content = response_text(response)

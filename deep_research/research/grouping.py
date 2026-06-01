@@ -151,7 +151,7 @@ Respond with ONLY the title (4-8 words).""",
 
     # Generate the title
     try:
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             ctx.valves.models.research_model,
             [title_prompt, message],
             temperature=0.7,
@@ -320,7 +320,7 @@ Please don't include any other text in your response but the replacement topics.
         # Generate replacements
         # Use research model for generating replacements
         research_model = ctx.valves.models.research_model
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             research_model,
             messages,
             temperature=ctx.valves.models.temperature

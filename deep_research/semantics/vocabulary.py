@@ -175,7 +175,7 @@ async def load_vocabulary_embeddings(ctx: RunContext) -> dict[str, list[float]]:
             embedding_model = ctx.valves.models.embedding_model
             for i in range(0, len(vocab), batch_size):
                 batch = vocab[i : i + batch_size]
-                batch_result = await ctx.client.embeddings(embedding_model, batch)
+                batch_result = await ctx.embeddings.embeddings(embedding_model, batch)
                 all_embeddings.extend(batch_result)
 
             _vocabulary_embeddings = {

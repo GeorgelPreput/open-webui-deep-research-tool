@@ -44,8 +44,6 @@ async def owui_client(valves: Valves):
         token_provider=StaticToken("mock-token"),
         timeout_seconds=10,
         max_retries=1,
-        llm_semaphore=asyncio.Semaphore(4),
-        embedding_semaphore=asyncio.Semaphore(8),
         search_semaphore=asyncio.Semaphore(2),
         fetch_semaphore=asyncio.Semaphore(4),
     )
@@ -91,6 +89,8 @@ async def run_context(
         valves=valves,
         config=runtime_config,
         client=owui_client,
+        llm=None,
+        embeddings=None,
         events=event_bus,
         caches=cache_bundle,
         state=state_manager,

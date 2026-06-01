@@ -12,7 +12,7 @@ def get_model_context_window(ctx: RunContext, model: str) -> int:
     """Return the configured context window for *model*.
 
     Resolution order: per-model override valve → cached ModelInfo from
-    OWUI list_models → fallback 8192. The fallback matches the plan's
+    LLM provider list_models → fallback 8192. The fallback matches the plan's
     B.2 auto-detect rule and is intentionally conservative.
     """
     if model == ctx.valves.models.synthesis_model:

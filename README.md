@@ -11,7 +11,7 @@ The same core ships in four runtimes:
 | **OpenAPI Tool server** | Anything that can call HTTP + SSE — non-OWUI clients, internal services, CI jobs. |
 | **MCP server** | Anything that speaks Streamable-HTTP MCP — Claude Desktop, Cline, an MCP-aware orchestrator. |
 
-All four runtimes call back into Open WebUI over its REST API (`/api/chat/completions`, `/api/embeddings`, `/api/v1/retrieval/*`, `/api/v1/files/*`, `/api/v1/knowledge/*`, `/api/v1/chats/*`). There are no `open_webui.*` Python imports anywhere in the package — Open WebUI is treated purely as a remote service.
+All four runtimes talk to three independently configured services: an **OpenAI-compatible chat LLM provider** (`/chat/completions`, `/models`), an **OpenAI-compatible embeddings provider** (`/embeddings`), and **Open WebUI** (`/api/v1/retrieval/*`, `/api/v1/files/*`, `/api/v1/knowledge/*`, `/api/v1/chats/*`) for search, retrieval, knowledge-base management, and chat persistence. Chat and embeddings each have their own base URL, bearer token, and path so they can point at the same backend or at different providers (e.g. chat at OpenAI, embeddings at a local Ollama). There are no `open_webui.*` Python imports anywhere in the package — all three services are treated purely as remote HTTP APIs.
 
 > Core algorithms (semantic eigendecomposition, multi-cycle research dimensions, preference direction vectors, gap-vector exploration) are adapted from [atineiatte/deep-research-at-home](https://github.com/atineiatte/deep-research-at-home). The packaging, runtime split, REST adapter, event bus, and persistence layer are this project's contributions.
 
@@ -78,7 +78,11 @@ services:
     environment:
       PIPELINES_API_KEY: "0p3n-w3bu!"
       DR_OWUI_BASE_URL: "http://open-webui:8080"
-      DR_OWUI_API_KEY: "sk-..."
+      DR_OWUI_API_KEY: "sk-owui-admin-key"
+      DR_LLM_BASE_URL: "http://open-webui:8080/openai"   # or your chat provider URL
+      DR_LLM_API_KEY: "sk-llm-key"
+      DR_EMBEDDINGS_BASE_URL: "http://open-webui:8080/openai"  # or a separate embedding provider
+      DR_EMBEDDINGS_API_KEY: "sk-emb-key"
     volumes:
       - ./deep_research:/app/pipelines/pipelines/deep_research
       - ./deep_research/entrypoints/owui_pipeline/pipeline.py:/app/pipelines/pipelines/deep_research_pipeline.py
@@ -97,7 +101,11 @@ Standalone REST service that exposes `POST /research` (SSE stream) and `GET /hea
 docker build -t deep-research-openapi -f deep_research/entrypoints/openapi_tool/Dockerfile .
 docker run -p 8000:8000 \
   -e DR_OWUI_BASE_URL=http://host.docker.internal:8080 \
-  -e DR_OWUI_API_KEY=sk-... \
+  -e DR_OWUI_API_KEY=sk-owui-admin-key \
+  -e DR_LLM_BASE_URL=http://host.docker.internal:8080/openai \
+  -e DR_LLM_API_KEY=sk-llm-key \
+  -e DR_EMBEDDINGS_BASE_URL=http://host.docker.internal:8080/openai \
+  -e DR_EMBEDDINGS_API_KEY=sk-emb-key \
   -e DR_DATA_DIR=/data/deep_research \
   -v dr-data:/data/deep_research \
   deep-research-openapi
@@ -117,7 +125,11 @@ curl -N http://localhost:8000/research \
 docker build -t deep-research-mcp -f deep_research/entrypoints/mcp/Dockerfile .
 docker run -p 9000:9000 \
   -e DR_OWUI_BASE_URL=http://host.docker.internal:8080 \
-  -e DR_OWUI_API_KEY=sk-... \
+  -e DR_OWUI_API_KEY=sk-owui-admin-key \
+  -e DR_LLM_BASE_URL=http://host.docker.internal:8080/openai \
+  -e DR_LLM_API_KEY=sk-llm-key \
+  -e DR_EMBEDDINGS_BASE_URL=http://host.docker.internal:8080/openai \
+  -e DR_EMBEDDINGS_API_KEY=sk-emb-key \
   -v dr-data:/data/deep_research \
   deep-research-mcp
 ```
@@ -134,7 +146,13 @@ from deep_research.core.types import RunUser
 from deep_research.orchestrator.coordinator import RuntimeConfig
 
 async def main():
-    coord = Coordinator(valves=Valves(), config=RuntimeConfig(data_dir="/tmp/dr"))
+    coord = Coordinator(valves=Valves(), config=RuntimeConfig(
+        data_dir="/tmp/dr",
+        llm_base_url="http://localhost:11434",     # chat provider
+        llm_api_key="ollama",
+        embeddings_base_url="http://localhost:11434",  # can be the same host or a different one
+        embeddings_api_key="ollama",
+    ))
     await coord.start()
     try:
         async def sink(event): print(event)
@@ -160,29 +178,53 @@ asyncio.run(main())
 
 Every knob is grouped on the `Valves` Pydantic model. In OWUI runtimes (Function / Pipelines) the groups render as nested forms in the admin UI. In Docker runtimes (OpenAPI Tool / MCP), valves are populated from environment variables with the `DR_<GROUP>_<FIELD>` convention, e.g. `DR_MODELS_RESEARCH_MODEL=gemma3:27b`.
 
-### OWUI route compatibility
+### LLM and Embedding provider configuration
 
-Deep Research calls chat completions at `/api/chat/completions` by default. Some OWUI deployments return `400 {"detail":"'NoneType' object has no attribute 'startswith'"}` from that route (and from `/api/v1/chat/completions`) while `/openai/chat/completions` works correctly with the same key and model. Override the route, or enable a one-shot fallback:
+Deep Research sends chat completions and embeddings to **two independently configured OpenAI-compatible providers** — each with its own base URL, bearer token, and path. They can point at the same backend (e.g. both at OWUI's `/openai` proxy with the same key) or at different backends (chat at OpenAI, embeddings at a local Ollama). Neither is required to live on the same host as OWUI.
 
-| Env var | Default | Purpose |
-|---|---|---|
-| `DR_OWUI_CHAT_COMPLETIONS_PATH` | `/api/chat/completions` | Primary chat completions route. Set to `/openai/chat/completions` on deployments where the default 400s. |
-| `DR_OWUI_CHAT_COMPLETIONS_FALLBACK_PATH` | `""` (disabled) | If set, retried once when the primary route returns 404 or the `'NoneType'…'startswith'` 400 signature; the working path is then locked for the rest of the client's lifetime. Unrelated 400s (e.g. model-not-found) do **not** trigger fallback. |
+#### Chat provider
 
-Compatibility matrix:
+| Env var | Default | Required | Notes |
+|---|---|---|---|
+| `DR_LLM_BASE_URL` | _(none)_ | **yes** | Base URL for the chat provider, without a trailing slash. E.g. `http://ollama:11434` or `https://api.openai.com/v1`. |
+| `DR_LLM_API_KEY` | _(none)_ | **yes** | Bearer token sent on every chat completion and `/models` request. |
+| `DR_LLM_CHAT_PATH` | `/chat/completions` | no | Path appended to `DR_LLM_BASE_URL` for chat completions. |
 
-| OWUI deployment | Working route |
-|---|---|
-| Default | `/api/chat/completions` |
-| Some self-hosted / LiteLLM-fronted setups | `/openai/chat/completions` |
+#### Embeddings provider
 
-Embeddings, retrieval, files, and KB endpoints are unchanged across deployments.
+| Env var | Default | Required | Notes |
+|---|---|---|---|
+| `DR_EMBEDDINGS_BASE_URL` | _(none)_ | **yes** | Base URL for the embeddings provider, without a trailing slash. |
+| `DR_EMBEDDINGS_API_KEY` | _(none)_ | **yes** | Bearer token sent on every embeddings request. Can differ from `DR_LLM_API_KEY`. |
+| `DR_EMBEDDINGS_EMBEDDINGS_PATH` | `/embeddings` | no | Path appended to `DR_EMBEDDINGS_BASE_URL`. The doubled `EMBEDDINGS_` follows the `DR_<GROUP>_<FIELD>` env-var convention used by all valve groups. |
+
+#### Example configurations
+
+**Same backend for both (simple case — OWUI's openai proxy):**
+```bash
+DR_LLM_BASE_URL=http://owui:8080/openai
+DR_LLM_API_KEY=sk-your-owui-key
+DR_EMBEDDINGS_BASE_URL=http://owui:8080/openai
+DR_EMBEDDINGS_API_KEY=sk-your-owui-key
+```
+
+**Different backends (chat at OpenAI, embeddings at local Ollama):**
+```bash
+DR_LLM_BASE_URL=https://api.openai.com/v1
+DR_LLM_API_KEY=sk-openai-...
+DR_EMBEDDINGS_BASE_URL=http://ollama:11434
+DR_EMBEDDINGS_API_KEY=ollama         # Ollama ignores the key; any non-empty value works
+```
+
+If any of `DR_LLM_BASE_URL`, `DR_LLM_API_KEY`, `DR_EMBEDDINGS_BASE_URL`, or `DR_EMBEDDINGS_API_KEY` is missing at startup, the Coordinator raises `ValueError` immediately rather than failing mid-request.
 
 ### Valve groups
 
 | Group | Fields |
 |---|---|
-| `models` | `research_model`, `synthesis_model`, `quality_filter_model`, `research_context_window` (override; `None` = auto-detect from `/api/v1/models/list`), `synthesis_context_window`, `temperature`, `synthesis_temperature` |
+| `llm` | `base_url` (required), `api_key` (required), `chat_path` (`/chat/completions`) |
+| `embeddings` | `base_url` (required), `api_key` (required), `embeddings_path` (`/embeddings`) |
+| `models` | `research_model`, `synthesis_model`, `quality_filter_model`, `research_context_window` (override; `None` = auto-detect via `GET {llm_base}/models`), `synthesis_context_window`, `temperature`, `synthesis_temperature` |
 | `cycles` | `min_cycles` (10), `max_cycles` (15), `gap_exploration_weight` (0.4), `trajectory_momentum` (0.6), `followup_weight` (0.5) |
 | `web` | `search_results_per_query` (3), `successful_results_per_query` (1), `extra_results_per_query` (3), `repeats_before_expansion` (3), `max_result_tokens` (4000), `domain_priority`, `content_priority`, `quality_filter_enabled` (True), `quality_similarity_threshold` (0.60), `fetch_concurrency` (4), `search_concurrency` (2) |
 | `compression` | `chunk_level` (2), `compression_level` (4), `stepped_synthesis_compression` (True) |
@@ -208,37 +250,49 @@ Configure via env (shorthand) or valves (long form). Precedence: explicit valve 
 Every record carries the active `conversation_id`, `chat_id`, `run_id`, and `request_id` (propagated via `contextvars`, surfaced as record fields in both formats). API keys and bearer tokens are redacted to first 4 + last 4 (`sk-a…0xyz`) wherever they would otherwise appear in logs; values under 9 characters render as `********`.
 
 At `DEBUG` level you get:
-- Coordinator startup with model IDs and concurrency settings.
+- Coordinator startup: effective chat base URL, embeddings base URL, OWUI base URL, all paths, and both LLM and embeddings keys redacted (`sk-a…0xyz`).
 - Each of the 9 research phases — `Phase start: <name>` / `Phase done: <name> elapsed_s=…` / `Phase failed: <name>` with traceback.
-- Every OWUI HTTP call: method, path, model id, body keys, status, elapsed time. Non-2xx responses include a 500-char truncated body — exactly the place the K8s-sidecar `400: 'NoneType' object has no attribute 'startswith'` failures surface. Set `DR_OWUI_CHAT_COMPLETIONS_PATH=/openai/chat/completions` (or enable `DR_OWUI_CHAT_COMPLETIONS_FALLBACK_PATH`) for OWUI instances that route LLM calls under `/openai/`.
+- Every HTTP call from all three clients. `LLMProviderClient` and `EmbeddingProviderClient` share the `deep_research.adapter.llm_provider` logger (they live in the same module); `OWUIClient` logs under `deep_research.adapter.client`. Each line carries method, path, model id, body keys, status, elapsed time. Non-2xx responses include a 500-char truncated body.
 - Each retry attempt from `adapter/retry.py` with attempt number, delay, classified reason, and exception type.
 
 Example for the OpenAPI Tool runtime:
 
 ```bash
 DR_LOG_LEVEL=DEBUG DR_LOG_FORMAT=text \
-  DR_OWUI_BASE_URL=http://owui:8080 DR_OWUI_API_KEY=sk-xxxxxxxx \
+  DR_OWUI_BASE_URL=http://owui:8080 DR_OWUI_API_KEY=sk-owui-key \
+  DR_LLM_BASE_URL=http://owui:8080/openai DR_LLM_API_KEY=sk-llm-key \
+  DR_EMBEDDINGS_BASE_URL=http://ollama:11434 DR_EMBEDDINGS_API_KEY=ollama \
   uvicorn deep_research.entrypoints.openapi_tool.server:app --port 8000
 ```
 
-Sample of one failing chat-completions call:
+Sample startup, one chat call, one embeddings call:
 
 ```
+2026-06-01 12:00:04,891 INFO deep_research.orchestrator Coordinator starting: owui_base=http://owui:8080 llm_base=http://owui:8080/openai llm_chat=/chat/completions llm_key=sk-ll…m-key embeddings_base=http://ollama:11434 embeddings_path=/embeddings embeddings_key=oll…lama
 2026-06-01 12:00:05,002 INFO deep_research.orchestrator [conv=api_abc run=r-9f req=req-77] Run started: conversation_id=api_abc prompt_chars=128
-2026-06-01 12:00:05,003 INFO deep_research.orchestrator [conv=api_abc run=r-9f req=req-77] Phase start: outline_feedback
-2026-06-01 12:00:05,051 DEBUG deep_research.adapter.client [conv=api_abc run=r-9f req=req-77] HTTP POST /api/chat/completions body_keys=['model', 'messages', 'stream', 'temperature'] model=gemma3:12b
-2026-06-01 12:00:05,402 WARNING deep_research.adapter.client [conv=api_abc run=r-9f req=req-77] HTTP POST /api/chat/completions -> 400 model=gemma3:12b elapsed_s=0.35 body={"detail":"'NoneType' object has no attribute 'startswith'"}
+2026-06-01 12:00:05,051 DEBUG deep_research.adapter.llm_provider [conv=api_abc run=r-9f req=req-77] HTTP POST /chat/completions body_keys=['model', 'messages', 'stream', 'temperature'] model=gemma3:12b
+2026-06-01 12:00:06,210 DEBUG deep_research.adapter.llm_provider [conv=api_abc run=r-9f req=req-77] HTTP POST /chat/completions -> 200 in 1.16s
+2026-06-01 12:00:06,251 DEBUG deep_research.adapter.llm_provider [conv=api_abc run=r-9f req=req-77] HTTP POST /embeddings body_keys=['model', 'input'] model=nomic-embed-text
+2026-06-01 12:00:06,332 DEBUG deep_research.adapter.llm_provider [conv=api_abc run=r-9f req=req-77] HTTP POST /embeddings -> 200 in 0.08s
 ```
 
 For structured ingestion (Loki, ELK, Datadog) set `DR_LOG_FORMAT=json` — each line is a JSON object with `ts`, `level`, `logger`, `message`, `conversation_id`, `chat_id`, `run_id`, `request_id`, and optional `exception`.
 
 ### Required environment variables (Docker runtimes only)
 
-| Var | Default | Notes |
-|---|---|---|
-| `DR_OWUI_BASE_URL` | `http://localhost:8080` | URL the runtime uses to reach Open WebUI. |
-| `DR_OWUI_API_KEY` | _empty_ | Admin `sk-...` token. Must own the chats you want to persist into. See [Chat persistence caveat](#chat-persistence-caveat). |
-| `DR_DATA_DIR` | `/data/deep_research` | Where vocab embeddings, transformation caches, and checkpoints are written. Mount a volume. |
+Deep Research uses three independently configured backends: chat provider, embeddings provider, and OWUI. Each has its own base URL and key — they can all point at the same host or at three different hosts.
+
+| Var | Default | Required | Notes |
+|---|---|---|---|
+| `DR_LLM_BASE_URL` | _(none)_ | **yes** | Base URL for the chat provider. |
+| `DR_LLM_API_KEY` | _(none)_ | **yes** | Bearer token for the chat provider. |
+| `DR_LLM_CHAT_PATH` | `/chat/completions` | no | Chat completions path. |
+| `DR_EMBEDDINGS_BASE_URL` | _(none)_ | **yes** | Base URL for the embeddings provider. |
+| `DR_EMBEDDINGS_API_KEY` | _(none)_ | **yes** | Bearer token for the embeddings provider. |
+| `DR_EMBEDDINGS_EMBEDDINGS_PATH` | `/embeddings` | no | Embeddings path. |
+| `DR_OWUI_BASE_URL` | `http://localhost:8080` | **yes** | URL of the Open WebUI instance (retrieval, files, KB, chat persistence). |
+| `DR_OWUI_API_KEY` | _empty_ | **yes** | Admin `sk-...` token for OWUI APIs. Must own the chats you want to persist into. See [Chat persistence caveat](#chat-persistence-caveat). |
+| `DR_DATA_DIR` | `/data/deep_research` | no | Where vocab embeddings, transformation caches, and checkpoints are written. Mount a volume. |
 
 The OWUI Function runtime uses the caller's `Authorization` header by default and falls back to `DR_OWUI_API_KEY` only when no header is present.
 
@@ -246,7 +300,7 @@ The OWUI Function runtime uses the caller's `Authorization` header by default an
 
 Use the **exact ID OWUI registers in Settings → Models**, not the value shown in Documents → Embedding Model. Models behind an OpenAI-compatible connection with a configured `prefix_id` show up as `{prefix_id}.{model_id}`. Ollama and Infinity-style providers expose IDs containing slashes — keep the slash.
 
-If you set a non-existent ID in `models.research_model` you'll get `Model not found` from `/api/embeddings` on the first cycle. The fix is always: list registered IDs with `GET /api/models` and copy verbatim.
+If you set a non-existent ID in `models.research_model` you'll get `Model not found` on the first embedding call. The fix is always: list registered IDs (e.g. `GET {DR_LLM_BASE_URL}/models`) and copy verbatim.
 
 ---
 
@@ -285,18 +339,21 @@ If `interactive_research=False`, step 1 runs straight through into research cycl
 ## Architecture in one diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Open WebUI (any 0.9.2+ instance)                                   │
-│  • /api/chat/completions   • /api/v1/retrieval/*                    │
-│  • /api/embeddings         • /api/v1/files/*                        │
-│                            • /api/v1/knowledge/*                    │
-└─────────────────▲───────────────────────────────────────────────────┘
-                  │ httpx (OWUIClient — the SOLE host adapter)
-                  │
-┌─────────────────┴───────────────────────────────────────────────────┐
-│                                                                     │
-│   deep_research/                                                    │
-│   ├── adapter/    OWUIClient, httpx, retries, semaphores            │
+┌─────────────────────────┐  ┌──────────────────────┐  ┌─────────────────────────────┐
+│  Chat provider          │  │  Embeddings provider │  │  Open WebUI (0.9.2+)        │
+│  (OpenAI-compatible)    │  │  (OpenAI-compatible) │  │  • /api/v1/retrieval/*      │
+│  • /chat/completions    │  │  • /embeddings       │  │  • /api/v1/files/*          │
+│  • /models              │  │                      │  │  • /api/v1/knowledge/*      │
+└────────────▲────────────┘  └──────────▲───────────┘  │  • /api/v1/chats/*          │
+             │                          │              └────────────▲────────────────┘
+             │ httpx                    │ httpx                     │ httpx
+             │ (LLMProviderClient)      │ (EmbeddingProviderClient) │ (OWUIClient)
+             │                          │                           │
+┌────────────┴──────────────────────────┴───────────────────────────┴──────────────┐
+│                                                                                   │
+│   deep_research/                                                                  │
+│   ├── adapter/    LLMProviderClient, EmbeddingProviderClient, OWUIClient,        │
+│   │               httpx, retries, semaphores                                      │
 │   ├── core/       caches, state manager, types, errors, text utils  │
 │   ├── config/     Valves, constants, env loader                     │
 │   ├── semantics/  embeddings, vocabulary, eigendecomp, dimensions,  │
@@ -319,10 +376,10 @@ If `interactive_research=False`, step 1 runs straight through into research cycl
 │       ├── openapi_tool/server.py       # FastAPI + SSE              │
 │       └── mcp/server.py                # FastMCP Streamable-HTTP    │
 │                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Every request that hits a runtime instantiates a fresh `RunContext` (per-call, never shared). The Coordinator is process-shared, the OWUIClient HTTP session is process-shared, the embedding/transformation/vocabulary caches are process-shared and lock-protected. Two concurrent `.run()` calls for the same `(user_id, conversation_id)` are rejected with `AlreadyRunningError` — the same dedupe semantics as the original `pipe.py`.
+Every request that hits a runtime instantiates a fresh `RunContext` (per-call, never shared). The Coordinator is process-shared; both `LLMProviderClient` and `OWUIClient` HTTP sessions are process-shared. The embedding/transformation/vocabulary caches are process-shared and lock-protected. Two concurrent `.run()` calls for the same `(user_id, conversation_id)` are rejected with `AlreadyRunningError` — the same dedupe semantics as the original `pipe.py`.
 
 ---
 
@@ -364,7 +421,11 @@ codeql database analyze /tmp/dr-db codeql/python-queries --format=sarif-latest -
 
 | Symptom | Likely cause |
 |---|---|
-| `Model not found` on first embedding call | `models.research_model` doesn't match a registered OWUI model ID — copy from Settings → Models exactly (with any `prefix_id.` prefix). |
+| `ValueError: llm_base_url is required` on startup | `DR_LLM_BASE_URL` is unset. Set it to your chat provider's base URL. |
+| `ValueError: llm_api_key is required` on startup | `DR_LLM_API_KEY` is unset. Set it to the bearer token for your chat provider. |
+| `ValueError: embeddings_base_url is required` on startup | `DR_EMBEDDINGS_BASE_URL` is unset. Set it to your embeddings provider's base URL (can equal `DR_LLM_BASE_URL`). |
+| `ValueError: embeddings_api_key is required` on startup | `DR_EMBEDDINGS_API_KEY` is unset. Set it to the bearer token for your embeddings provider (can equal `DR_LLM_API_KEY`). |
+| `Model not found` on first embedding call | `models.research_model` doesn't match a model registered at `DR_LLM_BASE_URL` — list available IDs with `GET {DR_LLM_BASE_URL}/models` and copy verbatim (with any `prefix_id.` prefix). |
 | Function appears in OWUI but every run fails with `OWUIClient not started` | The Function wasn't instantiated through the shim path — check that the wheel installed cleanly and that `from deep_research import Coordinator` resolves inside the OWUI container. |
 | Pipelines runtime hangs on first request | `DR_OWUI_BASE_URL` unreachable from the Pipelines container; check intra-network DNS (use the OWUI service name, not `localhost`). |
 | Stacked progress embeds on chat reload | OWUI < 0.9.5; the `replace` flag is ignored. Upgrade OWUI or live with the visual clutter on reload (live runs are unaffected). |

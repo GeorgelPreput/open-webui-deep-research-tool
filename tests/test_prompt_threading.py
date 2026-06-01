@@ -13,7 +13,12 @@ from deep_research.orchestrator.coordinator import RuntimeConfig
 
 @pytest.mark.asyncio
 async def test_build_context_stores_prompt_and_history(tmp_path):
-    cfg = RuntimeConfig()
+    cfg = RuntimeConfig(
+        llm_base_url="http://mock-llm:9090",
+        llm_api_key="sk-test",
+        embeddings_base_url="http://mock-emb:9091",
+        embeddings_api_key="sk-emb",
+    )
     cfg.data_dir = tmp_path
     coord = Coordinator(valves=Valves(), config=cfg)
     await coord.start()
@@ -36,7 +41,12 @@ async def test_build_context_stores_prompt_and_history(tmp_path):
 
 @pytest.mark.asyncio
 async def test_post_report_branch_uses_prompt_and_skips_cycles(tmp_path, monkeypatch):
-    cfg = RuntimeConfig()
+    cfg = RuntimeConfig(
+        llm_base_url="http://mock-llm:9090",
+        llm_api_key="sk-test",
+        embeddings_base_url="http://mock-emb:9091",
+        embeddings_api_key="sk-emb",
+    )
     cfg.data_dir = tmp_path
     coord = Coordinator(valves=Valves(), config=cfg)
     await coord.start()
@@ -84,7 +94,12 @@ async def test_post_report_branch_uses_prompt_and_skips_cycles(tmp_path, monkeyp
 
 @pytest.mark.asyncio
 async def test_concurrent_start_creates_single_client(tmp_path):
-    cfg = RuntimeConfig()
+    cfg = RuntimeConfig(
+        llm_base_url="http://mock-llm:9090",
+        llm_api_key="sk-test",
+        embeddings_base_url="http://mock-emb:9091",
+        embeddings_api_key="sk-emb",
+    )
     cfg.data_dir = tmp_path
     coord = Coordinator(valves=Valves(), config=cfg)
     try:

@@ -50,7 +50,7 @@ async def extract_topic_relevant_info(ctx: RunContext, results, topics) -> str:
 
     # Extract relevant information
     try:
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             ctx.valves.models.research_model,
             extraction_messages,
             temperature=ctx.valves.models.temperature
@@ -106,7 +106,7 @@ You do not need to include justification along with your refined topics.""",
 
     # Generate refined topics
     try:
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             ctx.valves.models.research_model,
             refine_messages,
             temperature=ctx.valves.models.temperature

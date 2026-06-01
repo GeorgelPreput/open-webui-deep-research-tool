@@ -64,6 +64,8 @@ class RunContext:
     valves: Any
     config: Any
     client: Any
+    llm: Any
+    embeddings: Any
     events: Any
     caches: Any
     state: Any

@@ -20,7 +20,7 @@ async def get_embedding(ctx: RunContext, text: str) -> list[float] | None:
 
     try:
         model = ctx.valves.models.embedding_model
-        result = await ctx.client.embeddings(model, [text])
+        result = await ctx.embeddings.embeddings(model, [text])
         embedding = result[0] if result else None
         if embedding:
             await ctx.caches.embedding.set(text, embedding)

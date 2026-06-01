@@ -87,7 +87,7 @@ async def _generate_introduction(ctx, user_message, synthesis_outline, edited_se
     intro_context = await build_intro_context(ctx, user_message, synthesis_outline, edited_sections, intro_budget["input_budget"])
     intro_msg = {"role": "user", "content": intro_context}
     try:
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             synthesis_model,
             [intro_prompt, intro_msg],
             stream=False,
@@ -117,7 +117,7 @@ async def _generate_conclusion(ctx, user_message, edited_sections, synthesis_mod
     concl_context = await build_conclusion_context(ctx, user_message, edited_sections, concl_budget["input_budget"])
     concl_msg = {"role": "user", "content": concl_context}
     try:
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             synthesis_model,
             [concl_prompt, concl_msg],
             stream=False,

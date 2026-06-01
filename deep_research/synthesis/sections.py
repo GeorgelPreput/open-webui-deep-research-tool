@@ -286,7 +286,7 @@ async def generate_subtopic_content_with_citations(
         )  # Use research model temperature for subtopics
 
         # Use research model for generating subtopics
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             synthesis_model,
             messages,
             stream=False,
@@ -753,7 +753,7 @@ You may relocate or lightly edit sentences with in-text citations or strikethrou
 
     try:
         # Use synthesis model for smoothing
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             synthesis_model,
             messages,
             stream=False,

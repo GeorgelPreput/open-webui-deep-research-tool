@@ -13,8 +13,7 @@ import httpx
 import pytest
 import respx
 
-from deep_research.adapter.auth import StaticToken
-from deep_research.adapter.client import OWUIClient
+from deep_research.adapter.llm_provider import LLMProviderClient
 from deep_research.adapter.retry import with_retry
 from deep_research.core.errors import (
     _TRANSIENT_COMPLETION_CODES,
@@ -144,18 +143,15 @@ async def test_with_retry_exhausts_then_raises():
     assert calls["n"] == 3  # initial + 2 retries
 
 
-# --- BUG 14 / 26: streaming retry -------------------------------------------
+# --- BUG 14 / 26: streaming retry (now on LLMProviderClient) ----------------
 
-def _make_client(max_retries: int = 1) -> OWUIClient:
-    return OWUIClient(
-        base_url="http://mock-owui:8080",
-        token_provider=StaticToken("mock-token"),
+def _make_llm_client(max_retries: int = 1) -> LLMProviderClient:
+    return LLMProviderClient(
+        base_url="http://mock-llm:9090",
+        api_key="sk-test",
         timeout_seconds=5,
         max_retries=max_retries,
         llm_semaphore=asyncio.Semaphore(4),
-        embedding_semaphore=asyncio.Semaphore(8),
-        search_semaphore=asyncio.Semaphore(2),
-        fetch_semaphore=asyncio.Semaphore(4),
     )
 
 
@@ -171,10 +167,10 @@ def _sse(*chunks: str) -> str:
 @pytest.mark.asyncio
 @respx.mock
 async def test_streaming_assembles_chunks_without_duplication():
-    respx.post("http://mock-owui:8080/api/chat/completions").respond(
+    respx.post("http://mock-llm:9090/chat/completions").respond(
         200, text=_sse("Hello", " ", "world")
     )
-    client = _make_client()
+    client = _make_llm_client()
     await client.start()
     try:
         resp = await client.chat_completions("m", [{"role": "user", "content": "hi"}], stream=True)
@@ -191,14 +187,14 @@ async def test_streaming_retries_pre_chunk_failure(monkeypatch):
     async def _no_sleep(*_a, **_k):
         return None
 
-    monkeypatch.setattr("deep_research.adapter.client.asyncio.sleep", _no_sleep)
+    monkeypatch.setattr("deep_research.adapter.llm_provider.asyncio.sleep", _no_sleep)
 
-    route = respx.post("http://mock-owui:8080/api/chat/completions")
+    route = respx.post("http://mock-llm:9090/chat/completions")
     route.side_effect = [
         httpx.Response(503, text="server error"),
         httpx.Response(200, text=_sse("only", " once")),
     ]
-    client = _make_client(max_retries=2)
+    client = _make_llm_client(max_retries=2)
     await client.start()
     try:
         resp = await client.chat_completions("m", [{"role": "user", "content": "hi"}], stream=True)

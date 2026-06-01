@@ -83,7 +83,7 @@ async def generate_titles(
             f"context_tokens={await count_tokens(ctx, titles_context)}"
         )
 
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             research_model,
             [titles_prompt, {"role": "user", "content": titles_context}],
             temperature=0.7,
@@ -191,7 +191,7 @@ The abstract must NOT:
         )
 
         response = await asyncio.wait_for(
-            ctx.client.chat_completions(
+            ctx.llm.chat_completions(
                 synthesis_model,
                 [abstract_prompt, {"role": "user", "content": abstract_context}],
                 temperature=ctx.valves.models.synthesis_temperature,

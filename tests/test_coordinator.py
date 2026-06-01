@@ -13,7 +13,12 @@ def coord_factory(tmp_path):
     coords: list[Coordinator] = []
 
     def _make() -> Coordinator:
-        cfg = RuntimeConfig()
+        cfg = RuntimeConfig(
+        llm_base_url="http://mock-llm:9090",
+        llm_api_key="sk-test",
+        embeddings_base_url="http://mock-emb:9091",
+        embeddings_api_key="sk-emb",
+    )
         cfg.data_dir = tmp_path
         c = Coordinator(valves=Valves(), config=cfg)
         coords.append(c)
@@ -28,7 +33,12 @@ def coord_factory(tmp_path):
 
 @pytest.mark.asyncio
 async def test_coordinator_start_close(tmp_path):
-    cfg = RuntimeConfig()
+    cfg = RuntimeConfig(
+        llm_base_url="http://mock-llm:9090",
+        llm_api_key="sk-test",
+        embeddings_base_url="http://mock-emb:9091",
+        embeddings_api_key="sk-emb",
+    )
     cfg.data_dir = tmp_path
     coord = Coordinator(valves=Valves(), config=cfg)
     await coord.start()
@@ -39,7 +49,12 @@ async def test_coordinator_start_close(tmp_path):
 
 @pytest.mark.asyncio
 async def test_inflight_dedupe_rejects_duplicate(tmp_path, monkeypatch):
-    cfg = RuntimeConfig()
+    cfg = RuntimeConfig(
+        llm_base_url="http://mock-llm:9090",
+        llm_api_key="sk-test",
+        embeddings_base_url="http://mock-emb:9091",
+        embeddings_api_key="sk-emb",
+    )
     cfg.data_dir = tmp_path
     coord = Coordinator(valves=Valves(), config=cfg)
     await coord.start()
@@ -95,7 +110,12 @@ async def test_inflight_dedupe_rejects_duplicate(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_distinct_conversations_run_concurrently(tmp_path, monkeypatch):
-    cfg = RuntimeConfig()
+    cfg = RuntimeConfig(
+        llm_base_url="http://mock-llm:9090",
+        llm_api_key="sk-test",
+        embeddings_base_url="http://mock-emb:9091",
+        embeddings_api_key="sk-emb",
+    )
     cfg.data_dir = tmp_path
     coord = Coordinator(valves=Valves(), config=cfg)
     await coord.start()

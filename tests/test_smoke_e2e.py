@@ -29,6 +29,8 @@ from deep_research.adapter.auth import StaticToken
 from deep_research.core.types import RunUser
 
 BASE = "http://mock-owui:8080"
+LLM_BASE = "http://mock-llm:9090"
+EMBEDDINGS_BASE = "http://mock-emb:9091"
 
 # Distinctive token so we can prove the prompt threaded through.
 PROMPT = "Explain the mambazz architecture in detail"
@@ -117,9 +119,11 @@ def _install_mocks(router: respx.Router, state: dict) -> None:
             data.append({"embedding": vec})
         return httpx.Response(200, json={"data": data})
 
-    router.post(f"{BASE}/api/chat/completions").mock(side_effect=chat_handler)
-    router.post(f"{BASE}/api/embeddings").mock(side_effect=embeddings_handler)
-    router.get(f"{BASE}/api/v1/models/list").mock(
+    # LLM provider endpoints (chat + models)
+    router.post(f"{LLM_BASE}/chat/completions").mock(side_effect=chat_handler)
+    # Embeddings provider endpoint (separate base URL)
+    router.post(f"{EMBEDDINGS_BASE}/embeddings").mock(side_effect=embeddings_handler)
+    router.get(f"{LLM_BASE}/models").mock(
         return_value=httpx.Response(
             200,
             json={"data": [{"id": "gemma3:12b", "name": "gemma", "meta": {"context_length": 8192}}]},
@@ -203,7 +207,14 @@ async def _run_scenario(data_dir: str) -> dict:
     from deep_research.orchestrator.coordinator import RuntimeConfig
 
     valves = load_valves_from_env(prefix="DR_")
-    config = RuntimeConfig(data_dir=data_dir, base_url=BASE)
+    config = RuntimeConfig(
+        data_dir=data_dir,
+        base_url=BASE,
+        llm_base_url=LLM_BASE,
+        llm_api_key="sk-smoke",
+        embeddings_base_url=EMBEDDINGS_BASE,
+        embeddings_api_key="sk-emb-smoke",
+    )
     coord = Coordinator(valves=valves, config=config)
     await coord.start()
 

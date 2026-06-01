@@ -71,6 +71,30 @@ class LoggingValves(BaseModel):
     include_tracebacks: bool = True
 
 
+class LLMValves(BaseModel):
+    base_url: str = Field("", description="OpenAI-compatible LLM base URL (required)")
+    api_key: str = Field("", description="Bearer token for the LLM provider (required)")
+    chat_path: str = Field(
+        "/chat/completions",
+        description="Chat completions path appended to base_url",
+    )
+
+
+class EmbeddingValves(BaseModel):
+    base_url: str = Field(
+        "",
+        description="OpenAI-compatible base URL for the embedding model (required)",
+    )
+    api_key: str = Field(
+        "",
+        description="Bearer token for the embedding provider (required)",
+    )
+    embeddings_path: str = Field(
+        "/embeddings",
+        description="Embeddings path appended to base_url",
+    )
+
+
 class AdvancedValves(BaseModel):
     query_weight: float = 0.5
     llm_concurrency: int = 4
@@ -97,3 +121,5 @@ class Valves(BaseModel):
     events: EventsValves = Field(default_factory=EventsValves)
     advanced: AdvancedValves = Field(default_factory=AdvancedValves)
     logging: LoggingValves = Field(default_factory=LoggingValves)
+    llm: LLMValves = Field(default_factory=LLMValves)  # type: ignore[arg-type]
+    embeddings: EmbeddingValves = Field(default_factory=EmbeddingValves)  # type: ignore[arg-type]

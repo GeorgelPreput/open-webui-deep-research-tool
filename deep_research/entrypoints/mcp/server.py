@@ -17,7 +17,6 @@ mcp = FastMCP("deep_research")
 _coord: Coordinator | None = None
 _coord_lock = asyncio.Lock()
 
-
 @mcp.tool()
 async def deep_research(prompt: str, conversation_id: str | None = None) -> str:
     """Run a deep research investigation on `prompt`. Returns the final report."""
@@ -30,12 +29,12 @@ async def deep_research(prompt: str, conversation_id: str | None = None) -> str:
                 config = RuntimeConfig(
                     data_dir=os.environ.get("DR_DATA_DIR", "/data/deep_research"),
                     base_url=os.environ.get("DR_OWUI_BASE_URL", "http://localhost:8080"),
-                    chat_completions_path=os.environ.get(
-                        "DR_OWUI_CHAT_COMPLETIONS_PATH", "/api/chat/completions"
-                    ),
-                    chat_completions_fallback_path=os.environ.get(
-                        "DR_OWUI_CHAT_COMPLETIONS_FALLBACK_PATH", ""
-                    ),
+                    llm_base_url=valves.llm.base_url,
+                    llm_api_key=valves.llm.api_key,
+                    llm_chat_path=valves.llm.chat_path,
+                    embeddings_base_url=valves.embeddings.base_url,
+                    embeddings_api_key=valves.embeddings.api_key,
+                    embeddings_path=valves.embeddings.embeddings_path,
                 )
                 coord = Coordinator(valves=valves, config=config)
                 await coord.start()
@@ -44,6 +43,7 @@ async def deep_research(prompt: str, conversation_id: str | None = None) -> str:
                 _coord = coord
 
     api_key = os.environ.get("DR_OWUI_API_KEY", "")
+
     async def sink(event: Event) -> None:
         # MCP returns the final report via run()'s return value; streamed
         # events are not surfaced here, so drop them instead of accumulating.

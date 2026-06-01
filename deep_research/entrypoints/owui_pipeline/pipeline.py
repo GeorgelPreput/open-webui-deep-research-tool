@@ -9,6 +9,7 @@ from uuid import uuid4
 from deep_research import Coordinator
 from deep_research import Valves as BaseValves
 from deep_research.adapter.auth import StaticToken
+from deep_research.config.env import load_valves_from_env
 from deep_research.config.logging import (
     configure_logging,
     reset_log_context,
@@ -105,15 +106,25 @@ class Pipeline:
             # Build + start the Coordinator on THIS (per-call worker) loop: its
             # httpx client and semaphores are bound to the loop they're created
             # on, so a shared/long-lived coordinator from another loop is unusable.
+            #
+            # Prefer admin-UI valve values (self.valves.llm.*); fall back to env
+            # if the admin UI left llm.base_url blank.
+            env_valves = load_valves_from_env(prefix="DR_")
+            llm = self.valves.llm
+            emb = self.valves.embeddings
+            if not llm.base_url:
+                llm = env_valves.llm
+            if not emb.base_url:
+                emb = env_valves.embeddings
             config = RuntimeConfig(
                 data_dir=os.environ.get("DR_DATA_DIR", "/tmp/deep_research"),
                 base_url=os.environ.get("DR_OWUI_BASE_URL", self.valves.OWUI_BASE_URL),
-                chat_completions_path=os.environ.get(
-                    "DR_OWUI_CHAT_COMPLETIONS_PATH", "/api/chat/completions"
-                ),
-                chat_completions_fallback_path=os.environ.get(
-                    "DR_OWUI_CHAT_COMPLETIONS_FALLBACK_PATH", ""
-                ),
+                llm_base_url=llm.base_url,
+                llm_api_key=llm.api_key,
+                llm_chat_path=llm.chat_path,
+                embeddings_base_url=emb.base_url,
+                embeddings_api_key=emb.api_key,
+                embeddings_path=emb.embeddings_path,
             )
             coord = Coordinator(valves=self.valves, config=config)
             await coord.start()

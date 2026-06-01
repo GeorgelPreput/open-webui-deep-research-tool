@@ -98,7 +98,7 @@ async def run_synthesis_time_kb_qa(
     }
     chosen_model = model or ctx.valves.models.research_model
     try:
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             chosen_model,
             [system, user],
             stream=False,
@@ -179,7 +179,7 @@ async def answer_post_report_user_qa(ctx: RunContext, body: dict[str, Any]) -> s
 
     chosen_model = ctx.valves.models.synthesis_model or ctx.valves.models.research_model
     try:
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             chosen_model,
             [system, user],
             stream=False,

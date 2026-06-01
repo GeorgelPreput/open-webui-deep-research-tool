@@ -143,7 +143,7 @@ Don't allow your own biases or preferences to have any affect on your answer - p
 
     # Generate interpretation of user feedback
     try:
-        response = await ctx.client.chat_completions(
+        response = await ctx.llm.chat_completions(
             ctx.valves.models.research_model,
             [interpret_prompt, {"role": "user", "content": context}],
             temperature=ctx.valves.models.temperature

@@ -14,6 +14,7 @@ dependencies = [
     "pdfplumber>=0.10",
     "fake-useragent>=1.5",
     "scikit-learn>=1.4",
+    "uv-secure>=0.17.2",
 ]
 
 [project.optional-dependencies]
@@ -75,3 +76,12 @@ testpaths = ["tests"]
 
 [tool.uv]
 exclude-newer = "1 week"
+
+[tool.uv-secure.vulnerability_criteria]
+severity = "medium"
+ignore_vulnerabilities = ["CVE-2024-12345"]
+aliases = true
+
+[tool.uv-secure.maintainability_criteria]
+max_package_age = "P1000D"
+forbid_deprecated = true
