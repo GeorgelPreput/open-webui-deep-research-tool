@@ -41,11 +41,15 @@ class RuntimeConfig:
         self,
         data_dir: str = "/tmp/deep_research",
         base_url: str = "http://localhost:8080",
+        chat_completions_path: str = "/api/chat/completions",
+        chat_completions_fallback_path: str = "",
     ):
         # Coerce to Path: the runtime shims pass str (from env), but the
         # vocabulary disk-cache code uses `data_dir / "deep_research"`.
         self.data_dir = Path(data_dir)
         self.base_url = base_url
+        self.chat_completions_path = chat_completions_path
+        self.chat_completions_fallback_path = chat_completions_fallback_path
 
 
 class CacheBundle:
@@ -87,13 +91,16 @@ class Coordinator:
             logger.info(
                 "Coordinator starting: base_url=%s data_dir=%s "
                 "llm_concurrency=%d embedding_concurrency=%d "
-                "http_timeout=%ds http_max_retries=%d",
+                "http_timeout=%ds http_max_retries=%d "
+                "chat_completions_path=%s chat_completions_fallback_path=%s",
                 self._config.base_url,
                 self._config.data_dir,
                 self._valves.advanced.llm_concurrency,
                 self._valves.advanced.embedding_concurrency,
                 self._valves.advanced.http_timeout_seconds,
                 self._valves.advanced.http_max_retries,
+                self._config.chat_completions_path,
+                self._config.chat_completions_fallback_path or "(disabled)",
             )
             self._client = OWUIClient(
                 base_url=self._config.base_url,
@@ -104,6 +111,8 @@ class Coordinator:
                 embedding_semaphore=asyncio.Semaphore(self._valves.advanced.embedding_concurrency),
                 search_semaphore=asyncio.Semaphore(self._valves.web.search_concurrency),
                 fetch_semaphore=asyncio.Semaphore(self._valves.web.fetch_concurrency),
+                chat_completions_path=self._config.chat_completions_path,
+                chat_completions_fallback_path=self._config.chat_completions_fallback_path,
             )
             await self._client.start()
             self._started = True

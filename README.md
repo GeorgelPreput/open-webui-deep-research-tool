@@ -160,6 +160,24 @@ asyncio.run(main())
 
 Every knob is grouped on the `Valves` Pydantic model. In OWUI runtimes (Function / Pipelines) the groups render as nested forms in the admin UI. In Docker runtimes (OpenAPI Tool / MCP), valves are populated from environment variables with the `DR_<GROUP>_<FIELD>` convention, e.g. `DR_MODELS_RESEARCH_MODEL=gemma3:27b`.
 
+### OWUI route compatibility
+
+Deep Research calls chat completions at `/api/chat/completions` by default. Some OWUI deployments return `400 {"detail":"'NoneType' object has no attribute 'startswith'"}` from that route (and from `/api/v1/chat/completions`) while `/openai/chat/completions` works correctly with the same key and model. Override the route, or enable a one-shot fallback:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `DR_OWUI_CHAT_COMPLETIONS_PATH` | `/api/chat/completions` | Primary chat completions route. Set to `/openai/chat/completions` on deployments where the default 400s. |
+| `DR_OWUI_CHAT_COMPLETIONS_FALLBACK_PATH` | `""` (disabled) | If set, retried once when the primary route returns 404 or the `'NoneType'…'startswith'` 400 signature; the working path is then locked for the rest of the client's lifetime. Unrelated 400s (e.g. model-not-found) do **not** trigger fallback. |
+
+Compatibility matrix:
+
+| OWUI deployment | Working route |
+|---|---|
+| Default | `/api/chat/completions` |
+| Some self-hosted / LiteLLM-fronted setups | `/openai/chat/completions` |
+
+Embeddings, retrieval, files, and KB endpoints are unchanged across deployments.
+
 ### Valve groups
 
 | Group | Fields |
@@ -192,7 +210,7 @@ Every record carries the active `conversation_id`, `chat_id`, `run_id`, and `req
 At `DEBUG` level you get:
 - Coordinator startup with model IDs and concurrency settings.
 - Each of the 9 research phases — `Phase start: <name>` / `Phase done: <name> elapsed_s=…` / `Phase failed: <name>` with traceback.
-- Every OWUI HTTP call: method, path, model id, body keys, status, elapsed time. Non-2xx responses include a 500-char truncated body — exactly the place the K8s-sidecar `400: 'NoneType' object has no attribute 'startswith'` failures surface.
+- Every OWUI HTTP call: method, path, model id, body keys, status, elapsed time. Non-2xx responses include a 500-char truncated body — exactly the place the K8s-sidecar `400: 'NoneType' object has no attribute 'startswith'` failures surface. Set `DR_OWUI_CHAT_COMPLETIONS_PATH=/openai/chat/completions` (or enable `DR_OWUI_CHAT_COMPLETIONS_FALLBACK_PATH`) for OWUI instances that route LLM calls under `/openai/`.
 - Each retry attempt from `adapter/retry.py` with attempt number, delay, classified reason, and exception type.
 
 Example for the OpenAPI Tool runtime:

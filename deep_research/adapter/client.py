@@ -47,6 +47,9 @@ class OWUIClientError(Exception):
         super().__init__(message)
 
 
+_INCOMPATIBILITY_SIGNATURE = "'NoneType' object has no attribute 'startswith'"
+
+
 class OWUIClient:
     def __init__(
         self,
@@ -59,6 +62,8 @@ class OWUIClient:
         embedding_semaphore: asyncio.Semaphore | None = None,
         search_semaphore: asyncio.Semaphore | None = None,
         fetch_semaphore: asyncio.Semaphore | None = None,
+        chat_completions_path: str = "/api/chat/completions",
+        chat_completions_fallback_path: str = "",
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._token_provider = token_provider
@@ -69,6 +74,9 @@ class OWUIClient:
         self._search_sem = search_semaphore or asyncio.Semaphore(2)
         self._fetch_sem = fetch_semaphore or asyncio.Semaphore(4)
         self._client: httpx.AsyncClient | None = None
+        self._chat_path = chat_completions_path
+        self._chat_fallback_path = chat_completions_fallback_path
+        self._chat_path_locked: str | None = None
 
     async def start(self) -> None:
         if self._client is not None:
@@ -300,6 +308,24 @@ class OWUIClient:
 
     # ---- LLM ----
 
+    def _current_chat_path(self) -> str:
+        return self._chat_path_locked or self._chat_path
+
+    def _should_try_fallback(self, err: "OWUIClientError") -> bool:
+        if self._chat_path_locked is not None:
+            return False
+        if not self._chat_fallback_path:
+            return False
+        if err.status == 404:
+            return True
+        if err.status == 400 and _INCOMPATIBILITY_SIGNATURE in str(err):
+            return True
+        return False
+
+    def _lock_chat_path(self, path: str) -> None:
+        self._chat_path_locked = path
+        logger.info("Locked chat completions path to %s for this client", path)
+
     async def chat_completions(
         self,
         model: str,
@@ -315,11 +341,28 @@ class OWUIClient:
         if chat_id is not None:
             body["chat_id"] = chat_id
 
+        primary = self._current_chat_path()
+
         if not stream:
-            return await self._request("POST", "/api/chat/completions", json_body=body)
+            try:
+                return await self._request("POST", primary, json_body=body)
+            except OWUIClientError as e:
+                if not self._should_try_fallback(e):
+                    raise
+                fallback = self._chat_fallback_path
+                logger.warning(
+                    "Chat completions path %s returned %d (%s); falling back to %s",
+                    primary,
+                    e.status,
+                    _truncate(str(e), 200),
+                    fallback,
+                )
+                result = await self._request("POST", fallback, json_body=body)
+                self._lock_chat_path(fallback)
+                return result
 
         chunks: list[str] = []
-        async for delta in self._request_stream("/api/chat/completions", body):
+        async for delta in self._chat_stream(body, primary):
             chunks.append(delta)
         return {"choices": [{"message": {"content": "".join(chunks)}}]}
 
@@ -333,8 +376,37 @@ class OWUIClient:
         body = {"model": model, "messages": messages, "stream": True}
         if temperature is not None:
             body["temperature"] = temperature
-        async for delta in self._request_stream("/api/chat/completions", body):
+        async for delta in self._chat_stream(body, self._current_chat_path()):
             yield delta
+
+    async def _chat_stream(
+        self,
+        body: dict,
+        primary: str,
+    ) -> AsyncIterator[str]:
+        yielded_any = False
+        try:
+            async for delta in self._request_stream(primary, body):
+                yielded_any = True
+                yield delta
+            return
+        except OWUIClientError as e:
+            if yielded_any or not self._should_try_fallback(e):
+                raise
+            fallback = self._chat_fallback_path
+            logger.warning(
+                "Chat completions path %s returned %d (%s); falling back to %s",
+                primary,
+                e.status,
+                _truncate(str(e), 200),
+                fallback,
+            )
+            locked = False
+            async for delta in self._request_stream(fallback, body):
+                if not locked:
+                    self._lock_chat_path(fallback)
+                    locked = True
+                yield delta
 
     async def embeddings(self, model: str, inputs: list[str]) -> list[list[float]]:
         resp = await self._request(

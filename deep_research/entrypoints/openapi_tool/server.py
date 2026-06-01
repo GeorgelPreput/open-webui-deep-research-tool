@@ -43,6 +43,12 @@ async def _startup() -> None:
     config = RuntimeConfig(
         data_dir=os.environ.get("DR_DATA_DIR", "/data/deep_research"),
         base_url=os.environ.get("DR_OWUI_BASE_URL", "http://localhost:8080"),
+        chat_completions_path=os.environ.get(
+            "DR_OWUI_CHAT_COMPLETIONS_PATH", "/api/chat/completions"
+        ),
+        chat_completions_fallback_path=os.environ.get(
+            "DR_OWUI_CHAT_COMPLETIONS_FALLBACK_PATH", ""
+        ),
     )
     logger.info(
         "OpenAPI server startup: base_url=%s data_dir=%s "

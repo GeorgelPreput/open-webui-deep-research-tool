@@ -108,6 +108,12 @@ class Pipeline:
             config = RuntimeConfig(
                 data_dir=os.environ.get("DR_DATA_DIR", "/tmp/deep_research"),
                 base_url=os.environ.get("DR_OWUI_BASE_URL", self.valves.OWUI_BASE_URL),
+                chat_completions_path=os.environ.get(
+                    "DR_OWUI_CHAT_COMPLETIONS_PATH", "/api/chat/completions"
+                ),
+                chat_completions_fallback_path=os.environ.get(
+                    "DR_OWUI_CHAT_COMPLETIONS_FALLBACK_PATH", ""
+                ),
             )
             coord = Coordinator(valves=self.valves, config=config)
             await coord.start()
