@@ -16,7 +16,8 @@ from deep_research.adapter.auth import (
 )
 from deep_research.adapter.client import OWUIClient
 from deep_research.adapter.llm_provider import EmbeddingProviderClient, LLMProviderClient
-from deep_research.config.logging import redact_secret, reset_log_context, set_log_context
+from deep_research.adapter.throttle import HttpThrottle
+from deep_research.config.logging import reset_log_context, set_log_context
 from deep_research.config.valves import Valves
 from deep_research.core.caches import EmbeddingCache, LRUBytesBoundedCache, TransformationCache
 from deep_research.core.state import ResearchStateManager
@@ -93,6 +94,8 @@ class Coordinator:
         self._client: OWUIClient | None = None
         self._llm: LLMProviderClient | None = None
         self._embeddings: EmbeddingProviderClient | None = None
+        self._llm_throttle: HttpThrottle | None = None
+        self._embeddings_throttle: HttpThrottle | None = None
         self._started = False
 
     async def start(self) -> None:
@@ -128,6 +131,9 @@ class Coordinator:
                     "DR_EMBEDDINGS_API_KEY or valves.embeddings.api_key to the "
                     "embedding provider bearer token."
                 )
+            # Log presence-only for API keys: confirming a key was loaded is
+            # sufficient for operators, and "set"/"unset" keeps any portion of
+            # the credential out of log archives.
             logger.info(
                 "Coordinator starting: owui_base=%s llm_base=%s llm_chat=%s "
                 "llm_key=%s embeddings_base=%s embeddings_path=%s embeddings_key=%s "
@@ -136,10 +142,10 @@ class Coordinator:
                 self._config.base_url,
                 self._config.llm_base_url,
                 self._config.llm_chat_path,
-                redact_secret(self._config.llm_api_key),
+                "set" if self._config.llm_api_key else "unset",
                 self._config.embeddings_base_url,
                 self._config.embeddings_path,
-                redact_secret(self._config.embeddings_api_key),
+                "set" if self._config.embeddings_api_key else "unset",
                 self._config.data_dir,
                 self._valves.advanced.llm_concurrency,
                 self._valves.advanced.embedding_concurrency,
@@ -154,21 +160,42 @@ class Coordinator:
                 search_semaphore=asyncio.Semaphore(self._valves.web.search_concurrency),
                 fetch_semaphore=asyncio.Semaphore(self._valves.web.fetch_concurrency),
             )
+            llm_t = self._valves.llm_throttle
+            emb_t = self._valves.embeddings_throttle
+            self._llm_throttle = HttpThrottle(
+                label="llm",
+                max_rps=llm_t.max_requests_per_second,
+                min_interval_ms=llm_t.min_interval_ms,
+                max_delay_seconds=llm_t.max_delay_seconds,
+            )
+            self._embeddings_throttle = HttpThrottle(
+                label="embeddings",
+                max_rps=emb_t.max_requests_per_second,
+                min_interval_ms=emb_t.min_interval_ms,
+                max_delay_seconds=emb_t.max_delay_seconds,
+            )
             self._llm = LLMProviderClient(
                 base_url=self._config.llm_base_url,
                 api_key=self._config.llm_api_key,
                 chat_path=self._config.llm_chat_path,
                 timeout_seconds=self._valves.advanced.http_timeout_seconds,
-                max_retries=self._valves.advanced.http_max_retries,
+                max_retries=llm_t.max_retries,
                 llm_semaphore=asyncio.Semaphore(self._valves.advanced.llm_concurrency),
+                throttle=self._llm_throttle,
+                base_delay_seconds=llm_t.base_delay_seconds,
+                max_delay_seconds=llm_t.max_delay_seconds,
             )
             self._embeddings = EmbeddingProviderClient(
                 base_url=self._config.embeddings_base_url,
                 api_key=self._config.embeddings_api_key,
                 embeddings_path=self._config.embeddings_path,
                 timeout_seconds=self._valves.advanced.http_timeout_seconds,
-                max_retries=self._valves.advanced.http_max_retries,
+                max_retries=emb_t.max_retries,
                 embedding_semaphore=asyncio.Semaphore(self._valves.advanced.embedding_concurrency),
+                throttle=self._embeddings_throttle,
+                base_delay_seconds=emb_t.base_delay_seconds,
+                max_delay_seconds=emb_t.max_delay_seconds,
+                batch_max_inputs=emb_t.batch_max_inputs,
             )
             await self._client.start()
             await self._llm.start()
@@ -230,6 +257,8 @@ class Coordinator:
             try:
                 return await self._run_phases(ctx)
             finally:
+                await self._emit_degraded_warnings(ctx)
+                await self._emit_throttle_diagnostics(ctx)
                 await ctx.events.stop()
         finally:
             elapsed = time.monotonic() - run_started
@@ -268,6 +297,64 @@ class Coordinator:
             yield event
         await task
 
+    async def _emit_degraded_warnings(self, ctx: RunContext) -> None:
+        """Emit a one-shot warning the first time each throttle goes degraded.
+
+        Called periodically (currently from the diagnostics-emit path); flag
+        guards on ``ctx`` keep it at most once per side per run.
+        """
+        emb = ctx.embeddings_diagnostics
+        llm = ctx.llm_diagnostics
+        if emb is not None and emb.degraded and not ctx.embeddings_degraded_warned:
+            ctx.embeddings_degraded_warned = True
+            await ctx.events.emit(
+                StatusEvent(
+                    description=(
+                        "Degraded mode: embedding rate limits detected — "
+                        "dimension tracking and per-result similarity scoring "
+                        "are temporarily reduced."
+                    ),
+                    level="warning",
+                    done=False,
+                )
+            )
+        if llm is not None and llm.degraded and not ctx.llm_degraded_warned:
+            ctx.llm_degraded_warned = True
+            await ctx.events.emit(
+                StatusEvent(
+                    description="Degraded mode: LLM provider rate limits detected.",
+                    level="warning",
+                    done=False,
+                )
+            )
+
+    async def _emit_throttle_diagnostics(self, ctx: RunContext) -> None:
+        """Emit a single end-of-run StatusEvent summarising both throttles.
+
+        Surfaces attempts / retries / 429s / degraded activations so an
+        operator can spot quota pressure without scraping logs. Best-effort:
+        any failure here must not mask the original phase outcome.
+        """
+        try:
+            lines: list[str] = []
+            emb = ctx.embeddings_diagnostics
+            llm = ctx.llm_diagnostics
+            if emb is not None:
+                lines.append(emb.snapshot().format_line())
+            if llm is not None:
+                lines.append(llm.snapshot().format_line())
+            if not lines:
+                return
+            await ctx.events.emit(
+                StatusEvent(
+                    description="Throttle diagnostics: " + " | ".join(lines),
+                    level="info",
+                    done=False,
+                )
+            )
+        except Exception:
+            logger.exception("Failed to emit throttle diagnostics")
+
     async def _build_context(
         self,
         user: RunUser,
@@ -299,6 +386,16 @@ class Coordinator:
             research_date=datetime.now().strftime("%Y-%m-%d"),
             prompt=prompt,
             history=history,
+            embeddings_diagnostics=(
+                self._embeddings_throttle.diagnostics()
+                if self._embeddings_throttle is not None
+                else None
+            ),
+            llm_diagnostics=(
+                self._llm_throttle.diagnostics()
+                if self._llm_throttle is not None
+                else None
+            ),
         )
         return ctx
 

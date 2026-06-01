@@ -22,9 +22,18 @@ async def initialize_research_dimensions(
             if embedding:
                 item_embeddings.append(embedding)
 
-        if len(item_embeddings) < 3:
+        # Under embedding-throttle pressure, accept 2 dimensions instead of 3
+        # so dimension tracking still functions — even at PCA(n=2) the
+        # coverage signal is informative, and the alternative is dropping the
+        # feature entirely.
+        diag = getattr(ctx, "embeddings_diagnostics", None)
+        min_required = 2 if diag is not None and diag.degraded else 3
+
+        if len(item_embeddings) < min_required:
             logger.warning(
-                f"Not enough valid embeddings for research dimensions: {len(item_embeddings)}/3 required"
+                f"Not enough valid embeddings for research dimensions: "
+                f"{len(item_embeddings)}/{min_required} required "
+                f"(degraded={diag is not None and diag.degraded})"
             )
             ctx.state.update_state(ctx.conversation_id, "research_dimensions", None)
             return
@@ -71,6 +80,13 @@ async def update_dimension_coverage(
     conv_state = ctx.state.get_state(ctx.conversation_id)
     research_dimensions = conv_state.get("research_dimensions")
     if not research_dimensions:
+        return
+
+    # Under embedding-throttle pressure, skip the per-result embedding entirely.
+    # Coverage simply freezes; synthesis still proceeds.
+    diag = getattr(ctx, "embeddings_diagnostics", None)
+    if diag is not None and diag.degraded:
+        diag.record_skipped()
         return
 
     try:

@@ -12,7 +12,6 @@ from deep_research.adapter.auth import StaticToken
 from deep_research.config.env import load_valves_from_env
 from deep_research.config.logging import (
     configure_logging,
-    redact_secret,
     reset_log_context,
     set_log_context,
 )
@@ -49,6 +48,9 @@ async def _startup() -> None:
         embeddings_api_key=valves.embeddings.api_key,
         embeddings_path=valves.embeddings.embeddings_path,
     )
+    # Log presence-only for API keys: avoids any portion of the credential
+    # reaching log archives. Operators see "set"/"unset" — enough to confirm
+    # bootstrapping picked up the env vars.
     logger.info(
         "OpenAPI server startup: owui_base=%s llm_base=%s llm_chat=%s "
         "llm_key=%s embeddings_base=%s embeddings_path=%s embeddings_key=%s "
@@ -57,15 +59,15 @@ async def _startup() -> None:
         config.base_url,
         config.llm_base_url,
         config.llm_chat_path,
-        redact_secret(config.llm_api_key),
+        "set" if config.llm_api_key else "unset",
         config.embeddings_base_url,
         config.embeddings_path,
-        redact_secret(config.embeddings_api_key),
+        "set" if config.embeddings_api_key else "unset",
         config.data_dir,
         valves.models.research_model,
         valves.models.synthesis_model,
         valves.models.embedding_model,
-        redact_secret(os.environ.get("DR_OWUI_API_KEY", "")),
+        "set" if os.environ.get("DR_OWUI_API_KEY") else "unset",
     )
     _coord = Coordinator(valves=valves, config=config)
     await _coord.start()

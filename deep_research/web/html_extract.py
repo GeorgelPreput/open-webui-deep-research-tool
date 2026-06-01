@@ -139,25 +139,28 @@ async def extract_text_from_html(ctx: RunContext, html_content: str) -> str:
             # First unescape HTML entities properly
             unescaped_content = html.unescape(html_content)
 
-            # Remove script and style tags
+            # Remove script and style tags. The closing tag pattern allows
+            # whitespace before ``>`` (e.g. ``</script >``) — HTML5 permits it
+            # and a bare ``</script>`` regex would leak the script body into
+            # extracted text (CodeQL py/bad-tag-filter).
             content = re.sub(
-                r"(?i)<script[^>]*>.*?</script>",
+                r"(?i)<script[^>]*>.*?</script\s*>",
                 " ",
                 unescaped_content,
                 flags=re.DOTALL | re.IGNORECASE,
             )
             content = re.sub(
-                r"(?i)<style[^>]*>.*?</style>", " ", content, flags=re.DOTALL | re.IGNORECASE
+                r"(?i)<style[^>]*>.*?</style\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
             )
             content = re.sub(
-                r"(?i)<head[^>]*>.*?</head>", " ", content, flags=re.DOTALL | re.IGNORECASE
+                r"(?i)<head[^>]*>.*?</head\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
             )
-            content = re.sub(r"(?i)<nav[^>]*>.*?</nav>", " ", content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r"(?i)<nav[^>]*>.*?</nav\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE)
             content = re.sub(
-                r"(?i)<header[^>]*>.*?</header>", " ", content, flags=re.DOTALL | re.IGNORECASE
+                r"(?i)<header[^>]*>.*?</header\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
             )
             content = re.sub(
-                r"(?i)<footer[^>]*>.*?</footer>", " ", content, flags=re.DOTALL | re.IGNORECASE
+                r"(?i)<footer[^>]*>.*?</footer\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
             )
 
             # Remove HTML tags
@@ -185,25 +188,25 @@ async def extract_text_from_html(ctx: RunContext, html_content: str) -> str:
                 else html_content
             )
 
-            # Remove script and style tags
+            # Remove script and style tags (see comment above re: \s* in close).
             content = re.sub(
-                r"(?i)<script[^>]*>.*?</script>",
+                r"(?i)<script[^>]*>.*?</script\s*>",
                 " ",
                 unescaped_content,
                 flags=re.DOTALL | re.IGNORECASE,
             )
             content = re.sub(
-                r"(?i)<style[^>]*>.*?</style>", " ", content, flags=re.DOTALL | re.IGNORECASE
+                r"(?i)<style[^>]*>.*?</style\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
             )
             content = re.sub(
-                r"(?i)<head[^>]*>.*?</head>", " ", content, flags=re.DOTALL | re.IGNORECASE
+                r"(?i)<head[^>]*>.*?</head\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
             )
-            content = re.sub(r"(?i)<nav[^>]*>.*?</nav>", " ", content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r"(?i)<nav[^>]*>.*?</nav\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE)
             content = re.sub(
-                r"(?i)<header[^>]*>.*?</header>", " ", content, flags=re.DOTALL | re.IGNORECASE
+                r"(?i)<header[^>]*>.*?</header\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
             )
             content = re.sub(
-                r"(?i)<footer[^>]*>.*?</footer>", " ", content, flags=re.DOTALL | re.IGNORECASE
+                r"(?i)<footer[^>]*>.*?</footer\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
             )
 
             # Remove HTML tags

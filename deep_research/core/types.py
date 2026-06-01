@@ -55,6 +55,24 @@ class Report:
 
 
 @dataclass(slots=True)
+class PersistenceGate:
+    """Per-run KB-upload counter and timestamp.
+
+    Tracks ``persist_selected_source`` activity within the current cycle so
+    ``PersistenceValves.max_kb_uploads_per_cycle`` and
+    ``PersistenceValves.kb_upload_delay_ms`` can throttle OWUI ingestion under
+    embedding quota pressure. Reset by ``cycles.run_cycles`` at the start of
+    each iteration.
+    """
+
+    uploads_this_cycle: int = 0
+    last_upload_monotonic: float = 0.0
+
+    def reset_cycle(self) -> None:
+        self.uploads_this_cycle = 0
+
+
+@dataclass(slots=True)
 class RunContext:
     user: RunUser
     conversation_id: str
@@ -81,3 +99,13 @@ class RunContext:
     # ContextVars). Not persisted.
     seen_subtopics: set = field(default_factory=set)
     seen_sections: set = field(default_factory=set)
+    # Per-client throttle diagnostics. Consumers read ``.degraded`` to
+    # opportunistically skip embedding-heavy work; they read ``.snapshot()``
+    # for end-of-run reporting. Filled in by Coordinator._build_context.
+    embeddings_diagnostics: Any = None
+    llm_diagnostics: Any = None
+    persistence_gate: PersistenceGate = field(default_factory=PersistenceGate)
+    # One-shot flags so a degraded-mode warning is emitted at most once per
+    # run and per side (embeddings vs LLM).
+    embeddings_degraded_warned: bool = False
+    llm_degraded_warned: bool = False

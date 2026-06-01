@@ -132,12 +132,43 @@ async def _generate_outline_and_initial(ctx, user_message, summary_embedding=Non
 
     initial_results = []
     seen_urls = set()
+    diag = getattr(ctx, "embeddings_diagnostics", None)
+    embedding_degraded = diag is not None and diag.degraded
+
+    # Best-effort path: under embedding-throttle pressure, run search without
+    # query embedding rather than dropping the query entirely. Otherwise we'd
+    # collapse the outline whenever the provider rate-limits us.
+    embedding_failures = 0
     for query in initial_queries:
-        query_embedding = await get_embedding(ctx, query)
-        if not query_embedding:
+        query_embedding = None
+        if not embedding_degraded:
+            query_embedding = await get_embedding(ctx, query)
+            if not query_embedding:
+                embedding_failures += 1
+                # If a majority of embeddings have failed, switch to
+                # embedding-less mode for the rest of the batch — likely the
+                # provider is rate-limiting and further attempts only burn TPM.
+                if embedding_failures * 2 > len(initial_queries):
+                    embedding_degraded = True
+                    logger.warning(
+                        "Initial queries: %d/%d embedding failures, switching "
+                        "to embedding-less best-effort search",
+                        embedding_failures,
+                        len(initial_queries),
+                    )
+        if not query_embedding and not embedding_degraded:
             logger.warning(f"Skipping initial query with no embedding: {query!r}")
+            if diag is not None:
+                diag.record_skipped()
             continue
-        results = await process_query(ctx, query, query_embedding, None, cycle_feedback=None, summary_embedding=summary_embedding)
+        results = await process_query(
+            ctx,
+            query,
+            query_embedding,
+            None,
+            cycle_feedback=None,
+            summary_embedding=summary_embedding,
+        )
         for r in results:
             url = r.get("url", "")
             if url and url not in seen_urls:

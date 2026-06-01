@@ -50,6 +50,11 @@ async def run_cycles(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
     cycle = ps.get("cycle", 1)
     while cycle < max_cycles and active_outline:
         cycle += 1
+        # Reset the KB upload counter so ``max_kb_uploads_per_cycle`` is enforced
+        # per cycle, not for the whole run.
+        gate = getattr(ctx, "persistence_gate", None)
+        if gate is not None:
+            gate.reset_cycle()
         await ctx.events.emit(StatusEvent(
             description=f"Research cycle {cycle}/{max_cycles}: Generating search queries...",
             level="info", done=False,

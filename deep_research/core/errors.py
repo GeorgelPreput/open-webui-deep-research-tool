@@ -1,3 +1,9 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from email.utils import parsedate_to_datetime
+from time import time as _wallclock
+
 import httpx
 
 _TRANSIENT_HTTPX_TYPES: tuple[type[BaseException], ...] = (
@@ -40,6 +46,50 @@ def classify_transient_completion_error(e: BaseException) -> str | None:
         if phrase in err_str:
             return f"fallback_phrase={phrase!r}"
     return None
+
+
+def _parse_retry_after_value(value: str) -> float | None:
+    """Parse a Retry-After header value (integer seconds or HTTP-date)."""
+    if not value:
+        return None
+    v = value.strip()
+    try:
+        secs = float(v)
+        return max(0.0, secs)
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(v)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    target = dt.timestamp()
+    return max(0.0, target - _wallclock())
+
+
+def extract_retry_after_seconds(e: BaseException) -> float | None:
+    """Return the Retry-After seconds carried on an exception, or None.
+
+    Looks at:
+      - ``httpx.HTTPStatusError.response.headers``
+      - Any exception with a ``headers`` attribute that is mapping-like
+        (this covers the adapter's ``AdapterError`` when it carries the
+        upstream response headers).
+    """
+    headers: Mapping[str, str] | None = None
+    if isinstance(e, httpx.HTTPStatusError):
+        headers = e.response.headers
+    else:
+        candidate = getattr(e, "headers", None)
+        if isinstance(candidate, Mapping):
+            headers = candidate
+    if not headers:
+        return None
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if not raw:
+        return None
+    return _parse_retry_after_value(raw)
 
 
 class CompletionError(RuntimeError):

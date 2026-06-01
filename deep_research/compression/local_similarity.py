@@ -32,6 +32,19 @@ async def compress_content_with_local_similarity(
         if not ratio:
             ratio = max_tokens / content_tokens
 
+    # Under embedding-throttle pressure, skip per-chunk embedding and fall back
+    # to character-ratio truncation. Without embeddings the local-similarity
+    # ranking cannot run, and a flat skip is cheaper than per-chunk 429s.
+    diag = getattr(ctx, "embeddings_diagnostics", None)
+    if diag is not None and diag.degraded:
+        diag.record_skipped()
+        if max_tokens and content:
+            content_tokens = await count_tokens(ctx, content)
+            if content_tokens > max_tokens:
+                char_ratio = max_tokens / content_tokens
+                return content[: int(len(content) * char_ratio)]
+        return content
+
     chunks = chunk_text(content, ctx.valves.compression.chunk_level)
 
     if len(chunks) <= 1:

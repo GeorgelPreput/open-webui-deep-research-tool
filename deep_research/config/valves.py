@@ -57,6 +57,15 @@ class PersistenceValves(BaseModel):
     export_research_data: bool = True
     interactive_research: bool = True
     user_preference_throughout: bool = True
+    # Cap on KB source uploads per research cycle. 0 = unlimited (current behaviour).
+    max_kb_uploads_per_cycle: int = 0
+    # Min gap between consecutive KB uploads, in milliseconds. 0 = no delay.
+    kb_upload_delay_ms: int = 0
+    # When the embedding throttle has tripped degraded mode, skip KB ingestion
+    # entirely until it recovers. Off by default so existing deployments keep
+    # persisting; recommended for low-TPM dev keys where OWUI's own ingestion
+    # competes for the same embedding quota.
+    disable_during_degraded: bool = False
 
 
 class EventsValves(BaseModel):
@@ -95,6 +104,37 @@ class EmbeddingValves(BaseModel):
     )
 
 
+class _ThrottleFieldsMixin(BaseModel):
+    """Shared per-client throttle knobs.
+
+    Both LLM and embedding clients share the same shape because the two
+    providers exhibit the same constraints in practice (separate quotas,
+    same 429 shape). Embedding adds ``batch_max_inputs`` on top.
+    """
+    # Token-bucket cap on dispatched HTTP calls. 0 disables the throttle.
+    max_requests_per_second: float = 0.0
+    # Minimum gap between dispatched calls, in milliseconds. 0 disables.
+    min_interval_ms: int = 0
+    # Retries on transient (incl. 429) errors. Overrides advanced.http_max_retries.
+    max_retries: int = 5
+    # Exponential-backoff base delay, in seconds. Honoured unless Retry-After
+    # is present on the response.
+    base_delay_seconds: float = 1.0
+    # Backoff ceiling. Also feeds the degraded-mode cooldown derivation.
+    max_delay_seconds: float = 60.0
+
+
+class LLMThrottleValves(_ThrottleFieldsMixin):
+    pass
+
+
+class EmbeddingsThrottleValves(_ThrottleFieldsMixin):
+    # Cap on the ``inputs`` array size in a single /embeddings POST. The
+    # vocabulary loader is the main reason this exists (a 10k-word batch
+    # explodes TPM); keep ≤ provider tolerance.
+    batch_max_inputs: int = 64
+
+
 class AdvancedValves(BaseModel):
     query_weight: float = 0.5
     llm_concurrency: int = 4
@@ -123,3 +163,7 @@ class Valves(BaseModel):
     logging: LoggingValves = Field(default_factory=LoggingValves)
     llm: LLMValves = Field(default_factory=LLMValves)  # type: ignore[arg-type]
     embeddings: EmbeddingValves = Field(default_factory=EmbeddingValves)  # type: ignore[arg-type]
+    llm_throttle: LLMThrottleValves = Field(default_factory=LLMThrottleValves)
+    embeddings_throttle: EmbeddingsThrottleValves = Field(
+        default_factory=EmbeddingsThrottleValves
+    )

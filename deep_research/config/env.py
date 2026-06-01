@@ -11,15 +11,24 @@ def load_valves_from_env(prefix: str = "DR_") -> Valves:
     prefix_upper = prefix.upper()
     env_data: dict[str, Any] = {}
 
+    # Group names may themselves contain underscores (e.g. ``llm_throttle``),
+    # so simple split-on-first-underscore would mis-route those vars. We
+    # check group names longest-first so ``llm_throttle_*`` wins over
+    # ``llm_*``.
+    group_names = sorted(VALVES_GROUP_MAP.keys(), key=len, reverse=True)
+
     for key, raw in os.environ.items():
         if not key.startswith(prefix_upper):
             continue
-        rest = key[len(prefix_upper) :]
-        parts = rest.lower().split("_", 1)
-        if len(parts) != 2:
-            continue
-        group, field = parts
-        if group not in VALVES_GROUP_MAP:
+        rest = key[len(prefix_upper) :].lower()
+        group = None
+        field = None
+        for candidate in group_names:
+            if rest.startswith(candidate + "_"):
+                group = candidate
+                field = rest[len(candidate) + 1 :]
+                break
+        if group is None or not field:
             continue
         if field not in VALVES_GROUP_MAP[group]:
             continue
@@ -112,6 +121,9 @@ VALVES_GROUP_MAP: dict[str, dict[str, type]] = {
         "export_research_data": bool,
         "interactive_research": bool,
         "user_preference_throughout": bool,
+        "max_kb_uploads_per_cycle": int,
+        "kb_upload_delay_ms": int,
+        "disable_during_degraded": bool,
     },
     "events": {
         "enable_progress_embed": bool,
@@ -141,5 +153,20 @@ VALVES_GROUP_MAP: dict[str, dict[str, type]] = {
         "base_url": str,
         "api_key": str,
         "embeddings_path": str,
+    },
+    "llm_throttle": {
+        "max_requests_per_second": float,
+        "min_interval_ms": int,
+        "max_retries": int,
+        "base_delay_seconds": float,
+        "max_delay_seconds": float,
+    },
+    "embeddings_throttle": {
+        "max_requests_per_second": float,
+        "min_interval_ms": int,
+        "max_retries": int,
+        "base_delay_seconds": float,
+        "max_delay_seconds": float,
+        "batch_max_inputs": int,
     },
 }

@@ -154,8 +154,20 @@ async def select_most_relevant_results(
                         result["similarity"] = similarity
                         continue  # Skip the expensive embedding calculation
 
-                # Get embedding for the snippet
-                snippet_embedding = await get_embedding(ctx, snippet)
+                # Under embedding-throttle pressure, skip the per-snippet
+                # embedding call. With no query_embedding either, the path
+                # falls through to the keyword-multiplier / repeat-penalty
+                # ranking below — which is still useful and far cheaper.
+                diag = getattr(ctx, "embeddings_diagnostics", None)
+                if (
+                    (diag is not None and diag.degraded)
+                    or query_embedding is None
+                ):
+                    if diag is not None and diag.degraded:
+                        diag.record_skipped()
+                    snippet_embedding = None
+                else:
+                    snippet_embedding = await get_embedding(ctx, snippet)
 
                 if snippet_embedding:
                     # Apply transformation to query only (Alternative A)

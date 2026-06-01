@@ -161,13 +161,31 @@ async def load_vocabulary_embeddings(ctx: RunContext) -> dict[str, list[float]]:
             )
             return _vocabulary_embeddings
 
+        # Under embedding-throttle pressure with no disk cache, skip vocabulary
+        # generation entirely. The 10k-word load is the biggest single embedding
+        # burst in a run; downstream dimension translation falls through to
+        # "Dimension N" labels which are still informative.
+        diag = getattr(ctx, "embeddings_diagnostics", None)
+        if diag is not None and diag.degraded:
+            logger.warning(
+                "Skipping vocabulary embedding generation: embedding throttle "
+                "is in degraded mode and no disk cache is present"
+            )
+            diag.record_skipped()
+            return {}
+
         vocab = await load_vocabulary(ctx)
         if not vocab:
             logger.error("Failed to load vocabulary for embeddings")
             return {}
 
         try:
-            batch_size = 512
+            # batch_size is capped by the embedding throttle's batch_max_inputs;
+            # the embedding client also re-chunks internally, but capping here
+            # keeps the per-batch progress log honest.
+            batch_size = max(
+                1, int(ctx.valves.embeddings_throttle.batch_max_inputs or 512)
+            )
             logger.info(
                 f"Generating embeddings for {len(vocab)} vocabulary words (batch_size={batch_size})"
             )

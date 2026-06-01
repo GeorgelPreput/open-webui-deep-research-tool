@@ -40,8 +40,17 @@ def _body_keys(json_body: Any) -> list[str]:
 
 
 class AdapterError(Exception):
-    def __init__(self, message: str, status: int = 0) -> None:
+    def __init__(
+        self,
+        message: str,
+        status: int = 0,
+        headers: "dict[str, str] | None" = None,
+    ) -> None:
         self.status = status
+        # Carries upstream response headers so retry/backoff logic can read
+        # ``Retry-After``. Mapping-shaped so ``extract_retry_after_seconds``
+        # picks it up via duck-typing.
+        self.headers = headers or {}
         super().__init__(message)
 
 
@@ -157,6 +166,7 @@ class OWUIClient:
                     raise AdapterError(
                         f"{method} {path} -> {resp.status_code}: {text[:500]}",
                         status=resp.status_code,
+                        headers=dict(resp.headers),
                     )
                 logger.debug(
                     "HTTP %s %s -> %d in %.2fs",
@@ -262,6 +272,7 @@ class OWUIClient:
                     raise AdapterError(
                         f"POST /api/v1/files/ -> {resp.status_code}",
                         status=resp.status_code,
+                        headers=dict(resp.headers),
                     )
                 return resp.json()
 

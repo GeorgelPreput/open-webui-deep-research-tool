@@ -1,6 +1,8 @@
+import asyncio
 import hashlib
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Any
 
@@ -203,6 +205,38 @@ async def persist_selected_source(ctx: RunContext,
     """
     if not url or not isinstance(full_text, str) or not full_text.strip():
         return None
+
+    # Throttle KB ingestion under embedding-quota pressure.
+    pv = getattr(ctx.valves, "persistence", None)
+    if pv is not None:
+        diag = getattr(ctx, "embeddings_diagnostics", None)
+        if (
+            getattr(pv, "disable_during_degraded", False)
+            and diag is not None
+            and diag.degraded
+        ):
+            logger.info(
+                "Skipping KB persistence for %s: embedding throttle in "
+                "degraded mode (disable_during_degraded=True)",
+                url,
+            )
+            return None
+        cap = int(getattr(pv, "max_kb_uploads_per_cycle", 0) or 0)
+        gate = getattr(ctx, "persistence_gate", None)
+        if cap > 0 and gate is not None and gate.uploads_this_cycle >= cap:
+            logger.info(
+                "Skipping KB persistence for %s: max_kb_uploads_per_cycle=%d reached",
+                url,
+                cap,
+            )
+            return None
+        delay_ms = int(getattr(pv, "kb_upload_delay_ms", 0) or 0)
+        if delay_ms > 0 and gate is not None and gate.last_upload_monotonic > 0:
+            gap_s = time.monotonic() - gate.last_upload_monotonic
+            min_gap_s = delay_ms / 1000.0
+            if gap_s < min_gap_s:
+                await asyncio.sleep(min_gap_s - gap_s)
+
     dr = get_dr_state(ctx)
     if dr is None:
         dr = new_dr_state(ctx)
@@ -283,6 +317,10 @@ async def persist_selected_source(ctx: RunContext,
     manifest[url] = entry
     set_dr_state(ctx, dr)
     await checkpoint(ctx)
+    gate = getattr(ctx, "persistence_gate", None)
+    if gate is not None:
+        gate.uploads_this_cycle += 1
+        gate.last_upload_monotonic = time.monotonic()
     logger.info(f"Persisted source url={url} file_id={file_id}")
     return file_id
 
