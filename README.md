@@ -8,7 +8,7 @@ The same core ships in four runtimes:
 |---|---|
 | **OWUI Function** | You run Open WebUI yourself and want Deep Research to appear as a model in the chat dropdown. |
 | **OWUI Pipelines plugin** | You can't drop new Functions into the OWUI container but you do run a sidecar Pipelines container. |
-| **OpenAPI Tool server** | Anything that can call HTTP + SSE — non-OWUI clients, internal services, CI jobs. |
+| **OpenAPI Tool server** | A JSON-over-HTTP tool surface designed for Open WebUI's tool-server integration; also usable from any HTTP client (internal services, CI jobs, agent frameworks). |
 | **MCP server** | Anything that speaks Streamable-HTTP MCP — Claude Desktop, Cline, an MCP-aware orchestrator. |
 
 All four runtimes talk to three independently configured services: an **OpenAI-compatible chat LLM provider** (`/chat/completions`, `/models`), an **OpenAI-compatible embeddings provider** (`/embeddings`), and **Open WebUI** (`/api/v1/retrieval/*`, `/api/v1/files/*`, `/api/v1/knowledge/*`, `/api/v1/chats/*`) for search, retrieval, knowledge-base management, and chat persistence. Chat and embeddings each have their own base URL, bearer token, and path so they can point at the same backend or at different providers (e.g. chat at OpenAI, embeddings at a local Ollama). There are no `open_webui.*` Python imports anywhere in the package — all three services are treated purely as remote HTTP APIs.
@@ -31,7 +31,7 @@ A run goes through nine phases:
 8. **Front/back matter** — titles, abstract, introduction, conclusion, review pass with edit application.
 9. **Finalise** — assemble the full report, run citation verification, persist final report to the KB, export research data if enabled.
 
-The whole run emits structured progress events (status pill, message chunk, embed iframe) over an `EventBus` which the entrypoint translates to OWUI's `__event_emitter__` payloads, an SSE stream, or whatever the host speaks.
+The whole run emits structured progress events (status pill, message chunk, embed iframe) over an `EventBus` which the entrypoint translates to OWUI's `__event_emitter__` payloads, MCP progress notifications, or — for the OpenAPI Tool runtime — a `progress` snapshot on the polling endpoint.
 
 ---
 
@@ -95,7 +95,14 @@ In OWUI: **Settings → Connections → Add OpenAI-compatible** pointing at `htt
 
 ### 3. OpenAPI Tool server (Docker)
 
-Standalone REST service that exposes `POST /research` (SSE stream) and `GET /health`.
+Standalone REST service designed to plug into Open WebUI as a [tool server](https://docs.openwebui.com/features/extensibility/plugin/tools/openapi-servers/open-webui). Exposes three operations plus a health check, all returning JSON (no SSE — OWUI's tool dispatcher reads `application/json` only):
+
+| Operation | Path | Purpose |
+|---|---|---|
+| `research` | `POST /research` | Synchronous run. Returns the full markdown report + structured citations. Blocking for the entire run. |
+| `start_research_job` | `POST /research_jobs` | Same shape as `research`, but returns a `job_id` immediately. Use when the run may exceed your tool-call HTTP timeout. |
+| `get_research_job` | `GET /research_jobs/{job_id}` | Poll status. Returns `pending` / `running` / `completed` / `failed` with the same result payload once done. |
+| _(health)_ | `GET /health` | Liveness check. |
 
 ```bash
 docker build -t deep-research-openapi -f deep_research/entrypoints/openapi_tool/Dockerfile .
@@ -114,10 +121,53 @@ docker run -p 8000:8000 \
 Smoke test:
 
 ```bash
-curl -N http://localhost:8000/research \
+curl -s http://localhost:8000/research \
+  -H 'Authorization: Bearer sk-owui-admin-key' \
   -H 'Content-Type: application/json' \
-  -d '{"prompt": "Summarise the state of post-quantum cryptography in 2026."}'
+  -d '{"prompt": "Summarise the state of post-quantum cryptography in 2026."}' \
+  | jq
 ```
+
+Example response (truncated):
+
+```json
+{
+  "status": "ok",
+  "report": "# Post-Quantum Cryptography in 2026\n\nNIST finalised three PQC standards [1]...",
+  "title": "Post-Quantum Cryptography in 2026",
+  "citations": [
+    {"id": 1, "url": "https://csrc.nist.gov/...", "title": "NIST PQC Standards", "snippet": "..."},
+    {"id": 2, "url": "https://arxiv.org/abs/...", "title": "Lattice-based KEM", "snippet": "..."}
+  ],
+  "conversation_id": "api_9c8b7a6f-...",
+  "metadata": {"token_usage": {"total_tokens": 19134}, "elapsed_s": 124.7, "report_file_id": null}
+}
+```
+
+**OpenAPI schema snippet** for `POST /research` (abbreviated; fetch `GET /openapi.json` for the full document):
+
+```yaml
+paths:
+  /research:
+    post:
+      operationId: research                       # ← OWUI uses this as the tool name
+      summary: Run a deep research investigation and return the final report
+      description: |
+        Call this when the user's question benefits from grounded, cited
+        research across the open web... (full text in /openapi.json)
+      security:
+        - HTTPBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResearchRequest' }
+      responses:
+        '200': { content: { application/json: { schema: { $ref: '#/components/schemas/ResearchResponse' }}}}
+        '409': { content: { application/json: { schema: { $ref: '#/components/schemas/ResearchErrorResponse' }}}}
+```
+
+**Using from Open WebUI**: In OWUI, go to **Settings → Tools → Add tool server** and point it at `http(s)://<host>/openapi.json`. Once registered, open the tool-server icon in the chat composer and toggle **Deep Research** on for the current chat — OWUI requires this per-chat opt-in for any tool-server-provided tool. The model will then see the `research` tool (description and parameters are surfaced from the OpenAPI schema). Prefer `research` for prompts that complete inside your `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` window; switch to `start_research_job` + `get_research_job` polling for long runs that would otherwise time out.
 
 ### 4. MCP server (Docker, Streamable-HTTP)
 
@@ -373,7 +423,7 @@ If `interactive_research=False`, step 1 runs straight through into research cycl
 │   └── entrypoints/                                                  │
 │       ├── owui_function/pipe.py        # OWUI Function shim         │
 │       ├── owui_pipeline/pipeline.py    # OWUI Pipelines shim        │
-│       ├── openapi_tool/server.py       # FastAPI + SSE              │
+│       ├── openapi_tool/server.py       # FastAPI JSON tool server   │
 │       └── mcp/server.py                # FastMCP Streamable-HTTP    │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────┘

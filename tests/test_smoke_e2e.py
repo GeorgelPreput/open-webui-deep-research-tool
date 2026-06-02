@@ -181,24 +181,27 @@ def _install_mocks(router: respx.Router, state: dict) -> None:
 
 
 async def _consume(coord, conversation_id, prompt, token):
-    last_message = ""
-    events = 0
-    errors: list[str] = []
-    async for event in coord.stream(
+    collected: list = []
+
+    async def sink(ev) -> None:
+        collected.append(ev)
+
+    report = await coord.run(
         user=RunUser(id="smoke", name="Smoke"),
         conversation_id=conversation_id,
         chat_id=None,
         token=StaticToken(token),
         prompt=prompt,
         history=[],
-    ):
-        events += 1
-        name = type(event).__name__
-        if name == "MessageEvent":
-            last_message = getattr(event, "content", "") or last_message
-        elif name == "StatusEvent" and getattr(event, "level", "") == "error":
-            errors.append(getattr(event, "description", ""))
-    return last_message, events, errors
+        sink=sink,
+    )
+    last_message = report.content or ""
+    errors = [
+        getattr(ev, "description", "")
+        for ev in collected
+        if type(ev).__name__ == "StatusEvent" and getattr(ev, "level", "") == "error"
+    ]
+    return last_message, len(collected), errors
 
 
 async def _run_scenario(data_dir: str) -> dict:

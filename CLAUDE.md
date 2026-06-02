@@ -430,9 +430,11 @@ the whole run (hangs forever). Keep them separate.
 
 ### Local smoke test (no live OWUI required)
 
-`tests/test_smoke_e2e.py` drives `Coordinator.stream()` (the exact coroutine the
-OpenAPI `/research` endpoint uses) end-to-end through all 9 phases with every OWUI
-REST endpoint mocked via `respx`. It asserts: (a) the prompt reaches the outbound
+`tests/test_smoke_e2e.py` drives `Coordinator.run(sink=...)` (the exact
+coroutine the OpenAPI `POST /research` endpoint uses) end-to-end through all
+9 phases with every OWUI REST endpoint mocked via `respx`. Events emitted
+through the pipeline are captured by a list-appending sink for the assertions.
+It asserts: (a) the prompt reaches the outbound
 LLM call, (b) the KB is named from the prompt, (c) a same-conversation follow-up
 answers from the KB without a new search crawl, (d) a substantial report is
 produced, (e) no error-level events are emitted. It now runs **in-process** as

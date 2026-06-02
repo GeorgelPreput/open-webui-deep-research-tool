@@ -2,7 +2,6 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -22,14 +21,7 @@ from deep_research.config.valves import Valves
 from deep_research.core.caches import EmbeddingCache, LRUBytesBoundedCache, TransformationCache
 from deep_research.core.state import ResearchStateManager
 from deep_research.core.types import ChatMessage, Report, ResearchMode, RunContext, RunUser
-from deep_research.progress.events import (
-    EmbedEvent,
-    Event,
-    EventBus,
-    MessageEvent,
-    Sink,
-    StatusEvent,
-)
+from deep_research.progress.events import EventBus, Sink, StatusEvent
 
 logger = logging.getLogger("deep_research.orchestrator")
 
@@ -272,30 +264,6 @@ class Coordinator:
             reset_current_token(token_handle)
             async with self._inflight_lock:
                 self._inflight.discard(inflight_key)
-
-    async def stream(self, **kwargs) -> AsyncIterator[Event]:
-        sink_queue: asyncio.Queue[Event | None] = asyncio.Queue()
-
-        async def sink(event: Event) -> None:
-            if isinstance(event, (StatusEvent, MessageEvent, EmbedEvent)):
-                await sink_queue.put(event)
-
-        async def runner():
-            try:
-                result = await self.run(**kwargs, sink=sink)
-                await sink_queue.put(MessageEvent(content=result.content))
-            except Exception as e:
-                await sink_queue.put(StatusEvent(description=str(e), level="error", done=True))
-            finally:
-                await sink_queue.put(None)
-
-        task = asyncio.create_task(runner())
-        while True:
-            event = await sink_queue.get()
-            if event is None:
-                break
-            yield event
-        await task
 
     async def _emit_degraded_warnings(self, ctx: RunContext) -> None:
         """Emit a one-shot warning the first time each throttle goes degraded.

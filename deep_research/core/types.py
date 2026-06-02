@@ -46,6 +46,7 @@ class Report:
     content: str
     title: str = ""
     sources: dict[str, Any] = field(default_factory=dict)
+    bibliography: list["BibliographyEntry"] = field(default_factory=list)
     token_usage: dict[str, Any] = field(default_factory=dict)
     report_file_id: str | None = None
     conversation_id: str = ""

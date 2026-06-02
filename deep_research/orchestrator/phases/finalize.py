@@ -70,10 +70,12 @@ async def run_finalize(ctx: RunContext, ps: dict[str, Any]) -> Report:
     await ctx.events.emit(StatusEvent(description="Deep research complete!", level="success", done=True))
 
     sources = conv_state.get("master_source_table", {})
+    bibliography = ps.get("bibliography_data", {}).get("bibliography", [])
     return Report(
         content=comprehensive_answer,
         title=report_title,
         sources=sources,
+        bibliography=list(bibliography),
         token_usage=memory_stats,
         report_file_id=report_file_id,
         conversation_id=ctx.conversation_id,

@@ -139,18 +139,23 @@ async def extract_text_from_html(ctx: RunContext, html_content: str) -> str:
             # First unescape HTML entities properly
             unescaped_content = html.unescape(html_content)
 
-            # Remove script and style tags. The closing tag pattern allows
-            # whitespace before ``>`` (e.g. ``</script >``) — HTML5 permits it
-            # and a bare ``</script>`` regex would leak the script body into
-            # extracted text (CodeQL py/bad-tag-filter).
+            # Remove script and style tags. HTML5 says a raw-text element's
+            # end tag terminates at ``</name`` followed by whitespace, ``/``
+            # or ``>`` — and anything up to the next ``>`` is consumed. So
+            # ``</script\t\n foo bar>`` is a valid script close. The
+            # lookahead-anchored ``[^>]*>`` tail covers that case while
+            # rejecting ``</scripted>`` (CodeQL py/bad-tag-filter).
             content = re.sub(
-                r"(?i)<script[^>]*>.*?</script\s*>",
+                r"(?i)<script[^>]*>.*?</script(?=[\s/>])[^>]*>",
                 " ",
                 unescaped_content,
                 flags=re.DOTALL | re.IGNORECASE,
             )
             content = re.sub(
-                r"(?i)<style[^>]*>.*?</style\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
+                r"(?i)<style[^>]*>.*?</style(?=[\s/>])[^>]*>",
+                " ",
+                content,
+                flags=re.DOTALL | re.IGNORECASE,
             )
             content = re.sub(
                 r"(?i)<head[^>]*>.*?</head\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
@@ -188,15 +193,19 @@ async def extract_text_from_html(ctx: RunContext, html_content: str) -> str:
                 else html_content
             )
 
-            # Remove script and style tags (see comment above re: \s* in close).
+            # Remove script and style tags (see comment above re: raw-text
+            # end-tag tolerance — CodeQL py/bad-tag-filter).
             content = re.sub(
-                r"(?i)<script[^>]*>.*?</script\s*>",
+                r"(?i)<script[^>]*>.*?</script(?=[\s/>])[^>]*>",
                 " ",
                 unescaped_content,
                 flags=re.DOTALL | re.IGNORECASE,
             )
             content = re.sub(
-                r"(?i)<style[^>]*>.*?</style\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE
+                r"(?i)<style[^>]*>.*?</style(?=[\s/>])[^>]*>",
+                " ",
+                content,
+                flags=re.DOTALL | re.IGNORECASE,
             )
             content = re.sub(
                 r"(?i)<head[^>]*>.*?</head\s*>", " ", content, flags=re.DOTALL | re.IGNORECASE

@@ -68,29 +68,31 @@ def _install_mocks_with_429(router: respx.Router, state: dict, throttle_first: i
 
 
 async def _consume(coord, conversation_id, prompt, token):
-    last_message = ""
-    events = 0
-    errors: list[str] = []
-    statuses: list[str] = []
-    async for event in coord.stream(
+    collected: list = []
+
+    async def sink(ev) -> None:
+        collected.append(ev)
+
+    report = await coord.run(
         user=RunUser(id="smoke", name="Smoke"),
         conversation_id=conversation_id,
         chat_id=None,
         token=StaticToken(token),
         prompt=prompt,
         history=[],
-    ):
-        events += 1
-        name = type(event).__name__
-        if name == "MessageEvent":
-            last_message = getattr(event, "content", "") or last_message
-        elif name == "StatusEvent":
-            desc = getattr(event, "description", "")
-            level = getattr(event, "level", "")
+        sink=sink,
+    )
+    last_message = report.content or ""
+    errors: list[str] = []
+    statuses: list[str] = []
+    for ev in collected:
+        if type(ev).__name__ == "StatusEvent":
+            desc = getattr(ev, "description", "")
+            level = getattr(ev, "level", "")
             statuses.append(f"[{level}] {desc}")
             if level == "error":
                 errors.append(desc)
-    return last_message, events, errors, statuses
+    return last_message, len(collected), errors, statuses
 
 
 async def _run_scenario(data_dir: str, throttle_first: int) -> dict:
