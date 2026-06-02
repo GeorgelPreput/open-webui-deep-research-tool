@@ -57,16 +57,18 @@ connection: URL `http://pipelines:9099`, API key = `PIPELINES_API_KEY` (default
 set `OWUI_API_KEY` / model IDs if needed. Start a chat with it.
 
 **OpenAPI tool server** — the reliable check is the built-in Swagger UI at
-http://localhost:8000/docs → `POST /research` with `{"prompt": "..."}` (the
-response is an SSE event stream). To attach it to OWUI: Settings > Tools > add a
-tool server with URL `http://openapi-tool:8000` (OWUI fetches `/openapi.json`).
-*Caveat:* `/research` streams via SSE, which OWUI's tool-call UI may not render
-incrementally — `/docs` or `curl` is the most direct functional test.
+http://localhost:8000/docs → `POST /research` with `{"prompt": "..."}`. The
+response is synchronous JSON (full report + citations); the call blocks for the
+whole run, which can take several minutes. For long prompts use the
+`POST /research_jobs` + `GET /research_jobs/{id}` polling pair instead.
+
+To attach it to OWUI: Settings > Tools > add a tool server with URL
+`http://openapi-tool:8000` (OWUI fetches `/openapi.json`).
 
 ```bash
-curl -N http://localhost:8000/research \
+curl -s http://localhost:8000/research \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Explain the Mamba state-space architecture"}'
+  -d '{"prompt":"Explain the Mamba state-space architecture"}' | jq
 ```
 
 **MCP server** — streamable-HTTP at `http://mcp:9000/mcp` (from inside the
