@@ -66,6 +66,18 @@ class PersistenceValves(BaseModel):
     # persisting; recommended for low-TPM dev keys where OWUI's own ingestion
     # competes for the same embedding quota.
     disable_during_degraded: bool = False
+    disable_kb_persistence: bool = Field(
+        default=False,
+        description=(
+            "Set true to skip uploading research sources and the final "
+            "report to Open WebUI's knowledge base. Saves embedding "
+            "tokens significantly. Trade-off: the research becomes "
+            "ephemeral — rehydrating state on a follow-up turn won't "
+            "work, and the engine can't answer post-report questions "
+            "against the KB. The in-chat report still appears as "
+            "Markdown content and remains there."
+        ),
+    )
 
 
 class EventsValves(BaseModel):
@@ -135,6 +147,19 @@ class EmbeddingsThrottleValves(_ThrottleFieldsMixin):
     batch_max_inputs: int = 64
 
 
+class JobsValves(BaseModel):
+    """OpenAPI Tool Server job-store and writeback knobs."""
+    completed_retention_s: int = 30 * 24 * 3600
+    failed_retention_s: int = 24 * 3600
+    cleanup_interval_s: int = 3600
+    sqlite_busy_timeout_ms: int = 5000
+    # Phase 2 fields (declared now, used when the writeback outbox lands):
+    writeback_enabled: bool = True
+    outbox_poll_interval_ms: int = 250
+    outbox_max_attempts: int = 10
+    outbox_max_backoff_s: int = 60
+
+
 class AdvancedValves(BaseModel):
     query_weight: float = 0.5
     llm_concurrency: int = 4
@@ -159,6 +184,7 @@ class Valves(BaseModel):
     compression: CompressionValves = Field(default_factory=CompressionValves)
     persistence: PersistenceValves = Field(default_factory=PersistenceValves)
     events: EventsValves = Field(default_factory=EventsValves)
+    jobs: JobsValves = Field(default_factory=JobsValves)
     advanced: AdvancedValves = Field(default_factory=AdvancedValves)
     logging: LoggingValves = Field(default_factory=LoggingValves)
     llm: LLMValves = Field(default_factory=LLMValves)  # type: ignore[arg-type]

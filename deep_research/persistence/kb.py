@@ -123,6 +123,10 @@ def build_kb_name(title: str, now_dt: datetime) -> str:
 
 async def ensure_research_kb(ctx: RunContext, title_hint: str) -> tuple[str, str] | None:
     """Create (or return existing) private research KB. Returns (id, name)."""
+    if getattr(ctx.valves.persistence, "disable_kb_persistence", False):
+        logger.debug("KB persistence disabled by valve; not creating KB")
+        return None
+
     dr = get_dr_state(ctx)
     if dr and dr.get("kb_id") and dr.get("kb_name"):
         return dr["kb_id"], dr["kb_name"]
@@ -209,6 +213,9 @@ async def persist_selected_source(ctx: RunContext,
     # Throttle KB ingestion under embedding-quota pressure.
     pv = getattr(ctx.valves, "persistence", None)
     if pv is not None:
+        if getattr(pv, "disable_kb_persistence", False):
+            logger.debug("KB persistence disabled by valve; skipping %s", url)
+            return None
         diag = getattr(ctx, "embeddings_diagnostics", None)
         if (
             getattr(pv, "disable_during_degraded", False)
@@ -327,6 +334,9 @@ async def persist_selected_source(ctx: RunContext,
 async def persist_final_report(ctx: RunContext, report_md: str, report_title: str
 ) -> str | None:
     """Persist the finalized report markdown into the research KB."""
+    if getattr(ctx.valves.persistence, "disable_kb_persistence", False):
+        logger.debug("KB persistence disabled by valve; skipping final report upload")
+        return None
     dr = get_dr_state(ctx)
     if not dr or not dr.get("kb_id"):
         return None

@@ -110,3 +110,55 @@ async def test_event_to_dict_emitter_shapes():
     embed = EmbedEvent(html="<div/>", title="t").to_dict()
     assert embed["type"] == "embeds"
     assert embed["data"]["embeds"][0]["html"] == "<div/>"
+
+
+def _snapshot() -> dict:
+    return {
+        "query": "What is X?",
+        "cycle": 1,
+        "max_cycles": 5,
+        "revision": 3,
+        "updated_at": "2026-01-01T00:00:00",
+        "all_topics": [],
+        "completed_topics": [],
+        "partial_topics": [],
+        "new_topics": [],
+        "irrelevant_topics": [],
+        "remaining_topics": [],
+        "results_tokens": 0,
+        "synthesis_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
+def test_render_progress_embed_push_only_omits_poll_script():
+    from deep_research.progress.embed import render_progress_embed_html
+
+    html = render_progress_embed_html(_snapshot())
+    assert "__DR_BOOTSTRAP__" not in html
+    assert "Content-Security-Policy" in html
+    assert "reportHeight" in html  # height-reporting script kept
+
+
+def test_render_progress_embed_with_poll_url_emits_polling_script():
+    from deep_research.progress.embed import render_progress_embed_html
+
+    html = render_progress_embed_html(
+        _snapshot(),
+        poll_url="http://example.test/live_view/job-1/status",
+        view_token="vt-xyz",
+    )
+    assert "__DR_BOOTSTRAP__" in html
+    assert "live_view/job-1/status" in html
+    assert "vt-xyz" in html
+    # Bootstrap JSON includes the current revision as since_version baseline.
+    assert '"since_version": 3' in html
+    # nonce attribute is applied to inline scripts
+    assert 'nonce="' in html
+
+
+def test_render_progress_embed_requires_view_token_when_polling():
+    from deep_research.progress.embed import render_progress_embed_html
+
+    with pytest.raises(ValueError):
+        render_progress_embed_html(_snapshot(), poll_url="http://x/status")

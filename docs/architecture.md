@@ -68,6 +68,44 @@ With `interactive_research=True` (default):
 If `interactive_research=False`, step 1 runs straight through into
 research cycles in the first turn.
 
+### How the OpenAPI Tool runtime maps this two-turn shape
+
+The OWUI Function runtime gets two-turn behaviour for free: OWUI calls
+the pipe with each user message, and the engine's
+`waiting_for_outline_feedback` flag on conversation state survives
+between calls.
+
+The OpenAPI Tool runtime can't do that — a single REST handler must
+return immediately. Instead it splits the flow into two endpoint calls
+that the LLM drives:
+
+1. `POST /research_jobs` kicks off the run. The handler persists a
+   `JobRecord`, spawns an `asyncio.Task` that calls `Coordinator.run`
+   with the user's prompt, and returns the `job_id` immediately. The
+   engine runs through initial queries + outline phases and pauses at
+   the gate; the runner observes
+   `state.waiting_for_outline_feedback == True` and updates the record
+   phase to `awaiting_outline_feedback`.
+2. The LLM presents the verbatim `user_facing_instruction` to the user
+   (its operation description tells it so).
+3. The user replies with a slash-command (`/k 1,3,5`, `/r 2`, `/continue`)
+   or freeform text.
+4. The LLM calls `POST /research_jobs/{id}/feedback` with the verbatim
+   reply. The handler spawns a second `Coordinator.run` task on the
+   same `conversation_id`; the engine's
+   `run_outline_feedback` phase consumes the reply and the run
+   continues to completion.
+
+The two `Coordinator.run` calls share a `conversation_id`, so the
+process-shared `ResearchStateManager` keeps the outline-feedback data
+between them. No new suspend/resume primitive is needed.
+
+Live progress is delivered by an iframe that polls
+`GET /live_view/{id}/status` every ~2s and reloads itself when the
+record's `revision` advances. The iframe's URL is in the response of
+`start_research_job` and is authenticated by a per-job view token
+(sha256-hashed at rest).
+
 ---
 
 ## Package layout

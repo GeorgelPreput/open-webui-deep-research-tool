@@ -51,15 +51,33 @@ key:
 
 **OpenAPI tool server** — the reliable check is the built-in Swagger UI at
 http://localhost:8000/docs → `POST /research_jobs` with `{"prompt": "..."}`. It
-returns a `job_id` immediately and runs the research in the background.
+returns a `job_id` immediately and runs the research in the background, then
+pauses at the outline-feedback gate. Submit a reply via
+`POST /research_jobs/{job_id}/feedback` to resume.
 
 To attach it to OWUI: Settings > Tools > add a tool server with URL
 `http://openapi-tool:8000` (OWUI fetches `/openapi.json`).
 
 ```bash
-curl -s -X POST http://localhost:8000/research_jobs \
+# 1. Start a job
+JOB_ID=$(curl -s -X POST http://localhost:8000/research_jobs \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Explain the Mamba state-space architecture"}' | jq
+  -d '{"prompt":"Explain the Mamba state-space architecture"}' | jq -r .job_id)
+
+# 2. Poll until the engine pauses for outline feedback
+until [ "$(curl -s http://localhost:8000/research_jobs/$JOB_ID | jq -r .phase)" = "awaiting_outline_feedback" ]; do sleep 2; done
+
+# 3. Accept the outline as-is and resume
+curl -s -X POST http://localhost:8000/research_jobs/$JOB_ID/feedback \
+  -H 'Content-Type: application/json' \
+  -d '{"selection":"/continue"}' | jq
+
+# 4. Open the live-progress iframe (token is in the start response above, but
+#    you can also dig it out of the OpenAPI tool's logs)
+# xdg-open "http://localhost:8000/live_view/$JOB_ID?token=..."
+
+# 5. Eventually
+curl -s http://localhost:8000/research_jobs/$JOB_ID | jq -r .report_markdown
 ```
 
 **MCP server** — streamable-HTTP at `http://mcp:9000/mcp` (from inside the

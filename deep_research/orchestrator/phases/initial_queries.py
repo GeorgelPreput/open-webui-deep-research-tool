@@ -45,16 +45,7 @@ async def run_initial_queries(ctx: RunContext, ps: dict[str, Any]) -> dict[str, 
     ps["cycle"] = 1
 
     if ctx.valves.persistence.interactive_research and not is_follow_up:
-        outline_lines = ["### Research Outline\n"]
-        for topic in research_outline:
-            outline_lines.append(f"**{topic.get('topic', '')}**")
-            for sub in topic.get("subtopics", []):
-                outline_lines.append(f"- {sub}")
-            outline_lines.append("")
-        outline_report = "\n".join(outline_lines) + (
-            "\n\n*Reply with adjustments to the outline, or send any message "
-            "to confirm and proceed with research cycles.*"
-        )
+        outline_report, flat_items = _build_outline_text(research_outline)
         ctx.state.update_state(ctx.conversation_id, "waiting_for_outline_feedback", True)
         ctx.state.update_state(
             ctx.conversation_id,
@@ -62,6 +53,7 @@ async def run_initial_queries(ctx: RunContext, ps: dict[str, Any]) -> dict[str, 
             {
                 "original_query": user_message,
                 "outline_items": research_outline,
+                "flat_items": flat_items,
             },
         )
         ps["awaiting_outline_feedback"] = True
@@ -225,11 +217,31 @@ async def _generate_outline(ctx, user_message, initial_results, is_follow_up):
         return {"outline": [{"topic": "Research Findings", "subtopics": ["Key Aspects", "Detailed Analysis"]}]}
 
 
+def _build_outline_text(research_outline: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    """Build a single Markdown outline string with flat numbering and the
+    slash-command help, plus the flat_items list the parser indexes against."""
+    lines: list[str] = ["### Research Outline\n"]
+    flat_items: list[str] = []
+    item_num = 1
+    for topic_item in research_outline:
+        topic = topic_item.get("topic", "")
+        flat_items.append(topic)
+        lines.append(f"**{item_num}. {topic}**")
+        item_num += 1
+        for sub in topic_item.get("subtopics", []):
+            flat_items.append(sub)
+            lines.append(f"   {item_num}. {sub}")
+            item_num += 1
+        lines.append("")
+    lines.append(
+        "Reply with one of:\n"
+        "- `/k 1,3,5` or `/keep 1, 3, 5` — keep only those items\n"
+        "- `/r 2,4` or `/remove 2, 4` — remove those items\n"
+        "- `/continue` (or `/c`) — proceed with all items as-is"
+    )
+    return "\n".join(lines), flat_items
+
+
 async def _emit_outline(ctx, research_outline):
-    await ctx.events.emit(MessageEvent(content="### Research Outline\n\n"))
-    for topic in research_outline:
-        t = topic["topic"]
-        subs = topic.get("subtopics", [])
-        line = f"**{t}**\n" + "".join(f"- {s}\n" for s in subs) + "\n"
-        await ctx.events.emit(MessageEvent(content=line))
-    await ctx.events.emit(MessageEvent(content="\n*Continuing with research...*\n\n"))
+    text, _ = _build_outline_text(research_outline)
+    await ctx.events.emit(MessageEvent(content=text))

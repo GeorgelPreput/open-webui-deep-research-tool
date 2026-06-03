@@ -28,3 +28,27 @@ fails. The research itself still runs.
   the structured `chat.deepResearch` checkpoint is not written.
 
 See also [troubleshooting › OWUI KB persistence "silently does nothing"](./troubleshooting.md#owui-kb-persistence-silently-does-nothing-but-chat-succeeds).
+
+### `/event` endpoint admin-bypass
+
+OWUI's per-message event endpoint —
+`POST /api/v1/chats/{id}/messages/{message_id}/event` — is distinct
+from the chat-update endpoints described above. It **does** allow an
+admin token to post events to any chat, regardless of who owns it.
+This is what makes the Phase 2 writeback channel viable for the
+OpenAPI Tool runtime: the tool server holds an admin
+`DR_OWUI_API_KEY` and uses it to land status / message / replace /
+embeds events directly on the LLM's tool-call assistant message.
+
+The accepted short event names that OWUI persists to the chat-message
+row (and broadcasts to live WebSocket clients) are:
+`status`, `message`, `replace`, `embeds`, `files`, `source` /
+`citation`. Long-name aliases (`chat:message:embeds` etc.) broadcast
+but do NOT persist — only the short names are durable.
+
+### OWUI Pipelines (legacy)
+
+OWUI itself flagged the Pipelines plugin loader as legacy. This
+project dropped its Pipelines entrypoint in `v2`; the three supported
+runtimes are now **OWUI Function**, **OpenAPI Tool Server**, and
+**MCP**.

@@ -71,11 +71,12 @@ async def process_user_outline_feedback(
         "- Use commands like `/keep 1,3,5-7` or `/remove 2,4,8-10` to select specific items by number\n"
         "- Or simply describe what topics you want to focus on or avoid in natural language\n\n"
         "Examples:\n"
-        "- `/k 1,3,5-7` (keep only items 1,3,5,6,7)\n"
-        "- `/r 2,4,8-10` (remove items 2,4,8,9,10)\n"
+        "- `/k 1,3,5-7` or `/keep 1, 3, 5-7` (keep only items 1,3,5,6,7)\n"
+        "- `/r 2,4,8-10` or `/remove 2, 4, 8-10` (remove items 2,4,8,9,10)\n"
+        "- `/continue` or `/c` (keep all items as-is)\n"
         '- "Focus on historical aspects and avoid technical details"\n'
         '- "I\'m more interested in practical applications than theoretical concepts"\n\n'
-        "If you want to continue with all items, just reply 'continue' or leave your message empty.\n\n"
+        "If you want to continue with all items, just reply `/continue`, `continue`, or leave your message empty.\n\n"
         "**I'll pause here to await your response before continuing the research.**"
     )
 
@@ -232,7 +233,7 @@ async def process_outline_feedback_continuation(ctx: RunContext, user_message: s
     user_input = user_message.strip()
 
     # If user just wants to continue with all items
-    if user_input.lower() == "continue" or not user_input:
+    if user_input.lower() in ("continue", "/continue", "/c") or not user_input:
         await _emit_message(ctx,
             "\n*Continuing with all research outline items.*\n\n"
         )

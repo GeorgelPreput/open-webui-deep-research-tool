@@ -28,6 +28,55 @@ The OWUI Pipelines plugin was removed (OWUI itself flagged
 Pipelines as legacy); the `owui_pipeline/` directory no longer
 exists.
 
+### OpenAPI Tool Server runtime — Phase 1 v2 endpoint surface
+
+The OpenAPI Tool Server was rewritten around a **two-call** workflow:
+
+  - `POST /research_jobs` starts a job and returns immediately with a
+    `job_id` plus `user_facing_instruction` (verbatim text the LLM
+    must surface so the user knows the slash-command grammar).
+  - `POST /research_jobs/{job_id}/feedback` forwards the user's
+    `/k 1,3,5` / `/r 2,4` / `/continue` (or freeform) reply and
+    resumes the engine.
+  - `GET /research_jobs/{job_id}` JSON snapshot.
+  - `POST /research_jobs/{job_id}/cancel` cooperative cancellation
+    via a `CancellationToken` checked at every phase boundary.
+  - `GET /live_view/{job_id}` HTML iframe — per-job view tokens,
+    sha256-hashed at rest, self-polling.
+  - `GET /live_view/{job_id}/status` JSON snapshot used by the iframe.
+
+Job state lives in a durable `aiosqlite` store
+(`deep_research/entrypoints/openapi_tool/jobs.py`). A server restart
+no longer drops in-flight runs (running engine state in
+`ResearchStateManager` IS lost, but the JobRecord survives so
+clients see a usable `failed` state instead of a 404).
+
+The engine's suspend/resume model wasn't extended for this — the
+runner just calls `Coordinator.run()` twice on the same
+`conversation_id`. State manager keeps the outline-feedback data
+between calls. See `entrypoints/openapi_tool/runner.py`.
+
+`target_message_id` lives on `RunContext` (defaults `None`; only the
+OpenAPI runner populates it). It rebinds on each
+`submit_research_feedback` call so the Phase 2 writeback channel
+posts to the *new* tool-call assistant message, not the prior one.
+
+### `/event` endpoint admin-bypass
+
+OWUI's per-message endpoint
+`POST /api/v1/chats/{id}/messages/{message_id}/event` is distinct
+from the chat-update endpoints documented in the "Chat persistence
+limitation" section below. Unlike `GET /api/v1/chats/{id}`, the
+`/event` endpoint **does** allow an admin token to post events to
+chats owned by other users. This is what makes the Phase 2
+writeback channel viable for the OpenAPI Tool Server (which holds an
+admin `DR_OWUI_API_KEY`).
+
+The accepted short event names that OWUI persists to the chat-message
+row are: `status`, `message`, `replace`, `embeds`, `files`, `source`
+/ `citation`. Long-name aliases (`chat:message:embeds` etc.)
+broadcast but do NOT persist.
+
 ---
 
 ## Concurrency contract (the engine)

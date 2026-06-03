@@ -22,6 +22,7 @@ server = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "python-multipart>=0.0.9",
+    "aiosqlite>=0.20",
 ]
 mcp = [
     "fastmcp>=0.3",

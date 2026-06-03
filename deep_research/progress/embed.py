@@ -1,5 +1,6 @@
 import hashlib
 import json
+import secrets
 from typing import Any
 
 from deep_research.core.text import escape_html
@@ -8,7 +9,27 @@ from deep_research.progress.events import EmbedEvent
 from deep_research.progress.snapshot import build_progress_snapshot, normalize_progress_categories
 
 
-def render_progress_embed_html(snapshot: dict[str, Any]) -> str:
+def render_progress_embed_html(
+    snapshot: dict[str, Any],
+    *,
+    poll_url: str | None = None,
+    view_token: str | None = None,
+) -> str:
+    """Render the iframe HTML for the progress embed.
+
+    Push-only mode (default, ``poll_url=None``) emits the same DOM the
+    Function runtime has always emitted: header, token counts, the five
+    topic-category sections, and the parent-height reporting script.
+
+    Self-polling mode (``poll_url`` set) adds a second inline script that
+    polls the status endpoint every 2s and reloads the iframe on a
+    revision bump. Both modes share the same CSP meta. ``view_token`` is
+    required when ``poll_url`` is set so the polling script can include
+    it in requests.
+    """
+    if poll_url is not None and not view_token:
+        raise ValueError("view_token is required when poll_url is provided")
+
     categories = normalize_progress_categories(snapshot)
     e = escape_html
 
@@ -36,7 +57,7 @@ def render_progress_embed_html(snapshot: dict[str, Any]) -> str:
 
     def checklist(items: list[str], checked: bool) -> str:
         if not items:
-            return '<div class="empty">\u2014</div>'
+            return '<div class="empty">—</div>'
         attrs = " checked" if checked else ""
         rows = [
             f'<label class="row"><input type="checkbox" disabled{attrs}><span>{e(t)}</span></label>'
@@ -46,18 +67,18 @@ def render_progress_embed_html(snapshot: dict[str, Any]) -> str:
 
     def emoji_list(items: list[str], emoji: str) -> str:
         if not items:
-            return '<div class="empty">\u2014</div>'
+            return '<div class="empty">—</div>'
         rows = [
             f'<div class="row"><span class="emo">{emoji}</span><span>{e(t)}</span></div>'
             for t in items
         ]
         return "".join(rows)
 
-    green_circle = "\u2705"
+    green_circle = "✅"
     yellow_circle = "\U0001f7e1"
     orange_circle = "\U0001f7e3"
     red_circle = "\U0001f534"
-    white_circle = "\u26aa"
+    white_circle = "⚪"
     sections = (
         f'<section><h2><span class="emo">{green_circle}</span>Topics Completed <span class="count">({len(categories["completed"])})</span></h2>{checklist(categories["completed"], True)}</section>'
         f'<section><h2><span class="emo">{yellow_circle}</span>Topics Partially Addressed <span class="count">({len(categories["partial"])})</span></h2>{emoji_list(categories["partial"], yellow_circle)}</section>'
@@ -66,8 +87,72 @@ def render_progress_embed_html(snapshot: dict[str, Any]) -> str:
         f'<section><h2><span class="emo">{white_circle}</span>Remaining Topics <span class="count">({len(categories["remaining"])})</span></h2>{checklist(categories["remaining"], False)}</section>'
     )
 
+    nonce = secrets.token_urlsafe(16)
+    csp = (
+        f'<meta http-equiv="Content-Security-Policy" '
+        f'content="default-src \'none\'; '
+        f"connect-src 'self' https:; "
+        f"img-src data: https:; "
+        f"style-src 'unsafe-inline'; "
+        f"script-src 'nonce-{nonce}'; "
+        f"object-src 'none'; "
+        f"base-uri 'none'; "
+        f'form-action \'none\';">'
+    )
+
+    height_script = (
+        f'<script nonce="{nonce}">'
+        "function reportHeight() {"
+        "const h = document.documentElement.scrollHeight;"
+        "parent.postMessage({ type: 'iframe:height', height: h }, '*');"
+        "}"
+        "window.addEventListener('load', reportHeight);"
+        "new ResizeObserver(reportHeight).observe(document.body);"
+        "</script>"
+    )
+
+    poll_script = ""
+    if poll_url is not None:
+        bootstrap = {
+            "poll_url": poll_url,
+            "view_token": view_token,
+            "since_version": int(snapshot.get("revision", 0) or 0),
+        }
+        bootstrap_json = json.dumps(bootstrap)
+        poll_script = (
+            f'<script nonce="{nonce}">'
+            f"window.__DR_BOOTSTRAP__ = {bootstrap_json};"
+            "(function(){"
+            "var bs = window.__DR_BOOTSTRAP__;"
+            "var sinceVersion = bs.since_version;"
+            "var stopped = false;"
+            "async function poll() {"
+            "if (stopped) return;"
+            "try {"
+            "var url = bs.poll_url + '?token=' + encodeURIComponent(bs.view_token) + '&since_version=' + sinceVersion;"
+            "var resp = await fetch(url, { credentials: 'omit' });"
+            "if (resp.status === 204) return;"
+            "if (resp.status >= 400 && resp.status < 500) {"
+            "var panel = document.querySelector('.panel');"
+            "if (panel) panel.innerHTML = '<p style=\"padding:16px;color:#888;\">Session expired or job not found.</p>';"
+            "stopped = true;"
+            "return;"
+            "}"
+            "if (resp.status >= 500) { console.warn('[deep-research] poll', resp.status); return; }"
+            "var data = await resp.json();"
+            "if (typeof data.revision === 'number' && data.revision > sinceVersion) {"
+            "sinceVersion = data.revision;"
+            "window.location.reload();"
+            "}"
+            "} catch (err) { console.warn('[deep-research] poll error', err); }"
+            "}"
+            "setInterval(poll, 2000);"
+            "})();"
+            "</script>"
+        )
+
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><style>
+<html><head><meta charset="utf-8">{csp}<style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 16px; color: #222; background: #fafafa; }}
 .panel {{ background: #fff; border: 1px solid #e3e3e3; border-radius: 12px; padding: 18px; }}
@@ -95,14 +180,7 @@ section h2 .count {{ color: #888; font-weight: 400; font-size: 0.85em; }}
   .tokens .num {{ color: #f0f0f0; }}
 }}
 </style></head><body><div class="panel">{header}{tokens}{sections}</div>
-<script>
-function reportHeight() {{
-    const h = document.documentElement.scrollHeight;
-    parent.postMessage({{ type: 'iframe:height', height: h }}, '*');
-}}
-window.addEventListener('load', reportHeight);
-new ResizeObserver(reportHeight).observe(document.body);
-</script>
+{height_script}{poll_script}
 </body></html>"""
 
 

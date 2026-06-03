@@ -62,7 +62,10 @@ async def run_finalize(ctx: RunContext, ps: dict[str, Any]) -> Report:
     cache_stats = ctx.caches.embedding.stats()
     logger.info(f"Embedding cache stats: {cache_stats}")
 
-    if ctx.valves.persistence.export_research_data:
+    if (
+        ctx.valves.persistence.export_research_data
+        and not getattr(ctx.valves.persistence, "disable_kb_persistence", False)
+    ):
         try:
             await ctx.events.emit(StatusEvent(description="Exporting research data...", level="info", done=False))
         except Exception as e:

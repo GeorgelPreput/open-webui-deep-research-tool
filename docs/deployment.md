@@ -82,6 +82,18 @@ serving the user — it just stops uploading new sources to the OWUI KB until
 the bucket recovers, so OWUI's own embedding ingestion doesn't compound the
 contention.
 
+If KB ingestion is the bottleneck rather than the search/synth path,
+turn it off entirely:
+
+```bash
+DR_PERSISTENCE_DISABLE_KB_PERSISTENCE=true          # never upload sources/report to OWUI KB
+```
+
+Trade-off: research becomes ephemeral — rehydrating state on follow-up
+turns won't work, and post-report KB-grounded Q&A goes away. The in-chat
+report is unaffected and remains as the assistant message's Markdown
+content.
+
 ---
 
 ## Environment variable reference
@@ -111,6 +123,11 @@ Function), `Coord` = `Coordinator` startup.
 | `DR_EMBEDDINGS_THROTTLE_BATCH_MAX_INPUTS` | Emb | `64` (default) | no | no | Provider rejects oversized batches; lower if you see 413/422 on `/embeddings` |
 | `DR_EMBEDDINGS_THROTTLE_MAX_RETRIES` | Emb | `5` (default) | no | no | Too low → runs fail under transient 429s |
 | `DR_PERSISTENCE_DISABLE_DURING_DEGRADED` | Coord | `false` (default) | no | no | When `true`, KB ingest is skipped while embedding throttle is tripped — recommended for low-TPM keys |
+| `DR_PERSISTENCE_DISABLE_KB_PERSISTENCE` | Coord | `false` (default) | no | no | When `true`, never upload research sources or the final report to the OWUI KB. Research becomes ephemeral (no rehydrate, no post-report KB Q&A) but the in-chat report still lands. Use to escape low-TPM embedding budgets entirely |
+| `DR_OPENAPI_PUBLIC_BASE_URL` | shim (OpenAPI) | `https://research.example.com` | recommended | no | URL the **user's browser** uses to reach the tool server (distinct from `DR_OWUI_BASE_URL`, which OWUI uses for backend calls). Required for the live-progress iframe to construct a working polling URL when OWUI calls in via an internal cluster name. Falls back to the request's host header if unset |
+| `DR_JOBS_COMPLETED_RETENTION_S` | shim (OpenAPI) | `2592000` (30d) | no | no | How long a completed `JobRecord` is kept before retention sweep deletes it |
+| `DR_JOBS_FAILED_RETENTION_S` | shim (OpenAPI) | `86400` (24h) | no | no | Shorter retention for failed/cancelled jobs |
+| `DR_JOBS_CLEANUP_INTERVAL_S` | shim (OpenAPI) | `3600` (1h) | no | no | How often the retention sweep runs |
 | `DR_WEB_SEARCH_RESULTS_PER_QUERY` | web | `3` (default) | no | no | Higher = more sources but more embedding work per cycle |
 | `DR_LOG_LEVEL` / `DR_LOGGING_LEVEL` | log | `INFO` / `DEBUG` | no | no | At `DEBUG` you get per-call HTTP traces with redacted keys |
 | `DR_LOG_FORMAT` / `DR_LOGGING_FORMAT` | log | `text` or `json` | no | no | `json` for Loki/ELK/Datadog ingestion |
@@ -351,6 +368,16 @@ Then confirm:
   Ollama/Infinity-style providers.
 - The OWUI API key user can see (or create) the chats you want persisted —
   see [Compatibility › chat persistence caveat](./compatibility.md#chat-persistence-caveat).
+- (OpenAPI Tool runtime) `DR_OPENAPI_PUBLIC_BASE_URL` resolves from
+  the user's browser to the tool server's listening port. Open
+  `<DR_OPENAPI_PUBLIC_BASE_URL>/health` in a browser; if you get JSON
+  `{"status":"ok"}` the live-progress iframe will be reachable too.
+- (Phase 2 writeback — OWUI side) Set
+  `ENABLE_FORWARD_USER_INFO_HEADERS=true` on the OWUI container so the
+  `X-OpenWebUI-Chat-Id` / `X-OpenWebUI-Message-Id` headers reach the
+  tool server. Without these, the writeback channel falls back to the
+  polling-only iframe and the LLM still has to repeat the topic list
+  by hand.
 
 ---
 

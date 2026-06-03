@@ -89,13 +89,17 @@ the chat model dropdown.
 
 Standalone REST service designed to plug into Open WebUI as a
 [tool server](https://docs.openwebui.com/features/extensibility/plugin/tools/openapi-servers/open-webui).
-Exposes three operations plus a health check, all returning JSON.
+The server exposes a two-call **start → user replies → submit feedback** workflow
+plus a self-polling live-progress iframe.
 
 | Operation | Path | Purpose |
 |---|---|---|
-| `research` | `POST /research` | Synchronous run. Returns the full markdown report + structured citations. Blocking for the entire run. |
-| `start_research_job` | `POST /research_jobs` | Same shape as `research`, but returns a `job_id` immediately. Use when the run may exceed your tool-call HTTP timeout. |
-| `get_research_job` | `GET /research_jobs/{job_id}` | Poll status. Returns `pending` / `running` / `completed` / `failed` with the same result payload once done. |
+| `start_research_job` | `POST /research_jobs` | Kicks off a research run. Returns a `job_id` immediately while the engine runs in the background. The response includes a `user_facing_instruction` the LLM must emit verbatim. |
+| `submit_research_feedback` | `POST /research_jobs/{job_id}/feedback` | Forwards the user's slash-command reply (`/k 1,3,5`, `/r 2,4`, `/continue`, or freeform text) and resumes the engine. |
+| `get_research_job` | `GET /research_jobs/{job_id}` | JSON snapshot. `phase` + `progress` while running, `report_markdown` once `completed`. |
+| `cancel_research_job` | `POST /research_jobs/{job_id}/cancel` | Best-effort cancellation; the engine bails at the next phase boundary. |
+| _(live view)_ | `GET /live_view/{job_id}` | Renders the progress iframe HTML (view-token authenticated). |
+| _(live view JSON)_ | `GET /live_view/{job_id}/status` | JSON snapshot used by the iframe's polling loop. |
 | _(health)_ | `GET /health` | Liveness check. |
 
 ```bash
@@ -108,26 +112,55 @@ docker run -p 8000:8000 \
   -e DR_EMBEDDINGS_BASE_URL=http://host.docker.internal:8080/openai \
   -e DR_EMBEDDINGS_API_KEY=sk-emb-key \
   -e DR_DATA_DIR=/data/deep_research \
+  -e DR_OPENAPI_PUBLIC_BASE_URL=https://research-tool.example.com \
   -v dr-data:/data/deep_research \
   deep-research-openapi
 ```
 
+`DR_OPENAPI_PUBLIC_BASE_URL` is the URL the **user's browser** uses to
+reach this server (distinct from `DR_OWUI_BASE_URL`, which OWUI itself
+uses). The live-progress iframe needs it to construct an absolute
+polling URL; if unset, the server falls back to the incoming request's
+host header, which usually works in development but breaks when OWUI
+calls in via an internal cluster name.
+
 Smoke test:
 
 ```bash
-curl -s http://localhost:8000/research \
+curl -s -X POST http://localhost:8000/research_jobs \
   -H 'Authorization: Bearer sk-owui-admin-key' \
   -H 'Content-Type: application/json' \
   -d '{"prompt": "Summarise the state of post-quantum cryptography in 2026."}' \
   | jq
+# → {"job_id":"...", "status":"running", "next_action":"await_user_selection",
+#    "user_facing_instruction":"..."}
+
+# Poll for the outline-feedback gate
+curl -s http://localhost:8000/research_jobs/$JOB_ID \
+  -H 'Authorization: Bearer sk-owui-admin-key' | jq
+
+# Submit a selection
+curl -s -X POST http://localhost:8000/research_jobs/$JOB_ID/feedback \
+  -H 'Authorization: Bearer sk-owui-admin-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"selection":"/continue"}' | jq
+
+# Eventually
+curl -s http://localhost:8000/research_jobs/$JOB_ID \
+  -H 'Authorization: Bearer sk-owui-admin-key' | jq '.report_markdown'
 ```
 
-**Use from Open WebUI**: Settings → Tools → Add tool server → point it at
-`http(s)://<host>/openapi.json`. Once registered, open the tool-server
-icon in the chat composer and toggle **Deep Research** on for the current
-chat. Prefer `research` for prompts that complete inside your
-`AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` window; switch to
-`start_research_job` + `get_research_job` polling for long runs.
+**Use from Open WebUI**: Settings → Tools → Add tool server → point it
+at `http(s)://<host>/openapi.json`. Once registered, open the
+tool-server icon in the chat composer and toggle **Deep Research** on
+for the current chat. The tool prompts the LLM to emit a verbatim
+slash-command instruction so the user knows how to drive the outline-
+feedback step.
+
+**Embedding-quota tip**: if KB ingestion is the bottleneck (low-TPM
+embedding key), set `DR_PERSISTENCE_DISABLE_KB_PERSISTENCE=true` to
+skip uploads to the OWUI KB. Research becomes ephemeral (no rehydrate,
+no post-report KB Q&A) but the in-chat report still lands.
 
 ### 3. MCP server (Docker, Streamable-HTTP)
 

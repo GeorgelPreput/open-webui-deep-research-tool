@@ -40,7 +40,7 @@ in order — the first one to fail localises the problem.
 
 - **Cause:** Embedding provider quota is below current load. Often shows up the moment a research cycle ranks 30+ chunks at once.
 - **Check:** Provider dashboard for the embedding key, plus the engine logs (`DR_LOG_LEVEL=DEBUG`) for `429` lines under `deep_research.adapter.llm_provider`.
-- **Fix:** Apply [Pattern C — constrained embeddings quota](./deployment.md#pattern-c--constrained-embeddings-quota). At minimum, set `DR_ADVANCED_EMBEDDING_CONCURRENCY=1` and `DR_EMBEDDINGS_THROTTLE_MAX_REQUESTS_PER_SECOND` to half your provider's RPS limit. If OWUI's own ingestion is competing for the same key, also `DR_PERSISTENCE_DISABLE_DURING_DEGRADED=true`.
+- **Fix:** Apply [Pattern C — constrained embeddings quota](./deployment.md#pattern-c--constrained-embeddings-quota). At minimum, set `DR_ADVANCED_EMBEDDING_CONCURRENCY=1` and `DR_EMBEDDINGS_THROTTLE_MAX_REQUESTS_PER_SECOND` to half your provider's RPS limit. If OWUI's own ingestion is competing for the same key, also `DR_PERSISTENCE_DISABLE_DURING_DEGRADED=true`. If KB ingestion itself is the dominant embedding consumer, set `DR_PERSISTENCE_DISABLE_KB_PERSISTENCE=true` — research becomes ephemeral (no rehydrate, no post-report KB Q&A) but the in-chat report still lands.
 
 ### `Model not found` on first embedding (or chat) call
 
@@ -86,15 +86,28 @@ in order — the first one to fail localises the problem.
 
 ### Tool discovered in OWUI but no usable output in the chat
 
-- **Cause:** Earlier builds of the OpenAPI tool server streamed via SSE, and OWUI's tool dispatcher reads `application/json` only. Since commit `8f2022f` the `POST /research` endpoint returns synchronous JSON, so this should no longer happen — but check that you're running a current image.
-- **Check:** `curl -fsS "http://<openapi-host>/openapi.json" | jq '.paths["/research"].post.responses["200"].content'`. The content type must be `application/json`.
-- **Fix:** Pull the latest `deep-research-openapi` image (or rebuild from `deep_research/entrypoints/openapi_tool/Dockerfile`) and restart the Deployment. Confirm the per-chat tool toggle is on (the tool-server icon in the OWUI chat composer must show **Deep Research → enabled** for the current chat).
+- **Cause:** The v2 OpenAPI tool server uses a two-call workflow (`start_research_job` → user reply → `submit_research_feedback`) rather than a single synchronous call; if OWUI is still configured against the v1 `POST /research` endpoint, no useful output appears.
+- **Check:** `curl -fsS "http://<openapi-host>/openapi.json" | jq '.paths | keys'`. You should see `/research_jobs` (POST), `/research_jobs/{job_id}` (GET), `/research_jobs/{job_id}/feedback`, `/research_jobs/{job_id}/cancel`, `/live_view/{job_id}`, and `/live_view/{job_id}/status`. The old `/research` is gone.
+- **Fix:** Re-register the tool server in OWUI Settings → Tools so it picks up the new operations. Confirm the per-chat tool toggle is on (the tool-server icon in the OWUI chat composer must show **Deep Research → enabled** for the current chat).
 
 ### Tool call times out before the report is ready
 
-- **Cause:** OWUI's `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` is shorter than the run.
-- **Check:** `kubectl logs deployment/deep-research-openapi` shows the run continued after OWUI gave up.
-- **Fix:** Switch the tool from `research` to the polling pair `start_research_job` + `get_research_job` (both ship in the same OpenAPI document). The first call returns immediately with a `job_id`; OWUI polls for the result.
+- **Cause:** The v2 endpoint surface returns immediately from `start_research_job`, so the LLM call cannot time out on the research itself. If you're still seeing this, the LLM is calling `submit_research_feedback` synchronously and waiting for completion — also returns immediately and shouldn't block.
+- **Check:** `kubectl logs deployment/deep-research-openapi` shows both calls returning `200` in well under a second. The actual run continues in the background.
+- **Fix:** Confirm the LLM is calling the v2 operations (`start_research_job`, `submit_research_feedback`, `get_research_job`) and not the long-gone `/research`.
+
+### Iframe shows but no live updates
+
+- **Cause:** `DR_OPENAPI_PUBLIC_BASE_URL` is unreachable from the user's browser, so the iframe's polling script keeps failing with network errors. The iframe paints once from the initial snapshot, then can't refresh.
+- **Check:** Open the browser DevTools network tab; the `/live_view/{id}/status` polling calls should be visible. If they 404 / fail DNS / hit an internal-only hostname, that's the cause.
+- **Fix:** Set `DR_OPENAPI_PUBLIC_BASE_URL` to the URL the **user's browser** sees (e.g. `https://research.example.com`), not the URL OWUI uses to reach the tool server (`http://deep-research-openapi:8000`). Restart the OpenAPI deployment.
+
+### LLM gave a summary instead of presenting the topic list
+
+- **Cause (Phase 1):** The LLM skipped reproducing the `user_facing_instruction` field from the `start_research_job` response, even though the operation description tells it to emit it verbatim. The user never sees the slash-command grammar and the next step stalls.
+- **Check:** Look at the OWUI chat — does the LLM's reply contain `/k`, `/r`, or `/continue` hints?
+- **Fix (Phase 1):** Verify the operation description is current — `curl -fsS "http://<openapi-host>/openapi.json" | jq '.paths["/research_jobs"].post.description'` should mention `verbatim`. Try a stronger model or add an explicit instruction to the system prompt.
+- **Fix (Phase 2):** Set `ENABLE_FORWARD_USER_INFO_HEADERS=true` on the OWUI side and restart OWUI. With Phase 2 writeback wired, the topic list lands directly in the assistant message via the `/event` channel; the LLM no longer needs to repeat anything.
 
 ---
 

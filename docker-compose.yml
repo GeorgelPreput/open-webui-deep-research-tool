@@ -11,7 +11,7 @@
 #
 # Services:
 #   open-webui    http://localhost:3000   the UI you test in
-#   openapi-tool  http://localhost:8000    OpenAPI tool server (/docs, /research, /health)
+#   openapi-tool  http://localhost:8000    OpenAPI tool server (/docs, /research_jobs, /live_view, /health)
 #   mcp           http://localhost:9000    MCP server (streamable-http at /mcp)
 
 name: deep-research
@@ -51,6 +51,10 @@ services:
       DR_OWUI_BASE_URL: http://open-webui:8080
       DR_OWUI_API_KEY: ${DR_OWUI_API_KEY:-}
       DR_DATA_DIR: /data/deep_research
+      # URL the user's browser uses to reach the tool server (for the
+      # live-progress iframe's polling script). In this local-test stack
+      # the host can reach it at http://localhost:8000.
+      DR_OPENAPI_PUBLIC_BASE_URL: http://localhost:8000
       # Override model IDs to match OWUI > Settings > Models if the defaults
       # (gemma3:12b / gemma3:27b / nomic-embed-text) are not registered:
       # DR_MODELS_RESEARCH_MODEL: gemma3:12b

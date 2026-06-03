@@ -124,11 +124,22 @@ VALVES_GROUP_MAP: dict[str, dict[str, type]] = {
         "max_kb_uploads_per_cycle": int,
         "kb_upload_delay_ms": int,
         "disable_during_degraded": bool,
+        "disable_kb_persistence": bool,
     },
     "events": {
         "enable_progress_embed": bool,
         "flush_interval_ms": int,
         "quiet_chat_mode": bool,
+    },
+    "jobs": {
+        "completed_retention_s": int,
+        "failed_retention_s": int,
+        "cleanup_interval_s": int,
+        "sqlite_busy_timeout_ms": int,
+        "writeback_enabled": bool,
+        "outbox_poll_interval_ms": int,
+        "outbox_max_attempts": int,
+        "outbox_max_backoff_s": int,
     },
     "advanced": {
         "query_weight": float,

@@ -1,4 +1,19 @@
-from typing import Literal
+"""Request/response schemas for the OpenAPI Tool Server.
+
+Phase 1 of the rewrite. The old `POST /research`, the `_jobs` dict,
+and the corresponding models (`ResearchRequest`, `ResearchResponse`,
+`Citation`, `ResearchMetadata`, `ResearchJobAccepted`, `JobProgress`,
+`ResearchJobStatus`) were deleted in favour of the four
+job-lifecycle endpoints plus two live-view endpoints documented in
+the plan.
+
+`StartResearchResponse.user_facing_instruction` is the Phase 1
+mitigation for the LLM-skips-the-topic-list bug. Its description is
+the OpenAPI prompt the LLM sees; the default value is the literal
+text the LLM is told to emit. Phase 2 makes the field a no-op
+(the topic list lands directly in chat content via `replace`).
+"""
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,13 +36,14 @@ class HistoryMessage(BaseModel):
     )
 
 
-class ResearchRequest(BaseModel):
+class StartResearchRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "prompt": "Compare Mamba and Transformer architectures for long-context reasoning.",
                 "user_id": "alice",
                 "user_name": "Alice",
+                "history": [],
             }
         }
     )
@@ -36,219 +52,219 @@ class ResearchRequest(BaseModel):
         description=(
             "The research question or topic to investigate. Should be a"
             " self-contained natural-language description of what the user"
-            " wants to learn; the engine will plan its own sub-queries."
+            " wants to learn; the engine plans its own sub-queries."
         ),
         min_length=1,
     )
     user_id: str = Field(
         default="api_user",
-        description="Stable identifier for the requesting user (used for inflight"
-                    " deduplication and quota accounting).",
+        description="Stable identifier for the requesting user.",
     )
     user_name: str = Field(
         default="API User",
-        description="Human-readable user name (used in trajectory traces and logs).",
-    )
-    conversation_id: str | None = Field(
-        default=None,
-        description="Optional conversation identifier. When supplied, follow-up"
-                    " calls on the same id reuse cached state (outline, KB).",
-    )
-    chat_id: str | None = Field(
-        default=None,
-        description="Optional Open WebUI chat id for cross-system correlation.",
+        description="Human-readable user name.",
     )
     history: list[HistoryMessage] = Field(
         default_factory=list,
-        description="Prior conversation turns. The last user turn should NOT be"
-                    " repeated here; pass that as `prompt`.",
+        description=(
+            "Prior conversation turns. The last user turn should NOT be"
+            " repeated here; pass that as `prompt`."
+        ),
     )
 
 
-class Citation(BaseModel):
+class StartResearchResponse(BaseModel):
+    """Tool-call response handed back to the LLM after a successful start.
+
+    The fields are designed to be self-explanatory so the LLM follows
+    the next step without paraphrasing or skipping the topic list.
+    """
+
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "id": 1,
-                "url": "https://arxiv.org/abs/2312.00752",
-                "title": "Mamba: Linear-Time Sequence Modeling with Selective State Spaces",
-                "snippet": None,
+                "job_id": "9c8b7a6f-1234-4567-89ab-cdef01234567",
+                "status": "running",
+                "next_action": "await_user_selection",
+                "user_facing_instruction": (
+                    "I've started the preliminary research. A live progress "
+                    "view is appearing in this message. When the topic list "
+                    "is ready you'll see it appear right here — reply with "
+                    "/k <numbers> to keep specific topics, /r <numbers> to "
+                    "remove specific topics, or /continue to research all "
+                    "topics as-is."
+                ),
             }
         }
     )
 
-    id: int = Field(
-        description="Sequential citation number that matches `[N]` markers in `report`.",
+    job_id: str = Field(
+        description="Identifier for the freshly-started job; pass it on follow-up calls.",
     )
-    url: str = Field(description="Source URL.")
-    title: str = Field(description="Source title (may be empty if unknown).")
-    snippet: str | None = Field(
-        default=None,
-        description="Short excerpt from the source, when available.",
+    status: Literal["running"] = Field(
+        default="running",
+        description="Sentinel — the job has been accepted and is in flight.",
+    )
+    next_action: Literal["await_user_selection"] = Field(
+        default="await_user_selection",
+        description=(
+            "What the LLM should expect from the user next. Currently the"
+            " only path: wait for the user's topic-selection reply."
+        ),
+    )
+    user_facing_instruction: str = Field(
+        description=(
+            "Verbatim instruction the LLM MUST emit to the user. "
+            "Do not paraphrase. Do not omit. The tool has already "
+            "started running and a live progress iframe is being "
+            "attached to your assistant message; this string tells "
+            "the user what to do next."
+        ),
+        default=(
+            "I've started the preliminary research. A live progress "
+            "view is appearing in this message. When the topic list "
+            "is ready you'll see it appear right here — reply with "
+            "/k <numbers> to keep specific topics, /r <numbers> to "
+            "remove specific topics, or /continue to research all "
+            "topics as-is."
+        ),
     )
 
 
-class ResearchMetadata(BaseModel):
+class FeedbackRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {"selection": "/k 1,3,5"}
+        }
+    )
+
+    selection: str = Field(
+        description=(
+            "User's reply, forwarded verbatim. The server parses"
+            " /k|/keep <list>, /r|/remove <list>, /continue (or /c),"
+            " or freeform natural-language feedback."
+        ),
+    )
+
+
+class FeedbackResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "token_usage": {"prompt": 12345, "completion": 6789, "total": 19134},
-                "elapsed_s": 124.7,
-                "report_file_id": None,
+                "job_id": "9c8b7a6f-1234-4567-89ab-cdef01234567",
+                "status": "running",
+                "next_phase": "researching",
             }
         }
     )
 
-    token_usage: dict[str, int] = Field(
+    job_id: str = Field(description="Job identifier echoed from the feedback call.")
+    status: Literal["running"] = Field(
+        default="running",
+        description="Sentinel — the engine has resumed after the outline-feedback gate.",
+    )
+    next_phase: Literal["researching", "drafting", "finalizing"] = Field(
+        description="Which phase the engine is moving into next.",
+    )
+
+
+class JobStatusResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "job_id": "9c8b7a6f-1234-4567-89ab-cdef01234567",
+                "phase": "researching",
+                "revision": 12,
+                "progress": {"cycle": 2, "max_cycles": 5},
+                "report_markdown": None,
+                "error": None,
+            }
+        }
+    )
+
+    job_id: str = Field(description="Job identifier echoed from the status call.")
+    phase: str = Field(
+        description="Current job phase (queued|bootstrapping|outlining|awaiting_outline_feedback|researching|drafting|finalizing|completed|failed|cancelled).",
+    )
+    revision: int = Field(
+        description="Monotonically-incrementing revision for cache-busting and polling.",
+    )
+    progress: dict[str, Any] = Field(
         default_factory=dict,
-        description="Token counts aggregated across all LLM calls in the run.",
+        description="Snapshot of in-flight progress info (categories, token counts).",
     )
-    elapsed_s: float = Field(
-        default=0.0,
-        description="Wall-clock duration of the run, in seconds.",
-    )
-    report_file_id: str | None = Field(
+    report_markdown: str | None = Field(
         default=None,
-        description="Identifier of the persisted report file, if persistence was enabled.",
+        description="The full Markdown report when phase == 'completed'. Null otherwise.",
+    )
+    error: str | None = Field(
+        default=None,
+        description="Error description when phase == 'failed'. Null otherwise.",
     )
 
 
-class ResearchResponse(BaseModel):
+class CancelResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "status": "ok",
-                "report": "# Mamba vs Transformer\n\nMamba shows linear-time scaling [1]...",
-                "title": "Mamba vs Transformer for Long-Context Reasoning",
-                "citations": [
-                    {
-                        "id": 1,
-                        "url": "https://arxiv.org/abs/2312.00752",
-                        "title": "Mamba: Linear-Time Sequence Modeling",
-                        "snippet": None,
-                    }
-                ],
-                "conversation_id": "conv_abc",
-                "metadata": {
-                    "token_usage": {"prompt": 12345, "completion": 6789, "total": 19134},
-                    "elapsed_s": 124.7,
-                    "report_file_id": None,
-                },
+                "job_id": "9c8b7a6f-1234-4567-89ab-cdef01234567",
+                "status": "cancel_requested",
             }
         }
     )
 
-    status: Literal["ok"] = Field(
-        default="ok",
-        description="Sentinel indicating a successful research run.",
-    )
-    report: str = Field(
-        description="Final markdown report. Contains inline `[N]` citation markers"
-                    " that index into `citations`. Surface this verbatim to the user;"
-                    " do not paraphrase the citation numbers.",
-    )
-    title: str = Field(
-        default="",
-        description="Short human-readable title for the report.",
-    )
-    citations: list[Citation] = Field(
-        default_factory=list,
-        description="Ordered list of citations referenced by `report` via `[N]` markers.",
-    )
-    conversation_id: str = Field(
-        description="Conversation identifier used for this run. Pass it back on"
-                    " follow-up calls to reuse the same research state.",
-    )
-    metadata: ResearchMetadata = Field(
-        default_factory=ResearchMetadata,
-        description="Run-level metadata (token usage, duration, persistence info).",
+    job_id: str = Field(description="Job identifier echoed from the cancel call.")
+    status: Literal["cancel_requested", "already_terminal"] = Field(
+        description=(
+            "`cancel_requested` — the engine will bail at the next phase boundary."
+            " `already_terminal` — the job is already finished and cannot be cancelled."
+        ),
     )
 
 
-class ResearchErrorResponse(BaseModel):
+class ErrorResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "status": "error",
                 "code": "already_running",
-                "message": "Research already running for conversation conv_abc",
+                "message": "Active job exists for this chat: 9c8b7a6f-...",
             }
         }
     )
 
     status: Literal["error"] = "error"
     code: str = Field(
-        description="Machine-readable error code (e.g. `already_running`,"
-                    " `coordinator_unavailable`, `internal_error`).",
+        description=(
+            "Machine-readable error code: `unknown_job`, `already_running`,"
+            " `not_awaiting_feedback`, `forbidden`, `internal_error`."
+        ),
     )
     message: str = Field(description="Human-readable error description.")
 
 
-class ResearchJobAccepted(BaseModel):
+class LiveViewSnapshot(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "job_id": "9c8b7a6f-1234-4567-89ab-cdef01234567",
-                "status": "pending",
-                "poll_url": "/research_jobs/9c8b7a6f-1234-4567-89ab-cdef01234567",
+                "phase": "researching",
+                "revision": 12,
+                "progress": {"cycle": 2, "max_cycles": 5},
+                "completed": False,
             }
         }
     )
 
-    job_id: str = Field(description="Identifier to use when polling for completion.")
-    status: Literal["pending"] = "pending"
-    poll_url: str = Field(
-        description="Relative URL to poll for job status and the eventual result.",
+    job_id: str = Field(description="Job identifier.")
+    phase: str = Field(description="Current job phase.")
+    revision: int = Field(
+        description="Monotonically-incrementing revision. The iframe polls with `since_version`.",
     )
-
-
-class JobProgress(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "phase": "cycles",
-                "message": "Cycle 2/5: refining queries",
-            }
-        }
+    progress: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Snapshot of in-flight progress info.",
     )
-
-    phase: str = Field(
-        default="",
-        description="Current pipeline phase name (e.g. `planning`, `cycles`, `synthesize`).",
-    )
-    message: str = Field(
-        default="",
-        description="Latest human-readable status line from the engine.",
-    )
-
-
-class ResearchJobStatus(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "job_id": "9c8b7a6f-1234-4567-89ab-cdef01234567",
-                "status": "running",
-                "result": None,
-                "error": None,
-                "progress": {"phase": "cycles", "message": "Cycle 2/5"},
-            }
-        }
-    )
-
-    job_id: str = Field(description="Job identifier echoed from the start call.")
-    status: Literal["pending", "running", "completed", "failed"] = Field(
-        description="Lifecycle state. Poll until `completed` or `failed`.",
-    )
-    result: ResearchResponse | None = Field(
-        default=None,
-        description="The full research response when `status == 'completed'`."
-                    " Identical shape to `POST /research`. Null otherwise.",
-    )
-    error: ResearchErrorResponse | None = Field(
-        default=None,
-        description="Error details when `status == 'failed'`. Null otherwise.",
-    )
-    progress: JobProgress | None = Field(
-        default=None,
-        description="Latest progress snapshot while running.",
+    completed: bool = Field(
+        description="True when the job has reached a terminal phase.",
     )

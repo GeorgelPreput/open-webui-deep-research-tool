@@ -195,6 +195,13 @@ class Coordinator:
             self._started = True
             logger.info("Coordinator started")
 
+    @property
+    def state_manager(self) -> ResearchStateManager:
+        """Process-shared per-conversation state. Used by the OpenAPI runner
+        to peek at ``waiting_for_outline_feedback`` between two
+        ``run()`` invocations on the same conversation_id."""
+        return self._state_manager
+
     async def close(self) -> None:
         logger.info("Coordinator shutting down")
         if self._client is not None:

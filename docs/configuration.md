@@ -73,8 +73,9 @@ Field defaults come from `deep_research/config/valves.py`.
 | `cycles` | `min_cycles` (10), `max_cycles` (15), `gap_exploration_weight` (0.4), `trajectory_momentum` (0.6), `followup_weight` (0.5) |
 | `web` | `search_results_per_query` (3), `successful_results_per_query` (1), `extra_results_per_query` (3), `repeats_before_expansion` (3), `max_result_tokens` (4000), `domain_priority` (`""`), `content_priority` (`""`), `quality_filter_enabled` (True), `quality_similarity_threshold` (0.60), `fetch_concurrency` (4), `search_concurrency` (2) |
 | `compression` | `chunk_level` (2), `compression_level` (4), `stepped_synthesis_compression` (True) |
-| `persistence` | `export_research_data` (True), `interactive_research` (True), `user_preference_throughout` (True), `max_kb_uploads_per_cycle` (0 = unlimited), `kb_upload_delay_ms` (0), `disable_during_degraded` (False) |
+| `persistence` | `export_research_data` (True), `interactive_research` (True), `user_preference_throughout` (True), `max_kb_uploads_per_cycle` (0 = unlimited), `kb_upload_delay_ms` (0), `disable_during_degraded` (False), `disable_kb_persistence` (False) |
 | `events` | `enable_progress_embed` (True), `flush_interval_ms` (400), `quiet_chat_mode` (True) |
+| `jobs` _(OpenAPI runtime)_ | `completed_retention_s` (30d), `failed_retention_s` (24h), `cleanup_interval_s` (1h), `sqlite_busy_timeout_ms` (5000), `writeback_enabled` (True), `outbox_poll_interval_ms` (250), `outbox_max_attempts` (10), `outbox_max_backoff_s` (60) |
 | `advanced` | `query_weight` (0.5), `llm_concurrency` (4), `embedding_concurrency` (8), `executor_workers` (2), `http_timeout_seconds` (600), `http_max_retries` (3), `pdf_legacy_tls_verify` (True) |
 | `llm_throttle` | `max_requests_per_second` (0 = off), `min_interval_ms` (0), `max_retries` (5), `base_delay_seconds` (1.0), `max_delay_seconds` (60.0) |
 | `embeddings_throttle` | same five fields, plus `batch_max_inputs` (64) |
