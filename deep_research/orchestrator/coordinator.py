@@ -10,6 +10,7 @@ from typing import Any
 from deep_research.adapter.auth import (
     BearerTokenProvider,
     ContextTokenProvider,
+    StaticToken,
     reset_current_token,
     set_current_token,
 )
@@ -84,13 +85,23 @@ class Coordinator:
         self._state_manager = ResearchStateManager()
         self._executor = ThreadPoolExecutor(max_workers=valves.advanced.executor_workers)
         self._client: OWUIClient | None = None
+        self._writeback_client: OWUIClient | None = None
         self._llm: LLMProviderClient | None = None
         self._embeddings: EmbeddingProviderClient | None = None
         self._llm_throttle: HttpThrottle | None = None
         self._embeddings_throttle: HttpThrottle | None = None
         self._started = False
 
-    async def start(self) -> None:
+    async def start(self, *, writeback_token: str | None = None) -> None:
+        """Bring the Coordinator's adapter clients online.
+
+        ``writeback_token``, when provided, instantiates a *second*
+        OWUIClient bound to a static admin token. Only the OpenAPI Tool
+        Server entrypoint needs this — it POSTs to OWUI's per-message
+        ``/event`` endpoint, which admin-bypasses chat ownership. Other
+        entrypoints leave the kwarg unset and the second client is
+        never created.
+        """
         if self._started:
             return
         async with self._start_lock:
@@ -152,6 +163,18 @@ class Coordinator:
                 search_semaphore=asyncio.Semaphore(self._valves.web.search_concurrency),
                 fetch_semaphore=asyncio.Semaphore(self._valves.web.fetch_concurrency),
             )
+            if writeback_token:
+                # Writeback path uses a static admin token to POST OWUI's
+                # per-message ``/event`` endpoint on behalf of arbitrary
+                # chats — only viable because that endpoint admin-bypasses
+                # the chat-owner filter. A separate client keeps the static
+                # admin token isolated from the per-request user-token path.
+                self._writeback_client = OWUIClient(
+                    base_url=self._config.base_url,
+                    token_provider=StaticToken(writeback_token),
+                    timeout_seconds=self._valves.advanced.http_timeout_seconds,
+                    max_retries=self._valves.advanced.http_max_retries,
+                )
             llm_t = self._valves.llm_throttle
             emb_t = self._valves.embeddings_throttle
             self._llm_throttle = HttpThrottle(
@@ -190,10 +213,15 @@ class Coordinator:
                 batch_max_inputs=emb_t.batch_max_inputs,
             )
             await self._client.start()
+            if self._writeback_client is not None:
+                await self._writeback_client.start()
             await self._llm.start()
             await self._embeddings.start()
             self._started = True
-            logger.info("Coordinator started")
+            logger.info(
+                "Coordinator started writeback_client=%s",
+                "set" if self._writeback_client is not None else "unset",
+            )
 
     @property
     def state_manager(self) -> ResearchStateManager:
@@ -202,11 +230,26 @@ class Coordinator:
         ``run()`` invocations on the same conversation_id."""
         return self._state_manager
 
+    @property
+    def writeback_client(self) -> OWUIClient | None:
+        """OWUIClient bound to a static admin token, or None if
+        ``writeback_token`` was not passed to :meth:`start`.
+
+        Used by the OpenAPI Tool Server's outbox worker to POST events
+        to OWUI's per-message ``/event`` endpoint. Only that endpoint
+        admin-bypasses the chat-owner filter, so the admin token isn't
+        useful for general OWUI calls (use ``self._client`` for those).
+        """
+        return self._writeback_client
+
     async def close(self) -> None:
         logger.info("Coordinator shutting down")
         if self._client is not None:
             await self._client.close()
             self._client = None
+        if self._writeback_client is not None:
+            await self._writeback_client.close()
+            self._writeback_client = None
         if self._llm is not None:
             await self._llm.close()
             self._llm = None

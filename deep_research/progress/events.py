@@ -40,7 +40,29 @@ class EmbedEvent:
         }}
 
 
-Event = StatusEvent | MessageEvent | EmbedEvent
+@dataclass(frozen=True, slots=True)
+class CitationEvent:
+    """Per-source citation surfaced once at finalize time.
+
+    Maps to OWUI's ``source`` event type, which the chat UI renders in
+    the message's side-panel citation list. The Function runtime can
+    convert it to the same OWUI shape; the OpenAPI runner translates it
+    to an outbox row.
+    """
+    url: str
+    title: str
+    snippet: str | None = None
+
+    def to_dict(self) -> dict:
+        return {"type": "source", "data": {
+            "type": "external",
+            "source": {"type": "external", "name": self.title or self.url},
+            "document": [self.snippet or ""],
+            "metadata": [{"source": self.url}],
+        }}
+
+
+Event = StatusEvent | MessageEvent | EmbedEvent | CitationEvent
 Sink = Callable[[Event], Awaitable[None]]
 
 

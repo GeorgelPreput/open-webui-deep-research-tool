@@ -27,19 +27,43 @@ import asyncio
 import contextlib
 import json
 import logging
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from deep_research.adapter.auth import StaticToken
 from deep_research.core.cancellation import CancellationToken
 from deep_research.core.types import ChatMessage, RunUser
-from deep_research.progress.events import EmbedEvent, MessageEvent, StatusEvent
+from deep_research.progress.embed import render_progress_embed_html
+from deep_research.progress.events import (
+    CitationEvent,
+    EmbedEvent,
+    MessageEvent,
+    StatusEvent,
+)
 
 from .jobs import JobPhase, JobRecord, JobStore, TERMINAL_PHASES, _now_iso
 
 if TYPE_CHECKING:
+    from deep_research.entrypoints.openapi_tool.outbox import OutboxWorker
     from deep_research.orchestrator.coordinator import Coordinator
 
 logger = logging.getLogger("deep_research.entrypoints.openapi.runner")
+
+
+def _writeback_target(record: JobRecord) -> tuple[str, str] | None:
+    """Return (chat_id, target_message_id) if the record is bindable for
+    OWUI writeback, otherwise None.
+
+    Local-only chats (``local:`` prefix) are OWUI ephemeral conversations
+    that don't persist; the per-message ``/event`` endpoint accepts the
+    POST but the event is dropped. Records without forwarded headers
+    (``chat_id`` or ``target_message_id`` missing) are also unbindable.
+    """
+    if record.chat_id is None or record.target_message_id is None:
+        return None
+    if record.chat_id.startswith("local:"):
+        return None
+    return (record.chat_id, record.target_message_id)
 
 
 class JobRunner:
@@ -54,7 +78,7 @@ class JobRunner:
         *,
         coord: "Coordinator",
         store: JobStore,
-        outbox: Any | None = None,  # Phase 2: OutboxWorker
+        outbox: "OutboxWorker | None" = None,
         public_base_url: str = "",
     ) -> None:
         self._coord = coord
@@ -66,6 +90,7 @@ class JobRunner:
         self._snapshots: dict[str, dict[str, Any]] = {}
         self._owui_tokens: dict[str, str] = {}
         self._view_tokens: dict[str, str] = {}
+        self._status_dedupe_counter: dict[str, int] = {}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ public
@@ -97,6 +122,8 @@ class JobRunner:
                 "synthesis_tokens": 0,
                 "total_tokens": 0,
             }
+        await self._enqueue_bootstrap_embed(record, view_token, marker="bootstrap")
+        async with self._lock:
             task = asyncio.create_task(
                 self._run_initial(record, cancel_token=cancel_token, owui_user_token=owui_user_token)
             )
@@ -128,6 +155,9 @@ class JobRunner:
 
         if cancel_token is None or cancel_token.is_cancelled():
             cancel_token = CancellationToken()
+        view_token = self._view_tokens.get(job_id, "")
+        if view_token:
+            await self._enqueue_bootstrap_embed(record, view_token, marker="feedback")
         async with self._lock:
             self._cancellation_tokens[job_id] = cancel_token
             task = asyncio.create_task(
@@ -218,6 +248,11 @@ class JobRunner:
                     completed_at=_now_iso(),
                 )
                 self._mark_phase(record.job_id, JobPhase.COMPLETED)
+                # Path used by post-report QA: the first Coordinator.run
+                # returns a final answer immediately (no outline gate).
+                # Land it in the same tool-call message so the LLM doesn't
+                # need to retrieve the answer text.
+                await self._enqueue_final_writeback(record, report.content)
         except asyncio.CancelledError:
             await self._store.update(
                 record.job_id, phase=JobPhase.CANCELLED, completed_at=_now_iso()
@@ -272,6 +307,10 @@ class JobRunner:
                 completed_at=_now_iso(),
             )
             self._mark_phase(record.job_id, JobPhase.COMPLETED)
+            # Phase 2: writeback the final report as message content, then
+            # clear the iframe. The user sees the report in the second
+            # tool-call message without the LLM having to retrieve it.
+            await self._enqueue_final_writeback(record, report.content)
         except asyncio.CancelledError:
             await self._store.update(
                 record.job_id, phase=JobPhase.CANCELLED, completed_at=_now_iso()
@@ -312,10 +351,161 @@ class JobRunner:
             snap["has_embed"] = True
 
     async def _event_to_outbox(self, job_id: str, event: Any) -> None:
-        """Phase 2 wiring point — translate events to OutboxWorker rows."""
-        # Placeholder: filled in P2.4. Returning early keeps Phase 1
-        # behaviour identical regardless of whether outbox is set.
-        return None
+        """Translate an engine event into an OutboxWorker row.
+
+        Maps:
+          - StatusEvent   → ``status``  (in-flight progress pills)
+          - MessageEvent  → ``replace`` (topic list at the gate, etc.)
+          - EmbedEvent    → ``embeds``  (live iframe HTML refresh)
+          - CitationEvent → ``source``  (side-panel citations)
+
+        Skips silently when the record has no writeback binding
+        (``chat_id`` / ``target_message_id`` missing or ``local:`` chat).
+        """
+        if self._outbox is None:
+            return
+        record = await self._store.get(job_id)
+        if record is None:
+            return
+        target = _writeback_target(record)
+        if target is None:
+            return
+        chat_id, message_id = target
+
+        if isinstance(event, StatusEvent):
+            seq = self._status_dedupe_counter.get(job_id, 0) + 1
+            self._status_dedupe_counter[job_id] = seq
+            await self._outbox.enqueue(
+                outbox_id=str(uuid.uuid4()),
+                job_id=job_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                event_type="status",
+                payload={
+                    "description": event.description,
+                    "done": event.done,
+                },
+                dedupe_key=f"{job_id}:{message_id}:status:{seq}",
+            )
+        elif isinstance(event, MessageEvent):
+            await self._outbox.enqueue(
+                outbox_id=str(uuid.uuid4()),
+                job_id=job_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                event_type="replace",
+                payload={"content": event.content},
+                dedupe_key=(
+                    f"{job_id}:{message_id}:replace:"
+                    f"msg:{record.revision}:{hash(event.content) & 0xFFFFFFFF}"
+                ),
+            )
+        elif isinstance(event, EmbedEvent):
+            await self._outbox.enqueue(
+                outbox_id=str(uuid.uuid4()),
+                job_id=job_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                event_type="embeds",
+                payload={"embeds": [event.html], "replace": True},
+                dedupe_key=(
+                    f"{job_id}:{message_id}:embeds:"
+                    f"engine:{record.revision}"
+                ),
+            )
+        elif isinstance(event, CitationEvent):
+            payload = event.to_dict()["data"]
+            await self._outbox.enqueue(
+                outbox_id=str(uuid.uuid4()),
+                job_id=job_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                event_type="source",
+                payload=payload,
+                dedupe_key=f"{job_id}:{message_id}:source:{event.url}",
+            )
+
+    async def _enqueue_bootstrap_embed(
+        self,
+        record: JobRecord,
+        view_token: str,
+        *,
+        marker: str,
+    ) -> None:
+        """Post the iframe HTML to the (current) target message once.
+
+        ``marker`` distinguishes the start-of-job bootstrap (``bootstrap``)
+        from the post-feedback re-attach (``feedback``), so the dedupe
+        key stays unique across the two phases of a single job.
+        """
+        if self._outbox is None:
+            return
+        target = _writeback_target(record)
+        if target is None:
+            return
+        chat_id, message_id = target
+        snapshot = self._snapshots.get(record.job_id, {}) or {}
+        snapshot = {**snapshot, "query": record.prompt}
+        status_url = (
+            f"{self.public_base_url}/live_view/{record.job_id}/status"
+            if self.public_base_url
+            else ""
+        )
+        iframe_html = render_progress_embed_html(
+            snapshot,
+            poll_url=status_url or None,
+            view_token=view_token if status_url else None,
+        )
+        await self._outbox.enqueue(
+            outbox_id=str(uuid.uuid4()),
+            job_id=record.job_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            event_type="embeds",
+            payload={"embeds": [iframe_html], "replace": True},
+            dedupe_key=f"{record.job_id}:{message_id}:embeds:{marker}",
+        )
+
+    async def _enqueue_final_writeback(
+        self,
+        record: JobRecord,
+        content: str,
+    ) -> None:
+        """Post the final report as message content, then clear the iframe.
+
+        Called from ``_run_feedback`` (and the rare ``_run_initial`` short-
+        circuit completion path) once ``coord.run`` returns. Two rows are
+        enqueued in order: a ``replace`` carrying the report markdown,
+        then an ``embeds`` row with an empty list to wipe the iframe.
+        Re-reads the record to pick up the rebound ``target_message_id``.
+        """
+        if self._outbox is None:
+            return
+        refreshed = await self._store.get(record.job_id)
+        if refreshed is None:
+            return
+        target = _writeback_target(refreshed)
+        if target is None:
+            return
+        chat_id, message_id = target
+        await self._outbox.enqueue(
+            outbox_id=str(uuid.uuid4()),
+            job_id=refreshed.job_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            event_type="replace",
+            payload={"content": content},
+            dedupe_key=f"{refreshed.job_id}:{message_id}:replace:final",
+        )
+        await self._outbox.enqueue(
+            outbox_id=str(uuid.uuid4()),
+            job_id=refreshed.job_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            event_type="embeds",
+            payload={"embeds": [], "replace": True},
+            dedupe_key=f"{refreshed.job_id}:{message_id}:embeds:clear",
+        )
 
     def _mark_phase(self, job_id: str, phase: JobPhase) -> None:
         snap = self._snapshots.setdefault(job_id, {})

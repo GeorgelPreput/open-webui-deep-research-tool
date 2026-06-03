@@ -5,7 +5,7 @@ from deep_research.core.types import Report, RunContext
 from deep_research.persistence.chat_state import checkpoint, get_dr_state
 from deep_research.persistence.kb import attach_collection_to_chat, persist_final_report
 from deep_research.progress.embed import refresh_progress_embed
-from deep_research.progress.events import StatusEvent
+from deep_research.progress.events import CitationEvent, StatusEvent
 
 logger = logging.getLogger("deep_research.orchestrator.phases.finalize")
 
@@ -75,6 +75,19 @@ async def run_finalize(ctx: RunContext, ps: dict[str, Any]) -> Report:
 
     sources = conv_state.get("master_source_table", {})
     bibliography = ps.get("bibliography_data", {}).get("bibliography", [])
+    # Surface each bibliography entry as a CitationEvent so downstream
+    # runtimes (OWUI Function path, OpenAPI outbox writeback) can
+    # populate the chat side-panel citations. Snippet is bounded at
+    # 500 chars to avoid blowing past OWUI's per-event payload limits.
+    for entry in bibliography:
+        url = (entry.get("url") or "").strip() if isinstance(entry, dict) else ""
+        if not url:
+            continue
+        title = (entry.get("title") or url).strip() if isinstance(entry, dict) else url
+        snippet_raw = entry.get("snippet") if isinstance(entry, dict) else None
+        snippet = (snippet_raw or "")[:500] if snippet_raw else None
+        await ctx.events.emit(CitationEvent(url=url, title=title, snippet=snippet))
+
     return Report(
         content=comprehensive_answer,
         title=report_title,

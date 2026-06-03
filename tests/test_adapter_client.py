@@ -71,6 +71,40 @@ async def test_query_collection_lists_of_lists():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_post_message_event_targets_correct_path():
+    route = respx.post(
+        "http://mock-owui:8080/api/v1/chats/CHAT/messages/MSG/event"
+    ).respond(200, json={"status": True})
+    client = _make_client()
+    await client.start()
+    try:
+        await client.post_message_event(
+            "CHAT", "MSG", "status", {"description": "hi", "done": False}
+        )
+        assert route.call_count == 1
+        body = route.calls[0].request.content.decode("utf-8")
+        assert '"type":"status"' in body or '"type": "status"' in body
+        assert "hi" in body
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_post_message_event_rejects_long_name_alias():
+    # No HTTP call should be made — the client raises before issuing.
+    client = _make_client()
+    await client.start()
+    try:
+        with pytest.raises(ValueError, match="not persisted by OWUI"):
+            await client.post_message_event(
+                "CHAT", "MSG", "chat:message:embeds", {}
+            )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_retry_on_5xx_eventually_succeeds():
     route = respx.post("http://mock-owui:8080/api/v1/retrieval/process/file")
     route.side_effect = [

@@ -60,6 +60,7 @@ from .jobs import (
     _now_iso,
     history_to_json,
 )
+from .outbox import OutboxWorker
 from .runner import JobRunner
 from .schemas import (
     CancelResponse,
@@ -153,7 +154,8 @@ async def lifespan(app: FastAPI):
     )
 
     coord = Coordinator(valves=valves, config=config)
-    await coord.start()
+    writeback_token = os.environ.get("DR_OWUI_API_KEY", "")
+    await coord.start(writeback_token=writeback_token or None)
     app.state.coord = coord
     app.state.valves = valves
 
@@ -162,10 +164,35 @@ async def lifespan(app: FastAPI):
     await store.start()
     app.state.job_store = store
 
+    outbox: OutboxWorker | None = None
+    writeback_client = coord.writeback_client
+    if valves.jobs.writeback_enabled and writeback_client is not None:
+        outbox = OutboxWorker(
+            db_path=db_path,
+            owui_client=writeback_client,
+            poll_interval_s=max(0.05, valves.jobs.outbox_poll_interval_ms / 1000.0),
+            max_attempts=valves.jobs.outbox_max_attempts,
+            max_backoff_s=valves.jobs.outbox_max_backoff_s,
+            busy_timeout_ms=valves.jobs.sqlite_busy_timeout_ms,
+        )
+        await outbox.start()
+        logger.info(
+            "OutboxWorker started (writeback enabled); poll_interval_ms=%d max_attempts=%d max_backoff_s=%d",
+            valves.jobs.outbox_poll_interval_ms,
+            valves.jobs.outbox_max_attempts,
+            valves.jobs.outbox_max_backoff_s,
+        )
+    elif valves.jobs.writeback_enabled and writeback_client is None:
+        logger.warning(
+            "writeback_enabled=true but DR_OWUI_API_KEY is unset; the iframe "
+            "and chat-content writeback are disabled until the env var is set."
+        )
+    app.state.outbox = outbox
+
     app.state.runner = JobRunner(
         coord=coord,
         store=store,
-        outbox=None,  # Phase 2 wires the OutboxWorker here.
+        outbox=outbox,
         public_base_url=os.environ.get("DR_OPENAPI_PUBLIC_BASE_URL", ""),
     )
 
@@ -180,6 +207,8 @@ async def lifespan(app: FastAPI):
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await app.state.retention_task
         await app.state.runner.shutdown()
+        if app.state.outbox is not None:
+            await app.state.outbox.stop()
         await app.state.job_store.close()
         await app.state.coord.close()
 

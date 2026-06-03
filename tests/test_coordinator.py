@@ -43,8 +43,30 @@ async def test_coordinator_start_close(tmp_path):
     coord = Coordinator(valves=Valves(), config=cfg)
     await coord.start()
     assert coord._client is not None
+    # No writeback_token passed → writeback_client stays unset
+    assert coord.writeback_client is None
     await coord.close()
     assert coord._client is None
+
+
+@pytest.mark.asyncio
+async def test_coordinator_start_with_writeback_token(tmp_path):
+    cfg = RuntimeConfig(
+        llm_base_url="http://mock-llm:9090",
+        llm_api_key="sk-test",
+        embeddings_base_url="http://mock-emb:9091",
+        embeddings_api_key="sk-emb",
+    )
+    cfg.data_dir = tmp_path
+    coord = Coordinator(valves=Valves(), config=cfg)
+    await coord.start(writeback_token="sk-admin")
+    assert coord.writeback_client is not None
+    assert coord.writeback_client is not coord._client
+    # Token provider is StaticToken("sk-admin")
+    token = await coord.writeback_client._token_provider.get_token()
+    assert token == "sk-admin"
+    await coord.close()
+    assert coord.writeback_client is None
 
 
 @pytest.mark.asyncio

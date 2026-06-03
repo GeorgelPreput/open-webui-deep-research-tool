@@ -92,6 +92,43 @@ to tune them.
 
 ---
 
+## OpenAPI runtime: writeback channel (Phase 2)
+
+The OpenAPI Tool Server posts engine output (topic list, status pills,
+final report, citations, live iframe) directly to OWUI's per-message
+`/event` endpoint when three conditions hold:
+
+1. **`ENABLE_FORWARD_USER_INFO_HEADERS=true` is set on the OWUI side**
+   (in the OWUI container, not the tool server). Without it, OWUI
+   doesn't forward `X-OpenWebUI-Chat-Id` / `X-OpenWebUI-Message-Id`
+   to outbound tool calls and the runner has no binding for writeback.
+2. **`DR_OWUI_API_KEY` is set to an admin token** on the tool server.
+   The per-message `/event` endpoint admin-bypasses chat ownership, so
+   this is the *only* OWUI endpoint a server-side key can use to write
+   into chats owned by other users.
+3. **`jobs.writeback_enabled=true`** (default). Set
+   `DR_JOBS_WRITEBACK_ENABLED=false` to disable the channel without
+   tearing down the admin key — useful for staging the rollout.
+
+When all three hold, the topic list and final report land in the
+assistant message verbatim — the LLM doesn't need to repeat them. When
+any are missing, the runtime degrades to Phase 1 behaviour (the LLM
+emits a `user_facing_instruction` describing the slash-command grammar).
+
+The `outbox_*` valves tune the writeback queue:
+
+- `outbox_poll_interval_ms` — how often the worker checks for pending
+  rows when the queue is empty. Lower values reduce per-event latency
+  but raise idle CPU.
+- `outbox_max_attempts` — give up after this many failed POSTs to OWUI
+  for a single event. The row is then marked delivered so the queue
+  doesn't deadlock on a permanently broken target message.
+- `outbox_max_backoff_s` — caps the exponential backoff window between
+  retries; OWUI's `Retry-After` header replaces the exponential delay
+  when present (also capped by this value).
+
+---
+
 ## Model ID format
 
 Use the **exact ID OWUI registers in Settings → Models**, not the value

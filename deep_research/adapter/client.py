@@ -19,6 +19,11 @@ from deep_research.adapter.retry import with_retry
 logger = logging.getLogger("deep_research.adapter.client")
 
 
+PERSISTED_EVENT_TYPES: frozenset[str] = frozenset(
+    {"status", "message", "replace", "embeds", "files", "source", "citation"}
+)
+
+
 def _truncate(text: str, limit: int = 500) -> str:
     if len(text) <= limit:
         return text
@@ -340,3 +345,48 @@ class OWUIClient:
             "POST", f"/api/v1/chats/{chat_id}", json_body={"chat": chat}
         )
         return isinstance(data, dict) and data.get("status", True) is not False
+
+    # ---- Per-message persisted events ----
+
+    async def post_message_event(
+        self,
+        chat_id: str,
+        message_id: str,
+        event_type: str,
+        data: dict,
+    ) -> None:
+        """POST a persisted event to a specific chat message.
+
+        OWUI's per-message endpoint
+        ``POST /api/v1/chats/{chat_id}/messages/{message_id}/event``
+        broadcasts to live WebSocket clients AND persists the event to
+        the message row when ``event_type`` is one of the documented
+        short names. Long-name aliases (``chat:message:embeds`` etc.)
+        broadcast but do NOT persist. Unlike ``GET /api/v1/chats/{id}``,
+        this endpoint admin-bypasses chat ownership so a server-side
+        admin token can write to chats owned by other users — the
+        mechanism the OpenAPI Tool Server uses to land content directly
+        in the assistant message.
+
+        Args:
+            chat_id, message_id: Forwarded by OWUI in
+                ``X-OpenWebUI-Chat-Id`` / ``X-OpenWebUI-Message-Id``
+                headers when ``ENABLE_FORWARD_USER_INFO_HEADERS=true``.
+            event_type: Must be one of ``PERSISTED_EVENT_TYPES``.
+            data: Payload per OWUI's event schema; varies by event type.
+
+        Raises:
+            ValueError: ``event_type`` not in ``PERSISTED_EVENT_TYPES``.
+            AdapterError: HTTP failure after retry exhaustion.
+        """
+        if event_type not in PERSISTED_EVENT_TYPES:
+            raise ValueError(
+                f"event_type {event_type!r} is not persisted by OWUI; "
+                f"allowed: {sorted(PERSISTED_EVENT_TYPES)}"
+            )
+        path = f"/api/v1/chats/{chat_id}/messages/{message_id}/event"
+        await self._request(
+            "POST",
+            path,
+            json_body={"type": event_type, "data": data},
+        )

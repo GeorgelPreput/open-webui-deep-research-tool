@@ -77,6 +77,56 @@ row are: `status`, `message`, `replace`, `embeds`, `files`, `source`
 / `citation`. Long-name aliases (`chat:message:embeds` etc.)
 broadcast but do NOT persist.
 
+### Phase 2 writeback wiring
+
+The OpenAPI Tool Server uses a **second** `OWUIClient` bound to a
+static admin `DR_OWUI_API_KEY`. It's instantiated by
+`Coordinator.start(writeback_token=...)` and exposed as
+`Coordinator.writeback_client`. The user-request `OWUIClient` keeps
+its per-request `ContextTokenProvider` for everything else — only the
+`/event` POST path needs the admin token, because only that endpoint
+admin-bypasses chat ownership.
+
+The `OutboxWorker` (`entrypoints/openapi_tool/outbox.py`) is the
+durable writeback queue. It lives in the same sqlite file as
+`research_jobs` so a single `DR_DATA_DIR` volume gives durability for
+both. The runner translates each engine event to an `OutboxRow` via
+`_event_to_outbox`:
+
+  - `StatusEvent` → `status` (dedupe_key uses a monotonic per-job counter)
+  - `MessageEvent` → `replace` (the topic list at the gate; the LLM
+    no longer needs to reproduce it)
+  - `EmbedEvent` → `embeds` (engine-emitted iframe HTML)
+  - `CitationEvent` → `source` (side-panel citations, emitted per
+    bibliography entry in `phases/finalize.py`)
+
+Two writebacks happen *outside* the sink:
+
+  - **Bootstrap embed** at `start_job` and again at `submit_feedback`
+    (rebinds to the new tool-call message). Posts the iframe HTML with
+    a `replace: true` flag, baked with the per-job view token and the
+    `DR_OPENAPI_PUBLIC_BASE_URL`-resolved status poll URL.
+  - **Final writeback** after `coord.run()` returns: a `replace` with
+    `report.content`, followed by an `embeds` with `[]` to clear the
+    iframe.
+
+The drain order is `next_attempt_at ASC, rowid ASC` — `rowid` is
+sqlite's auto-increment, so rows enqueued in the same second still
+deliver in insertion order. UUIDs as `outbox_id` are useless for
+ordering and the original `outbox_id ASC` secondary sort produced
+nondeterministic delivery sequence.
+
+Worker loop spawn is opt-out: `OutboxWorker.start(spawn_loop=False)`
+opens the sqlite connection without spawning the background drain.
+The tests use this mode so `drain_once()` is deterministic; production
+uses `spawn_loop=True` (the default).
+
+Skip conditions in `_event_to_outbox` / bootstrap / final-writeback:
+`chat_id is None`, `target_message_id is None`, or
+`chat_id.startswith("local:")`. The `local:` prefix is OWUI's
+ephemeral-chat marker — the `/event` endpoint accepts the POST but
+the event is dropped, so we don't waste an HTTP round-trip.
+
 ---
 
 ## Concurrency contract (the engine)

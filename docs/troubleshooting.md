@@ -109,6 +109,34 @@ in order — the first one to fail localises the problem.
 - **Fix (Phase 1):** Verify the operation description is current — `curl -fsS "http://<openapi-host>/openapi.json" | jq '.paths["/research_jobs"].post.description'` should mention `verbatim`. Try a stronger model or add an explicit instruction to the system prompt.
 - **Fix (Phase 2):** Set `ENABLE_FORWARD_USER_INFO_HEADERS=true` on the OWUI side and restart OWUI. With Phase 2 writeback wired, the topic list lands directly in the assistant message via the `/event` channel; the LLM no longer needs to repeat anything.
 
+### Phase 2 writeback configured but nothing appears in chat
+
+The tool server is running, `DR_OWUI_API_KEY` is set, and the LLM made
+the call — but the topic list / final report doesn't appear in the
+assistant message.
+
+- **Cause 1 — headers not forwarded:** `ENABLE_FORWARD_USER_INFO_HEADERS`
+  defaults to `false` on the OWUI side. Without it, the
+  `X-OpenWebUI-Chat-Id` / `X-OpenWebUI-Message-Id` headers don't reach
+  the tool server, so the runner has no binding for writeback.
+  **Check:** the tool server log for a job start should include
+  `chat_id=` and the value should be non-empty (not `None`).
+  **Fix:** set `ENABLE_FORWARD_USER_INFO_HEADERS=true` on the OWUI
+  container, restart OWUI.
+- **Cause 2 — admin key wrong:** `DR_OWUI_API_KEY` is set but it isn't
+  an admin token. The `/event` endpoint requires admin (regular user
+  tokens are scoped to chats the user owns; the writeback path needs
+  to write into chats owned by *other* users).
+  **Check:** `curl -i -H "Authorization: Bearer $DR_OWUI_API_KEY" \
+  "http://<owui>/api/v1/users/" | head -1` should return 200, not 403.
+  **Fix:** issue a fresh admin token in OWUI Admin Settings → Users.
+- **Cause 3 — writeback disabled:** `DR_JOBS_WRITEBACK_ENABLED=false`.
+  **Fix:** unset the env var or set it to `true`.
+- **Cause 4 — ephemeral chat:** the chat's `chat_id` starts with
+  `local:`. OWUI's `/event` accepts the POST but the event is dropped
+  by design (local chats don't persist). **Workaround:** create a
+  proper (non-ephemeral) chat in OWUI before calling the tool.
+
 ---
 
 ## Compatibility / display

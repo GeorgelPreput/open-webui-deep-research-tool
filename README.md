@@ -157,6 +157,22 @@ for the current chat. The tool prompts the LLM to emit a verbatim
 slash-command instruction so the user knows how to drive the outline-
 feedback step.
 
+**Live writeback to chat content (recommended)**: when OWUI is started
+with `ENABLE_FORWARD_USER_INFO_HEADERS=true` and `DR_OWUI_API_KEY` is an
+admin token, the topic list and final report land directly in the
+assistant message as the engine produces them. The LLM no longer needs
+to repeat the topic list — the user sees it in chat in real time, types
+their `/k 1,3,5` reply, and the final report appears in the next tool-
+call message. Status pills and side-panel citations also stream in via
+the same channel. The mechanism is OWUI's per-message
+`POST /api/v1/chats/{id}/messages/{message_id}/event` endpoint, which
+admin-bypasses chat ownership (so the tool server's admin key can write
+to any user's chat). Without `ENABLE_FORWARD_USER_INFO_HEADERS=true` on
+the OWUI side the headers don't reach the tool server and writeback is
+silently disabled (Phase 1 verbatim-instruction fallback still works).
+Set `DR_JOBS_WRITEBACK_ENABLED=false` to disable writeback explicitly
+even when the headers and key are available.
+
 **Embedding-quota tip**: if KB ingestion is the bottleneck (low-TPM
 embedding key), set `DR_PERSISTENCE_DISABLE_KB_PERSISTENCE=true` to
 skip uploads to the OWUI KB. Research becomes ephemeral (no rehydrate,

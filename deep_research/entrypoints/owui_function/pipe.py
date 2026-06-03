@@ -14,7 +14,13 @@ from deep_research.config.logging import (
 )
 from deep_research.core.types import ChatMessage, RunUser
 from deep_research.orchestrator.coordinator import RuntimeConfig
-from deep_research.progress.events import EmbedEvent, Event, MessageEvent, StatusEvent
+from deep_research.progress.events import (
+    CitationEvent,
+    EmbedEvent,
+    Event,
+    MessageEvent,
+    StatusEvent,
+)
 
 name = "Deep Research"
 
@@ -145,3 +151,5 @@ async def _translate_event(event: Event, emitter: Any) -> None:
             "type": "embeds",
             "data": {"embeds": [embed_dict], "replace": True},
         })
+    elif isinstance(event, CitationEvent):
+        await emitter(event.to_dict())
