@@ -13,6 +13,7 @@ logger = logging.getLogger("deep_research.orchestrator.phases.front_back")
 
 
 async def run_front_back(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
+    ctx.raise_if_cancelled()
     conv_state = ctx.state.get_state(ctx.conversation_id)
     compiled_sections = ps.get("compiled_sections", {})
     synthesis_outline = ps.get("synthesis_outline", [])

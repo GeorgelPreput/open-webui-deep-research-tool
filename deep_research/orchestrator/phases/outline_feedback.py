@@ -13,6 +13,7 @@ logger = logging.getLogger("deep_research.orchestrator.phases.outline_feedback")
 
 
 async def run_outline_feedback(ctx: RunContext, state: dict[str, Any]) -> dict[str, Any]:
+    ctx.raise_if_cancelled()
     conv_state = ctx.state.get_state(ctx.conversation_id)
     if not conv_state.get("waiting_for_outline_feedback", False):
         return state

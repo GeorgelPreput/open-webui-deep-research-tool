@@ -106,7 +106,6 @@ research cycles in the first turn.
 │   ├── progress/   event bus, snapshot, progress-embed HTML                       │
 │   └── entrypoints/                                                               │
 │       ├── owui_function/pipe.py        # OWUI Function shim                      │
-│       ├── owui_pipeline/pipeline.py    # OWUI Pipelines shim                     │
 │       ├── openapi_tool/server.py       # FastAPI JSON tool server                │
 │       └── mcp/server.py                # FastMCP Streamable-HTTP                 │
 │                                                                                   │

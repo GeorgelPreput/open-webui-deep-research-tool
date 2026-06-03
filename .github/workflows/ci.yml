@@ -35,7 +35,7 @@ jobs:
         with:
           python-version: "3.11"
       # All optional extras so the smoke-import test sees the entry-point
-      # modules under entrypoints/{openapi_tool,mcp,owui_pipeline} too.
+      # modules under entrypoints/{openapi_tool,mcp} too.
       - run: pip install .[dev,server,mcp]
       - run: pytest tests/ --cov=deep_research --cov-report=term-missing
 

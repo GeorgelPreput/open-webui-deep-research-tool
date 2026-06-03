@@ -9,6 +9,7 @@ logger = logging.getLogger("deep_research.orchestrator.phases.compress")
 
 
 async def run_compress(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
+    ctx.raise_if_cancelled()
     results_history = ps.get("results_history", [])
     summary_embedding = ps.get("summary_embedding")
 

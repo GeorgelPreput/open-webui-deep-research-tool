@@ -11,6 +11,7 @@ logger = logging.getLogger("deep_research.orchestrator.phases.finalize")
 
 
 async def run_finalize(ctx: RunContext, ps: dict[str, Any]) -> Report:
+    ctx.raise_if_cancelled()
     conv_state = ctx.state.get_state(ctx.conversation_id)
     comprehensive_answer = ps.get("comprehensive_answer", "")
     titles = ps.get("titles", {})

@@ -9,6 +9,7 @@ logger = logging.getLogger("deep_research.orchestrator.phases.outline")
 
 
 async def run_outline(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
+    ctx.raise_if_cancelled()
     conv_state = ctx.state.get_state(ctx.conversation_id)
 
     research_outline = ps.get("research_outline", conv_state.get("research_state", {}).get("research_outline", []))

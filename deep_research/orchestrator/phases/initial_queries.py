@@ -14,6 +14,7 @@ logger = logging.getLogger("deep_research.orchestrator.phases.initial_queries")
 
 
 async def run_initial_queries(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
+    ctx.raise_if_cancelled()
     conv_state = ctx.state.get_state(ctx.conversation_id)
     user_message = ps.get("user_message", conv_state.get("last_user_message", ""))
     is_follow_up = await is_follow_up_query(ctx, [{"role": "user", "content": user_message}])

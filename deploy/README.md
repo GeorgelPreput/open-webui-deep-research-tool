@@ -6,13 +6,12 @@ runtimes in a browser. It brings up:
 | Service | URL | What it is |
 |---|---|---|
 | `open-webui` | http://localhost:3000 | The Open WebUI you test in |
-| `pipelines` | http://localhost:9099 | OWUI Pipelines sidecar with the `deep_research` pipeline preloaded |
-| `openapi-tool` | http://localhost:8000 | OpenAPI tool server (`/docs`, `POST /research`, `/health`) |
+| `openapi-tool` | http://localhost:8000 | OpenAPI tool server (`/docs`, `POST /research_jobs`, `/health`) |
 | `mcp` | http://localhost:9000 | MCP server (streamable-HTTP at `/mcp`) |
 
 > The **OWUI Function** runtime (`pipe.py`) is *not* a container — it runs inside
 > OWUI itself. To test it, paste `pipe.py` into OWUI > Admin > Functions. This
-> stack covers the other three runtimes.
+> stack covers the other two runtimes.
 
 ## 1. Start
 
@@ -37,36 +36,28 @@ to do those things:
 - Note the exact model IDs from OWUI > Admin Settings > Models. If they aren't
   the engine defaults (`gemma3:12b`, `gemma3:27b`, `nomic-embed-text`), set
   `DR_MODELS_*` in `docker-compose.yml` for `openapi-tool`/`mcp` (see comments
-  there) and in the Pipelines valves (step 4) for the pipeline.
+  there).
 
 ## 3. Create the callback API key
 
-The `openapi-tool`, `mcp`, and `pipelines` services call back into OWUI and need
-an admin key:
+The `openapi-tool` and `mcp` services call back into OWUI and need an admin
+key:
 
 1. OWUI > Settings > Account > API Keys > create one.
 2. Put it in `.env` as `DR_OWUI_API_KEY=sk-...`.
-3. `docker compose up -d` to restart the three caller services with the key.
+3. `docker compose up -d` to restart the caller services with the key.
 
 ## 4. Wire each runtime
 
-**Pipelines** — OWUI > Admin Settings > Connections > add an **OpenAI-compatible**
-connection: URL `http://pipelines:9099`, API key = `PIPELINES_API_KEY` (default
-`0p3n-w3bu!`). A model named **`deep_research_pipeline.deep-research`** (id
-`deep_research`) appears in the model picker. Open valves on that connection to
-set `OWUI_API_KEY` / model IDs if needed. Start a chat with it.
-
 **OpenAPI tool server** — the reliable check is the built-in Swagger UI at
-http://localhost:8000/docs → `POST /research` with `{"prompt": "..."}`. The
-response is synchronous JSON (full report + citations); the call blocks for the
-whole run, which can take several minutes. For long prompts use the
-`POST /research_jobs` + `GET /research_jobs/{id}` polling pair instead.
+http://localhost:8000/docs → `POST /research_jobs` with `{"prompt": "..."}`. It
+returns a `job_id` immediately and runs the research in the background.
 
 To attach it to OWUI: Settings > Tools > add a tool server with URL
 `http://openapi-tool:8000` (OWUI fetches `/openapi.json`).
 
 ```bash
-curl -s http://localhost:8000/research \
+curl -s -X POST http://localhost:8000/research_jobs \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"Explain the Mamba state-space architecture"}' | jq
 ```
@@ -78,9 +69,8 @@ exposes one tool, `deep_research(prompt, conversation_id?)`.
 
 ## Ports & data
 
-Host ports: `3000` (OWUI), `8000` (OpenAPI), `9000` (MCP), `9099` (Pipelines).
-State lives in named volumes (`openwebui-data`, `pipelines-data`, `openapi-data`,
-`mcp-data`).
+Host ports: `3000` (OWUI), `8000` (OpenAPI), `9000` (MCP).
+State lives in named volumes (`openwebui-data`, `openapi-data`, `mcp-data`).
 
 ## Teardown
 
@@ -93,5 +83,5 @@ docker compose down -v         # stop and delete the volumes
 
 - A research run only works once OWUI has a working chat model, embedding model,
   and web search — otherwise the engine starts but every LLM/search call fails.
-- All three caller services reach OWUI at `http://open-webui:8080` on the compose
+- Both caller services reach OWUI at `http://open-webui:8080` on the compose
   network; that's why `DR_OWUI_BASE_URL` is hardcoded to it in the compose file.

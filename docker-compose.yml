@@ -11,7 +11,6 @@
 #
 # Services:
 #   open-webui    http://localhost:3000   the UI you test in
-#   pipelines     http://localhost:9099    deep_research pipeline (OpenAI-compatible)
 #   openapi-tool  http://localhost:8000    OpenAPI tool server (/docs, /research, /health)
 #   mcp           http://localhost:9000    MCP server (streamable-http at /mcp)
 
@@ -31,26 +30,6 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - openwebui-data:/app/backend/data
-    restart: unless-stopped
-
-  pipelines:
-    build:
-      context: .
-      dockerfile: deploy/Dockerfile.pipelines
-    image: deep-research/pipelines:local
-    container_name: dr-pipelines
-    ports:
-      - "9099:9099"
-    environment:
-      # Must match the API key OWUI uses for its Pipelines connection.
-      PIPELINES_API_KEY: ${PIPELINES_API_KEY:-0p3n-w3bu!}
-      DR_OWUI_BASE_URL: http://open-webui:8080
-      DR_OWUI_API_KEY: ${DR_OWUI_API_KEY:-}
-      DR_DATA_DIR: /app/pipelines/data/deep-research
-    volumes:
-      - pipelines-data:/app/pipelines/data
-    depends_on:
-      - open-webui
     restart: unless-stopped
 
   openapi-tool:
@@ -118,6 +97,5 @@ services:
 
 volumes:
   openwebui-data:
-  pipelines-data:
   openapi-data:
   mcp-data:

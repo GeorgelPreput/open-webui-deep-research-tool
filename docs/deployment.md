@@ -89,7 +89,7 @@ contention.
 `Consumer` identifies which component reads the var. `LLM` =
 `LLMProviderClient`, `Emb` = `EmbeddingProviderClient`, `OWUI` =
 `OWUIClient`, `shim` = the entrypoint shim (OpenAPI server / MCP server /
-Pipelines / Function), `Coord` = `Coordinator` startup.
+Function), `Coord` = `Coordinator` startup.
 
 | Env var | Consumer | Typical value | Required | Secret | Failure if wrong |
 |---|---|---|---|---|---|

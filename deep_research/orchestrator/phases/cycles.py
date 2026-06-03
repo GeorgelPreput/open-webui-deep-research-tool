@@ -23,6 +23,7 @@ logger = logging.getLogger("deep_research.orchestrator.phases.cycles")
 
 
 async def run_cycles(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
+    ctx.raise_if_cancelled()
     conv_state = ctx.state.get_state(ctx.conversation_id)
     user_message = ps.get("user_message", "")
     all_topics = ps.get("all_topics", conv_state.get("all_topics", []))
@@ -49,6 +50,7 @@ async def run_cycles(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
 
     cycle = ps.get("cycle", 1)
     while cycle < max_cycles and active_outline:
+        ctx.raise_if_cancelled()
         cycle += 1
         # Reset the KB upload counter so ``max_kb_uploads_per_cycle`` is enforced
         # per cycle, not for the whole run.

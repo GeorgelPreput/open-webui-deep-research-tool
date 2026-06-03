@@ -5,16 +5,15 @@ search/fetch/compress cycles against Open WebUI's built-in web search and
 retrieval endpoints, and produces a synthesised, citation-verified report
 with a persisted knowledge base.
 
-The same core ships in four runtimes:
+The same core ships in three runtimes:
 
 | Runtime | When to use it |
 |---|---|
 | **OWUI Function** | You run Open WebUI yourself and want Deep Research to appear as a model in the chat dropdown. |
-| **OWUI Pipelines plugin** | You can't drop new Functions into the OWUI container but you do run a sidecar Pipelines container. |
 | **OpenAPI Tool server** | A JSON-over-HTTP tool surface designed for Open WebUI's tool-server integration; also usable from any HTTP client. |
 | **MCP server** | Anything that speaks Streamable-HTTP MCP — Claude Desktop, Cline, an MCP-aware orchestrator. |
 
-All four runtimes talk to **three independently configured services**: an
+All three runtimes talk to **three independently configured services**: an
 OpenAI-compatible chat LLM provider, an OpenAI-compatible embeddings
 provider, and Open WebUI (for retrieval, files, knowledge base, and chat
 persistence). Each surface has its own base URL and bearer token, so chat
@@ -40,8 +39,8 @@ services are pure remote HTTP APIs.
   completions, retrieval, files, knowledge, and chat persistence.
 - A search provider configured in OWUI Settings → Web Search.
 - An embedding model registered in OWUI Settings → Models.
-- Python 3.11+ if you're running the OpenAPI Tool / MCP / Pipelines
-  runtimes yourself.
+- Python 3.11+ if you're running the OpenAPI Tool or MCP runtimes
+  yourself.
 
 ---
 
@@ -86,36 +85,7 @@ container.
 After install, the Function appears as a model called `Deep Research` in
 the chat model dropdown.
 
-### 2. OWUI Pipelines plugin (sidecar container)
-
-```yaml
-# docker-compose.yml fragment
-services:
-  pipelines:
-    image: ghcr.io/open-webui/pipelines:main
-    ports:
-      - "9099:9099"
-    environment:
-      PIPELINES_API_KEY: "0p3n-w3bu!"
-      DR_OWUI_BASE_URL: "http://open-webui:8080"
-      DR_OWUI_API_KEY: "sk-owui-admin-key"
-      DR_LLM_BASE_URL: "http://open-webui:8080/openai"
-      DR_LLM_API_KEY: "sk-llm-key"
-      DR_EMBEDDINGS_BASE_URL: "http://open-webui:8080/openai"
-      DR_EMBEDDINGS_API_KEY: "sk-emb-key"
-    volumes:
-      - ./deep_research:/app/pipelines/pipelines/deep_research
-      - ./deep_research/entrypoints/owui_pipeline/pipeline.py:/app/pipelines/pipelines/deep_research_pipeline.py
-      - pipelines-data:/app/pipelines/data
-volumes:
-  pipelines-data:
-```
-
-In OWUI: **Settings → Connections → Add OpenAI-compatible** pointing at
-`http://pipelines:9099`. The Deep Research pipeline shows up in the model
-dropdown.
-
-### 3. OpenAPI Tool server (Docker)
+### 2. OpenAPI Tool server (Docker)
 
 Standalone REST service designed to plug into Open WebUI as a
 [tool server](https://docs.openwebui.com/features/extensibility/plugin/tools/openapi-servers/open-webui).
@@ -159,7 +129,7 @@ chat. Prefer `research` for prompts that complete inside your
 `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` window; switch to
 `start_research_job` + `get_research_job` polling for long runs.
 
-### 4. MCP server (Docker, Streamable-HTTP)
+### 3. MCP server (Docker, Streamable-HTTP)
 
 ```bash
 docker build -t deep-research-mcp -f deep_research/entrypoints/mcp/Dockerfile .
@@ -178,7 +148,7 @@ Then in Claude Desktop / Cline / your MCP client, register
 `http://localhost:9000` as a Streamable-HTTP MCP server. A single tool,
 `deep_research(prompt, conversation_id=None)`, becomes available.
 
-### 5. Library use (no runtime shim)
+### 4. Library use (no runtime shim)
 
 ```python
 import asyncio

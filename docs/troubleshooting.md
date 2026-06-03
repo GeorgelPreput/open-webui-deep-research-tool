@@ -71,7 +71,7 @@ in order — the first one to fail localises the problem.
     -H "Authorization: Bearer $DR_OWUI_API_KEY"
   ```
   A 404 confirms the cause.
-- **Fix:** Use the chat owner's API key, or accept that Pipelines / OpenAPI / MCP runtimes can only persist to chats owned by their fixed key user. The OWUI **Function** runtime sidesteps this — it forwards the caller's `Authorization` header. See [Compatibility › chat persistence caveat](./compatibility.md#chat-persistence-caveat).
+- **Fix:** Use the chat owner's API key, or accept that the OpenAPI / MCP runtimes can only persist to chats owned by their fixed key user. The OWUI **Function** runtime sidesteps this — it forwards the caller's `Authorization` header. See [Compatibility › chat persistence caveat](./compatibility.md#chat-persistence-caveat).
 
 ### OWUI returns 401 on every Deep Research API call
 
@@ -79,11 +79,6 @@ in order — the first one to fail localises the problem.
 - **Check:** `curl -fsS "$DR_OWUI_BASE_URL/api/v1/auths/" -H "Authorization: Bearer $DR_OWUI_API_KEY"` — 200 with user info if the key is good.
 - **Fix:** Reissue the key in OWUI → Settings → Account → API Keys, push it into the `dr-owui-key` Secret, rolling-restart the Deployment.
 
-### Pipelines runtime hangs on first request
-
-- **Cause:** `DR_OWUI_BASE_URL` unreachable from the Pipelines container — typically `localhost:8080` (which means *the Pipelines pod*, not OWUI).
-- **Check:** From inside the Pipelines container: `curl -v "$DR_OWUI_BASE_URL/api/health"`.
-- **Fix:** Use the in-cluster DNS name of the OWUI service (e.g. `http://open-webui.owui.svc.cluster.local:8080`) or the compose service name (`http://open-webui:8080`).
 
 ---
 

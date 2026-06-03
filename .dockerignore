@@ -9,10 +9,7 @@ __pycache__/
 **/*.pyc
 **/*.pyo
 
-# Legacy pre-refactor sources — not used at runtime, kept only as reference
-pipe.py
-deep_research_pipeline.py
-REFACTOR_PLAN.md
+# Project notes — not needed in runtime images
 CLAUDE.md
 
 # Tests + tooling

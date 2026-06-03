@@ -16,6 +16,7 @@ logger = logging.getLogger("deep_research.orchestrator.phases.rehydrate")
 
 
 async def run_rehydrate(ctx: RunContext, state: dict[str, Any]) -> dict[str, Any]:
+    ctx.raise_if_cancelled()
     await ctx.events.emit(StatusEvent(description="Rehydrating research state...", level="info", done=False))
 
     persisted_dr = await load_persisted_dr_state(ctx, ctx.chat_id)

@@ -1,10 +1,10 @@
 # Configuration reference
 
 Every knob is grouped on the `Valves` Pydantic model
-(`deep_research/config/valves.py`). In OWUI runtimes (Function /
-Pipelines) the groups render as nested forms in the admin UI. In Docker
-runtimes (OpenAPI Tool / MCP) the same fields are populated from
-environment variables with the `DR_<GROUP>_<FIELD>` convention, e.g.
+(`deep_research/config/valves.py`). In the OWUI Function runtime the
+groups render as nested forms in the admin UI. In Docker runtimes
+(OpenAPI Tool / MCP) the same fields are populated from environment
+variables with the `DR_<GROUP>_<FIELD>` convention, e.g.
 `DR_MODELS_RESEARCH_MODEL=gemma3:27b`.
 
 For production env layout see [deployment.md](./deployment.md). This page

@@ -219,6 +219,8 @@ class Coordinator:
         prompt: str,
         history: list[ChatMessage],
         sink: Sink,
+        cancellation_token: Any = None,
+        target_message_id: str | None = None,
     ) -> Report:
         inflight_key = f"{user.id}:{conversation_id}"
         async with self._inflight_lock:
@@ -233,7 +235,11 @@ class Coordinator:
         run_started = time.monotonic()
         log_handle = None
         try:
-            ctx = await self._build_context(user, conversation_id, chat_id, token, prompt, history, sink)
+            ctx = await self._build_context(
+                user, conversation_id, chat_id, token, prompt, history, sink,
+                cancellation_token=cancellation_token,
+                target_message_id=target_message_id,
+            )
             log_handle = set_log_context(
                 conversation_id=ctx.conversation_id,
                 chat_id=ctx.chat_id or "-",
@@ -332,6 +338,9 @@ class Coordinator:
         prompt: str,
         history: list[ChatMessage],
         sink: Sink,
+        *,
+        cancellation_token: Any = None,
+        target_message_id: str | None = None,
     ) -> RunContext:
         event_bus = EventBus(sink, flush_interval_ms=self._valves.events.flush_interval_ms)
         ctx = RunContext(
@@ -364,6 +373,8 @@ class Coordinator:
                 if self._llm_throttle is not None
                 else None
             ),
+            cancellation_token=cancellation_token,
+            target_message_id=target_message_id,
         )
         return ctx
 

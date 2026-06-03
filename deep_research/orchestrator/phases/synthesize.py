@@ -15,6 +15,7 @@ logger = logging.getLogger("deep_research.orchestrator.phases.synthesize")
 
 
 async def run_synthesize(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
+    ctx.raise_if_cancelled()
     conv_state = ctx.state.get_state(ctx.conversation_id)
     synthesis_outline = ps.get("synthesis_outline", [])
     results_history = ps.get("results_history", [])

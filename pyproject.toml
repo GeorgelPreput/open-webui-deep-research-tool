@@ -1,7 +1,7 @@
 [project]
 name = "deep-research"
 version = "0.2.8"
-description = "Multi-cycle deep research engine — single core, four runtimes (OWUI Function, Pipeline, OpenAPI Tool, MCP)"
+description = "Multi-cycle deep research engine — single core, three runtimes (OWUI Function, OpenAPI Tool, MCP)"
 requires-python = ">=3.11"
 dependencies = [
     "httpx[http2]>=0.27",
@@ -48,10 +48,6 @@ packages = ["deep_research/"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-extend-exclude = [
-  "pipe.py",
-  "deep_research_pipeline.py",
-]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]

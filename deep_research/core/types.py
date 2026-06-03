@@ -110,3 +110,27 @@ class RunContext:
     # run and per side (embeddings vs LLM).
     embeddings_degraded_warned: bool = False
     llm_degraded_warned: bool = False
+    # Cooperative cancellation. None when the entrypoint doesn't expose a
+    # cancel surface (Function runtime today); a CancellationToken when it
+    # does (OpenAPI runtime's /cancel endpoint, MCP cancel notifications).
+    # Phase boundaries call ``ctx.raise_if_cancelled()`` so a cancellation
+    # propagates as asyncio.CancelledError out of the run.
+    # Typed Any to avoid an import cycle with core.cancellation.
+    cancellation_token: Any = None
+    # OWUI assistant-message id this run writes back to, when known. Captured
+    # from the inbound X-OpenWebUI-Message-Id header by the OpenAPI runner;
+    # consumed by the runner's event→outbox mapping (Phase 2). The engine
+    # never reads this field — it's purely a binding the entrypoint carries
+    # alongside ctx so its own sink can route writebacks to the right msg.
+    target_message_id: str | None = None
+
+    def raise_if_cancelled(self) -> None:
+        """Phase-boundary cancellation check.
+
+        No-op when no cancellation token is attached (Function runtime
+        default). When a token is attached and cancellation has been
+        requested, raises ``asyncio.CancelledError`` so the engine's
+        normal exception path unwinds the run.
+        """
+        if self.cancellation_token is not None:
+            self.cancellation_token.raise_if_cancelled()

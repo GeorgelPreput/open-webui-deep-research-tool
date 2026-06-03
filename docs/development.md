@@ -41,12 +41,6 @@ endpoint mocked via `respx`, and runs as part of `pytest`.
 ## Repository layout
 
 - `deep_research/` — the active package.
-- `pipe.py`, `deep_research_pipeline.py` — frozen pre-refactor sources
-  kept as historical reference until the new package has been deployed and
-  observed in production. **Do not edit.** They are excluded from ruff /
-  mypy.
-- `REFACTOR_PLAN.md` — the multi-LLM migration plan that produced this
-  refactor. Useful for understanding why a file is structured the way it is.
 - `CLAUDE.md` — agent context, including the OWUI REST response-shape
   table and concurrency contract notes.
 - `tests/` — unit tests for caches, text utilities, the EventBus, the env

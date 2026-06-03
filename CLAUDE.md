@@ -12,22 +12,25 @@ the first persistence/KB call.
 
 ## What this repo is
 
-Two-file repo. Both files implement the same deep research engine (multi-cycle web research with semantic compression, eigendecomposition-based dimension tracking, KB persistence, and citation verification) but target different OWUI deployment environments:
+A multi-cycle web research engine (semantic compression,
+eigendecomposition-based dimension tracking, KB persistence,
+citation verification) packaged as the `deep_research/` Python
+package. The package ships in three runtimes, all of them
+shims over the same `Coordinator.run()` coroutine:
 
-| File | Class | Target | Entry point |
-|---|---|---|---|
-| `pipe.py` | `Pipe` | OWUI **Function** (runs inside OWUI container, shares its asyncio loop and `app.state`) | `async def pipe(self, body, __user__, __event_emitter__, ...)` |
-| `deep_research_pipeline.py` | `Pipeline` | OWUI **Pipelines** plugin (runs in a separate Pipelines container, calls OWUI via REST) | `def pipe(self, user_message, model_id, messages, body) -> Iterator[str]` |
+| Entrypoint | Target | Shape |
+|---|---|---|
+| `deep_research/entrypoints/owui_function/pipe.py` | OWUI **Function** (runs inside OWUI container) | `async def pipe(self, body, __user__, __event_emitter__, ...)` |
+| `deep_research/entrypoints/openapi_tool/server.py` | **OpenAPI Tool Server** (separate container, REST + iframe) | FastAPI app with `/research_jobs`, `/live_view`, etc. |
+| `deep_research/entrypoints/mcp/server.py` | **MCP server** (Streamable-HTTP) | Single FastMCP tool `deep_research(prompt, conversation_id?)` |
 
-`pipe.py` is the **active production code** — it ships as an OWUI Function. `deep_research_pipeline.py` was an attempted port to the OWUI Pipelines runtime; that approach proved a dead end (see "Why the Pipelines port was abandoned" below) and is kept only as historical reference. **Do not put new fixes in `deep_research_pipeline.py`.**
-
-### Why the Pipelines port was abandoned
-
-The Pipelines runtime forces a per-call thread + new-event-loop pattern, decouples the plugin from OWUI's request lifecycle, and prevents direct ORM access for chat persistence (the REST chat endpoints filter by API-key user, so persistence silently fails for chats not owned by that user). Cumulative friction made it not worth maintaining as a parallel implementation. The documentation below is preserved as a reference for how that port worked; do not treat it as a target for new code.
+The OWUI Pipelines plugin was removed (OWUI itself flagged
+Pipelines as legacy); the `owui_pipeline/` directory no longer
+exists.
 
 ---
 
-## Concurrency contract (`pipe.py`)
+## Concurrency contract (the engine)
 
 OWUI instantiates `Pipe` once and calls `pipe()` concurrently for every user request. Concurrent invocations are **separate `asyncio.Task` instances on the same event loop** — not separate threads. The concurrency model in `pipe.py` is built on three rules.
 
@@ -41,86 +44,7 @@ OWUI instantiates `Pipe` once and calls `pipe()` concurrently for every user req
 
 ---
 
-## Architecture: `deep_research_pipeline.py` (historical, abandoned)
-
-**Abandoned.** This pipeline is no longer maintained; fixes go in `pipe.py`. The sections below describe how the port worked and what was learned from it. Do not extend or maintain this code.
-
-### Key structural differences from `pipe.py`
-
-| Concern | `pipe.py` (OWUI Function) | `deep_research_pipeline.py` (Pipelines plugin) |
-|---|---|---|
-| LLM calls | `generate_chat_completions` from `open_webui.main` | `OWUIClient.chat_completions` → POST `/api/chat/completions` |
-| Embeddings | `self.__request__.app.state.config.RAG_EMBEDDING_MODEL` + direct EmbeddingFunction call | `OWUIClient.embeddings` → POST `/api/embeddings` |
-| Web search | `_try_openwebui_search` using OWUI internal search function | `OWUIClient.web_search` → POST `/api/v1/retrieval/process/web/search` |
-| Document extraction | `_build_document_loader_kwargs` + OWUI loaders | `OWUIClient.process_web_url` / `process_file` → REST endpoints |
-| KB operations | Direct ORM: `Knowledges.insert_new_knowledge()`, `Files.insert_new_file()` | `OWUIClient.create_kb` / `upload_file` / `add_file_to_kb` → REST |
-| Chat persistence | Direct ORM: `Chats.get_chat_by_id_and_user_id()` | `OWUIClient.get_chat` / `update_chat` — **only works for chats owned by the API key's user** (no admin bypass for `get_chat_by_id_and_user_id`) |
-| Status/progress UI | `__event_emitter__({"type": "status", ...})` → status pills in OWUI UI | `<details type="reasoning">` blocks yielded into the SSE stream |
-| Progress embed widget | HTML iframe rendered via `render_progress_embed_html` + `refresh_progress_embed` | Downgraded to plain-text summary inside the reasoning block |
-| Entry point signature | `async def pipe(...)` — awaitable coroutine | `def pipe(...) -> Iterator[str]` — sync, must return an iterator |
-| Asyncio environment | Runs inside OWUI's existing event loop | Runs in a fresh per-call event loop in a daemon thread |
-| OWUI imports | `from open_webui.models.chats import Chats`, `from open_webui.main import generate_chat_completions`, etc. | No OWUI imports — pure stdlib + third-party |
-
-### File layout (approximate line numbers — search by class/function name, not line)
-
-```
-deep_research_pipeline.py
-├── Module docstring + frontmatter (requirements pip list)
-├── OWUIClient                         # Async REST client (~L77–559)
-│   ├── __init__ / start / close
-│   ├── _request (retry + backoff core)
-│   ├── chat_completions               # streaming SSE parser
-│   ├── embeddings
-│   ├── web_search
-│   ├── process_web_url
-│   ├── process_text
-│   ├── upload_file (multipart)
-│   ├── process_file
-│   ├── get_file
-│   ├── create_kb / get_kb / add_file_to_kb
-│   ├── query_collection
-│   ├── get_chat / update_chat
-│   └── list_models
-├── _BridgeSink                        # Thread-safe async→sync bridge (~L562–588)
-├── _ReasoningBlock                    # <details type="reasoning"> builder (~L591–632)
-├── EmbeddingCache / TransformationCache / ResearchStateManager  # shared (~L635–782)
-├── _PipelineCallLocal                 # threading.local subclass; defines per-call slots (~L785)
-├── _tls_prop                          # module helper: builds threadlocal-backed property (~L815)
-├── Pipeline                           # Pipelines plugin shell
-│   ├── Valves (BaseModel)             # ~60 valves from pipe.py + 9 new ones
-│   ├── client/_sink/_reasoning/...    # 15 property descriptors → self._tls.<name>
-│   ├── __init__                       # type="manifold", pipelines list, self._tls=_PipelineCallLocal()
-│   ├── on_startup                     # Creates DATA_DIR only — NO client (wrong loop)
-│   ├── on_shutdown                    # Shuts down executor
-│   ├── on_valves_updated              # No-op (client is per-call)
-│   ├── _build_client                  # Factory; caller must start() in the right loop
-│   ├── pipe()                         # Sync entrypoint — spawns thread, returns iter(sink)
-│   ├── _run_research_async            # Async: creates client, runs engine, pushes result
-│   ├── _push_status_line              # Time-based reasoning flush
-│   ├── _flush_reasoning               # Finalizes current <details> block
-│   ├── _compat_event_emitter          # Translates OWUI event dicts for compat shims
-│   └── [all methods from pipe.py]    # Lifted verbatim; only I/O surface changed
-```
-
-### New valves (not in `pipe.py`)
-
-| Valve | Default | Purpose |
-|---|---|---|
-| `OWUI_BASE_URL` | `http://localhost:8080` | OWUI instance to call back into |
-| `OWUI_API_KEY` | `""` | Admin `sk-...` key. Must own the chats for persistence to work |
-| `EMBEDDING_MODEL` | `""` | OWUI embedding model ID. If empty, OWUI uses its default |
-| `DATA_DIR` | `/app/pipelines/data/deep-research` | Vocab embedding cache, checkpoints |
-| `OWUI_REQUEST_TIMEOUT_S` | `600` | Per-request aiohttp timeout |
-| `OWUI_MAX_CONCURRENT` | `8` | Semaphore cap on parallel OWUI calls |
-| `OWUI_MAX_RETRIES` | `3` | Retry count for retriable errors (5xx, connect errors) |
-| `STATUS_AS_REASONING` | `True` | Emit status as `<details type="reasoning">` vs. plain text |
-| `REASONING_FLUSH_SECONDS` | `4.0` | Max seconds before force-flushing an open reasoning block |
-
-### Valve type changes from `pipe.py`
-
-`DOMAIN_PRIORITY`, `CONTENT_PRIORITY`, `OWUI_API_KEY`, `EMBEDDING_MODEL` are `Optional[str]` in the Pipelines version (not `str`). OWUI admin UI sends empty fields as JSON `null`; Pydantic rejects bare `str` for null but accepts `Optional[str]`.
-
-### Valve model ID format
+## Valve model ID format
 
 Model IDs for `RESEARCH_MODEL`, `SYNTHESIS_MODEL`, and `EMBEDDING_MODEL` must match **exactly** what is registered in `app.state.MODELS` — the main OWUI models registry, NOT the RAG embedding config.
 
@@ -134,87 +58,6 @@ Model IDs for `RESEARCH_MODEL`, `SYNTHESIS_MODEL`, and `EMBEDDING_MODEL` must ma
 **"Model not found" on `/api/embeddings`**: means the model ID is not in `app.state.MODELS`. Check that:
 1. The model is **enabled** in OWUI Admin > Models (disabled models are excluded from `app.state.MODELS`).
 2. The model ID matches exactly — call `GET /api/models` to list all registered IDs.
-
----
-
-## Critical implementation patterns
-
-### Per-call OWUIClient — why it's required
-
-`aiohttp.ClientSession` is bound to the event loop it was created in. The Pipelines framework calls `pipe()` from multiple threads (one per request). Each call spawns a daemon thread with its own `asyncio.new_event_loop()`. If a shared session from `on_startup()` were used, it would raise `Future attached to a different loop`.
-
-**The rule:** never create an aiohttp session in `on_startup`. Always call `_build_client()` at the start of `_run_research_async`, inside the per-call event loop.
-
-```python
-# In the worker thread:
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)   # required for libraries that call get_event_loop()
-loop.run_until_complete(self._run_research_async(...))
-```
-
-```python
-# In _run_research_async:
-self.client = self._build_client()
-await self.client.start()
-try:
-    ...
-finally:
-    await self.client.close()
-    self.client = None
-```
-
-### Async-to-sync bridge (`_BridgeSink`)
-
-`pipe()` must return `Iterator[str]` (sync). The engine is entirely async. Pattern:
-
-1. Create `_BridgeSink(queue.Queue(maxsize=64))` with a sentinel object.
-2. Spawn daemon thread: `thread_target` creates a new event loop, runs `_run_research_async`, puts SENTINEL when done.
-3. `pipe()` returns `iter(sink)` — `_BridgeSink.__iter__` pulls from the queue, stopping at SENTINEL.
-
-Any string put into the sink becomes a chunk in OWUI's SSE stream, rendered immediately as markdown.
-
-### `<details type="reasoning">` rendering — exact format required
-
-OWUI's marked extension (`extension.ts:31`) tokenizes the block with this regex:
-
-```
-/^<details(\s+[^>]*)?>\n/
-```
-
-The `\n` after `>` is **mandatory** — the tokenizer will not match without it. Similarly, the summary regex requires `\n` after `</summary>`. `_ReasoningBlock.render()` must produce exactly:
-
-```python
-f"\n\n<details {attrs}>\n"
-f"<summary>{html.escape(summary)}</summary>\n"
-f"{body}\n"
-f"</details>\n\n"
-```
-
-- Leading `\n\n` — ensures the block starts on a fresh paragraph (otherwise inline text runs into it).
-- `\n` after opening `>` — required by tokenizer.
-- `\n` after `</summary>` — required by tokenizer.
-- Trailing `\n\n` — paragraph break after the block.
-
-Attributes used: `type="reasoning"`, `done="true"|"false"`, `duration="X.X"` (seconds, shown as "Thought for X seconds" when done).
-
-Consecutive `<details type="reasoning">` blocks are grouped by OWUI's `ConsecutiveDetailsGroup.svelte` into a single collapsible accordion. Each research phase (planning, cycle N, synthesis, citation verify) should open as `done="false"` and close with `done="true"`.
-
-### QUIET_CHAT_MODE — return value must be pushed to sink
-
-In OWUI Functions, the return value of `pipe()` is auto-appended to the chat as the assistant message. In Pipelines, the return value is discarded — only yielded strings reach the user.
-
-`_run_research` (the async engine) returns a `comprehensive_answer` string in QUIET mode. `_run_research_async` must capture it and push it to the sink:
-
-```python
-result = await self._run_research(body=body, __user__=user_dict)
-self._flush_reasoning(done=True)
-if isinstance(result, str) and result.strip():
-    self._sink_put(result)
-```
-
-### Time-based reasoning flush (`REASONING_FLUSH_SECONDS`)
-
-Without this, all status lines accumulate in memory and only flush at message events or end-of-run — the user sees no output for 9+ minutes. `_push_status_line` checks `time.monotonic() - self._block_opened_at` and flushes early if the block has been open longer than `REASONING_FLUSH_SECONDS` (default 4.0s).
 
 ---
 
@@ -234,27 +77,6 @@ These were wrong in the initial migration and required fixes. Trust these, not t
 ### Chat persistence limitation
 
 `GET /api/v1/chats/{id}` calls `Chats.get_chat_by_id_and_user_id(id, user_id)` — it filters by `user_id` matching the authenticated user. Admin role does **not** bypass this filter. If the `OWUI_API_KEY` belongs to user A and the chat was created by user B, `get_chat` returns 404. Persistence silently fails for chats not owned by the API key user. There is no workaround short of using the chat owner's key.
-
----
-
-## Deployment configuration
-
-### Container setup
-
-The Pipelines container needs:
-- `PIPELINES_API_KEY` env var (default `0p3n-w3bu!`) — used by OWUI to authenticate with Pipelines.
-- `OWUI_API_KEY` env var (or set via OWUI admin UI > Valves) — an admin `sk-...` key for Pipelines to call back into OWUI.
-- Volume mount at `/app/pipelines/data` (or `DATA_DIR`) for vocab embedding cache (~50–500 MB depending on model dimensions).
-
-Intra-pod deployment (Pipelines container in the same K8s pod as OWUI): `OWUI_BASE_URL=http://localhost:8080`. Docker Compose: `OWUI_BASE_URL=http://open-webui:8080`.
-
-### OWUI connection
-
-In OWUI: Settings > Connections > add OpenAI-compatible connection pointing at the Pipelines container (e.g. `http://pipelines:9099`). The model `deep_research_pipeline.deep-research` will appear in the model list.
-
-### Reasoning block flushing
-
-`REASONING_FLUSH_SECONDS=4.0` is calibrated for interactive use. Setting it lower gives more granular streaming but more frequent block boundaries. Setting it to `0` disables the cap (flush only at explicit `done=True` events).
 
 ---
 
@@ -454,7 +276,4 @@ narrower per-function tests.
 ls /app/backend/open_webui/utils/
 sed -n '720,770p' /app/backend/open_webui/main.py     # lifespan handler
 grep -rn "close_session\|session_pool" /app/backend/open_webui/
-
-# Pipelines
-docker logs <pipelines-container> -f --tail=100
 ```

@@ -21,8 +21,8 @@ fails. The research itself still runs.
 - **OWUI Function runtime** — the caller's `Authorization` header is
   passed through, so chat persistence works correctly without any extra
   configuration.
-- **Pipelines / OpenAPI Tool / MCP runtimes** — the API key is fixed at
-  the container level, so persistence only works for chats owned by that
+- **OpenAPI Tool / MCP runtimes** — the API key is fixed at the
+  container level, so persistence only works for chats owned by that
   key's user. Either use a per-user key, or accept that the report still
   reaches the user (it is appended to the assistant message) even though
   the structured `chat.deepResearch` checkpoint is not written.
