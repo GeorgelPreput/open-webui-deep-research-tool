@@ -25,10 +25,10 @@ Also asserts:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import pathlib
 from typing import Any
 
-import pytest
 import pytest_asyncio
 
 from deep_research.adapter.client import PERSISTED_EVENT_TYPES
@@ -167,10 +167,8 @@ async def runner(coord: _FakeCoord, store: JobStore, outbox: OutboxWorker):
 async def _wait_task(runner: JobRunner, job_id: str) -> None:
     t = runner._tasks.get(job_id)
     if t is not None:
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await t
-        except asyncio.CancelledError:
-            pass
 
 
 async def test_writeback_sequence_through_full_lifecycle(

@@ -18,8 +18,8 @@ import json
 import logging
 import pathlib
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 import aiosqlite
@@ -27,7 +27,7 @@ import aiosqlite
 logger = logging.getLogger("deep_research.entrypoints.openapi.jobs")
 
 
-class JobPhase(str, Enum):
+class JobPhase(StrEnum):
     QUEUED = "queued"
     BOOTSTRAPPING = "bootstrapping"
     OUTLINING = "outlining"
@@ -46,7 +46,7 @@ TERMINAL_PHASES: frozenset[JobPhase] = frozenset(
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 @dataclass
@@ -281,7 +281,7 @@ class JobStore:
         Times are measured against `completed_at`. Cancelled jobs share
         the failed bucket (both treated as undesirable outcomes).
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         completed_cutoff = (
             now - _seconds_to_timedelta(completed_retention_s)
         ).isoformat(timespec="seconds")

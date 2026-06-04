@@ -2,18 +2,17 @@
 from __future__ import annotations
 
 import asyncio
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
 
 from deep_research.entrypoints.openapi_tool.jobs import (
+    TERMINAL_PHASES,
     JobPhase,
     JobRecord,
     JobStore,
-    TERMINAL_PHASES,
     _now_iso,
     history_to_json,
 )
@@ -114,7 +113,7 @@ async def test_find_active_by_chat_handles_cancelled_and_failed(store: JobStore)
 
 async def test_list_expired_respects_phase_retention(store: JobStore, monkeypatch):
     # Two completed jobs, one fresh, one old. completed_retention_s=60.
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     fresh = (now - timedelta(seconds=5)).isoformat(timespec="seconds")
     old = (now - timedelta(seconds=3600)).isoformat(timespec="seconds")
 
@@ -137,7 +136,7 @@ async def test_list_expired_respects_phase_retention(store: JobStore, monkeypatc
 async def test_list_expired_uses_failed_retention_for_failed_and_cancelled(
     store: JobStore,
 ):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     old = (now - timedelta(seconds=120)).isoformat(timespec="seconds")
     await store.create(_make_record("old-failed"))
     await store.update("old-failed", phase=JobPhase.FAILED, completed_at=old)

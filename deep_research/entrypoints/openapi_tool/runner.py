@@ -41,7 +41,7 @@ from deep_research.progress.events import (
     StatusEvent,
 )
 
-from .jobs import JobPhase, JobRecord, JobStore, TERMINAL_PHASES, _now_iso
+from .jobs import TERMINAL_PHASES, JobPhase, JobRecord, JobStore, _now_iso
 
 if TYPE_CHECKING:
     from deep_research.entrypoints.openapi_tool.outbox import OutboxWorker
@@ -76,9 +76,9 @@ class JobRunner:
     def __init__(
         self,
         *,
-        coord: "Coordinator",
+        coord: Coordinator,
         store: JobStore,
-        outbox: "OutboxWorker | None" = None,
+        outbox: OutboxWorker | None = None,
         public_base_url: str = "",
     ) -> None:
         self._coord = coord

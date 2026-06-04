@@ -26,12 +26,12 @@ import json
 import logging
 import pathlib
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
-from deep_research.adapter.client import AdapterError, PERSISTED_EVENT_TYPES
+from deep_research.adapter.client import PERSISTED_EVENT_TYPES, AdapterError
 from deep_research.core.errors import extract_retry_after_seconds
 
 if TYPE_CHECKING:
@@ -41,11 +41,11 @@ logger = logging.getLogger("deep_research.entrypoints.openapi.outbox")
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _iso_from(dt: datetime) -> str:

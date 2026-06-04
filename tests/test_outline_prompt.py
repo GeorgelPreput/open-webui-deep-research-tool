@@ -15,7 +15,6 @@ from deep_research.research.outline_feedback import (
     render_outline_prompt,
 )
 
-
 SAMPLE_OUTLINE = [
     {"topic": "Architecture", "subtopics": ["State space", "Selectivity"]},
     {"topic": "Performance", "subtopics": ["Latency", "Throughput"]},

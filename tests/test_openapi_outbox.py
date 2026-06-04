@@ -8,7 +8,6 @@ isn't exercised here (that lives in the writeback e2e test).
 from __future__ import annotations
 
 import asyncio
-import json
 import pathlib
 from typing import Any
 

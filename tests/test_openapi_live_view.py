@@ -6,7 +6,6 @@ import pathlib
 import secrets
 from typing import Any
 
-import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -95,7 +94,7 @@ async def test_live_view_html_contains_polling_script(app_with_store):
     client = TestClient(app)
     resp = client.get(f"/live_view/{record.job_id}", params={"token": token})
     assert resp.status_code == 200
-    assert "__DR_BOOTSTRAP__" in resp.text
+    assert 'id="dr-bootstrap"' in resp.text
     assert "/live_view/jv-poll/status" in resp.text
     # nonce-protected script tags
     assert 'nonce="' in resp.text

@@ -20,8 +20,9 @@ escape hatch that disables the fail-fast still surfaces the warning.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Mapping
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from deep_research.config.valves import Valves
@@ -39,9 +40,9 @@ class ConfigWarning:
 
 
 async def audit_writeback_configuration(
-    valves: "Valves",
+    valves: Valves,
     env: Mapping[str, str],
-    coord: "Coordinator",
+    coord: Coordinator,
 ) -> list[ConfigWarning]:
     """Audit the runtime config that controls writeback + iframe behaviour.
 

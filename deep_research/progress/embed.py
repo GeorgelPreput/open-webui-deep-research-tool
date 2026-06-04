@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import secrets
 from typing import Any
@@ -118,12 +119,16 @@ def render_progress_embed_html(
             "view_token": view_token,
             "since_version": int(snapshot.get("revision", 0) or 0),
         }
-        bootstrap_json = json.dumps(bootstrap)
+        # Carry the bootstrap config through an HTML-escaped data attribute
+        # rather than interpolating JSON into the <script> body. HTML escaping
+        # is a recognised XSS barrier and prevents any stray `</script>` in
+        # user-derived values (job_id, view_token) from terminating the tag.
+        bootstrap_attr = html.escape(json.dumps(bootstrap), quote=True)
         poll_script = (
+            f'<div id="dr-bootstrap" hidden data-bootstrap="{bootstrap_attr}"></div>'
             f'<script nonce="{nonce}">'
-            f"window.__DR_BOOTSTRAP__ = {bootstrap_json};"
             "(function(){"
-            "var bs = window.__DR_BOOTSTRAP__;"
+            "var bs = JSON.parse(document.getElementById('dr-bootstrap').dataset.bootstrap);"
             "var sinceVersion = bs.since_version;"
             "var stopped = false;"
             "async function poll() {"

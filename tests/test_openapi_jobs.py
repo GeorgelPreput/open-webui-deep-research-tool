@@ -6,10 +6,7 @@ endpoint without spinning up the actual ``Coordinator``.
 """
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import pathlib
-import secrets
 from typing import Any
 
 import pytest

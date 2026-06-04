@@ -135,7 +135,7 @@ def test_render_progress_embed_push_only_omits_poll_script():
     from deep_research.progress.embed import render_progress_embed_html
 
     html = render_progress_embed_html(_snapshot())
-    assert "__DR_BOOTSTRAP__" not in html
+    assert "dr-bootstrap" not in html
     assert "Content-Security-Policy" in html
     assert "reportHeight" in html  # height-reporting script kept
 
@@ -148,11 +148,12 @@ def test_render_progress_embed_with_poll_url_emits_polling_script():
         poll_url="http://example.test/live_view/job-1/status",
         view_token="vt-xyz",
     )
-    assert "__DR_BOOTSTRAP__" in html
+    assert 'id="dr-bootstrap"' in html
     assert "live_view/job-1/status" in html
     assert "vt-xyz" in html
-    # Bootstrap JSON includes the current revision as since_version baseline.
-    assert '"since_version": 3' in html
+    # Bootstrap JSON includes the current revision as since_version baseline;
+    # JSON keys live in an HTML data attribute so quotes are entity-escaped.
+    assert "&quot;since_version&quot;: 3" in html
     # nonce attribute is applied to inline scripts
     assert 'nonce="' in html
 

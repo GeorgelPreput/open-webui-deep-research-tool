@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import json
 import logging
 import os
 import pathlib
@@ -40,7 +39,6 @@ from fastapi import (
     Query,
     Request,
     Response,
-    status,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -54,11 +52,10 @@ from deep_research.progress.embed import render_progress_embed_html
 
 from .config_audit import ConfigWarning, audit_writeback_configuration
 from .jobs import (
+    TERMINAL_PHASES,
     JobPhase,
     JobRecord,
     JobStore,
-    TERMINAL_PHASES,
-    _now_iso,
     history_to_json,
 )
 from .outbox import OutboxWorker
@@ -265,10 +262,15 @@ app = FastAPI(
 )
 
 
+# OWUI mounts the live-view iframe sandboxed `allow-scripts` *without*
+# `allow-same-origin`, so the iframe runs with an opaque origin and must use a
+# wildcard CORS policy to call back to this server. The poll request explicitly
+# uses `credentials: 'omit'`, so `allow_credentials=False` matches the actual
+# call pattern and keeps the CORS posture spec-conformant.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*"],  # nosemgrep: python.fastapi.security.wildcard-cors.wildcard-cors
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
