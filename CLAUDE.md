@@ -209,6 +209,80 @@ implementation's contamination bug was caused by per-call state being
 held on module/Pipe-level attributes; the new package has no such
 sites by construction.)
 
+**Slash-command grammar lives in three places.** The user-facing
+slash-command grammar (`/k`, `/keep`, `/r`, `/remove`, `/continue`,
+`/c`, plus range syntax `5-7`) is referenced by three independent
+sites:
+
+  1. `deep_research/research/outline_feedback.py::render_outline_prompt`
+     — the in-chat prompt the user sees and types against.
+  2. `deep_research/research/outline_feedback.py::process_outline_feedback_continuation`
+     — the parser that consumes the user's reply.
+  3. `deep_research/entrypoints/openapi_tool/schemas.py::StartResearchResponse.user_facing_instruction`
+     — the *pre-outline* teaser the LLM is told to emit verbatim
+     immediately after calling `start_research_job`.
+
+Any change to the grammar — rename, add, or remove a command — MUST
+touch all three sites in the same commit. Sites #1 and #2 are pinned
+together by `tests/test_outline_prompt.py` and the parser's own
+regex (`outline_feedback.py:249-250`); site #3 is pinned by
+`tests/test_openapi_jobs.py:99-100, 110-116`.
+
+Do NOT try to consolidate #3 into a single source of truth with #1.
+They serve different audiences (LLM re-emission vs direct-to-user
+chat content) and different timings (#3 fires before the outline
+exists; #1 fires when it's ready). The intentional duplication is
+documented here so a future cleanup pass doesn't accidentally
+collapse them.
+
+**Config warning code taxonomy.** The OpenAPI Tool Server runs a
+startup configuration audit
+(`deep_research/entrypoints/openapi_tool/config_audit.py`) plus one
+runtime detector inside `start_research_job`. Results are cached on
+`app.state.config_warnings` and surfaced via `GET /health` as JSON
+(`config_warnings: list[{code, severity, message, remediation}]`).
+The stable `code` values:
+
+  - `MISSING_OWUI_API_KEY` — `DR_OWUI_API_KEY` unset while
+    `valves.jobs.writeback_enabled=True`. The lifespan also fails
+    fast (raises `RuntimeError`) on this exact condition before the
+    audit runs; the audit retains the check so a future ops escape
+    hatch that disables the fail-fast still surfaces the warning.
+  - `OWUI_API_KEY_NOT_ADMIN` — probe (`OWUIClient.get_session_user()`
+    → `GET /api/v1/auths/`) returned `role != "admin"`. Writeback
+    POSTs would 401 at runtime; the server still starts.
+  - `OWUI_API_KEY_PROBE_FAILED` — the admin probe raised. Could be
+    transient infrastructure (OWUI not yet up); does NOT fail-fast.
+  - `MISSING_PUBLIC_BASE_URL` — `DR_OPENAPI_PUBLIC_BASE_URL` unset.
+    Severity `info` (degraded UX, not broken) — the iframe falls
+    back to the inbound request's host header.
+  - `OWUI_HEADERS_NOT_FORWARDED` — detected at runtime (not startup):
+    the first authenticated request to `start_research_job` arrived
+    without `X-OpenWebUI-Chat-Id`. One-shot per process via
+    `app.state._forward_headers_warned`. Means OWUI hasn't set
+    `ENABLE_FORWARD_USER_INFO_HEADERS=true`.
+
+Probe endpoint is `GET /api/v1/auths/`, not `GET /api/v1/users/`:
+`auths/` admits any valid token and returns the holder's `role`
+field, so we can check `role == "admin"` directly without inferring
+admin status from 401/403 codes. The matching adapter method is
+`OWUIClient.get_session_user()` in `deep_research/adapter/client.py`.
+
+**The audit is intentionally not re-run on every `/health` call.**
+K8s readinessProbe defaults to `periodSeconds=10`, so re-probing OWUI
+on each call would add ~360 calls/hour per pod purely for cosmetic
+warnings, and a transient OWUI outage would CrashLoopBackOff the tool
+server. The cached result is stale only after token rotation or OWUI
+config changes, which normally trigger a Secret rotation → pod
+restart anyway.
+
+**Fail-fast scope is narrow on purpose.** Only `MISSING_OWUI_API_KEY`
+(combined with `writeback_enabled=True`) raises at startup.
+`OWUI_API_KEY_NOT_ADMIN` and `OWUI_API_KEY_PROBE_FAILED` do not
+fail-fast because the former can't be checked synchronously before
+the event loop is up and the latter is often a transient infra
+issue. `MISSING_PUBLIC_BASE_URL` is informational only.
+
 ---
 
 ## Concurrency contract (the engine)

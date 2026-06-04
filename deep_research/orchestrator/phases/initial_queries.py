@@ -6,6 +6,7 @@ from deep_research.core.types import RunContext
 from deep_research.persistence.chat_state import initialize_research_state
 from deep_research.progress.events import MessageEvent, StatusEvent
 from deep_research.research.cycle import process_query
+from deep_research.research.outline_feedback import render_outline_prompt
 from deep_research.research.relevance import is_follow_up_query
 from deep_research.semantics.dimensions import initialize_research_dimensions
 from deep_research.semantics.embeddings import get_embedding
@@ -33,6 +34,8 @@ async def run_initial_queries(ctx: RunContext, ps: dict[str, Any]) -> dict[str, 
     else:
         research_outline, all_topics, outline_embedding, initial_results = await _handle_fresh(ctx, user_message, summary_embedding)
 
+    outline_text, flat_items = render_outline_prompt(research_outline)
+    await ctx.events.emit(MessageEvent(content=outline_text))
     await ctx.events.emit(StatusEvent(description="Initial research outline generated", level="info", done=False))
 
     ps["user_message"] = user_message
@@ -45,7 +48,6 @@ async def run_initial_queries(ctx: RunContext, ps: dict[str, Any]) -> dict[str, 
     ps["cycle"] = 1
 
     if ctx.valves.persistence.interactive_research and not is_follow_up:
-        outline_report, flat_items = _build_outline_text(research_outline)
         ctx.state.update_state(ctx.conversation_id, "waiting_for_outline_feedback", True)
         ctx.state.update_state(
             ctx.conversation_id,
@@ -57,7 +59,7 @@ async def run_initial_queries(ctx: RunContext, ps: dict[str, Any]) -> dict[str, 
             },
         )
         ps["awaiting_outline_feedback"] = True
-        ps["outline_report"] = outline_report
+        ps["outline_report"] = outline_text
 
     return ps
 
@@ -66,7 +68,6 @@ async def _handle_fresh(ctx, user_message, summary_embedding):
     research_outline, all_topics, outline_embedding, initial_results = await _generate_outline_and_initial(ctx, user_message)
 
     await initialize_research_state(ctx, user_message, research_outline, all_topics, outline_embedding, initial_results)
-    await _emit_outline(ctx, research_outline)
     await ctx.events.emit(StatusEvent(description="Research outline generated. Beginning research cycles...", level="info", done=False))
 
     return research_outline, all_topics, outline_embedding, initial_results
@@ -77,7 +78,6 @@ async def _handle_follow_up(ctx, user_message, summary_embedding):
     research_outline, all_topics, outline_embedding, initial_results = await _generate_outline_and_initial(ctx, user_message, summary_embedding=summary_embedding)
 
     await initialize_research_state(ctx, user_message, research_outline, all_topics, outline_embedding, initial_results)
-    await _emit_outline(ctx, research_outline)
 
     conv_state["follow_up_mode"] = True
     return research_outline, all_topics, outline_embedding, initial_results
@@ -215,33 +215,3 @@ async def _generate_outline(ctx, user_message, initial_results, is_follow_up):
         return json.loads(json_str)
     except (json.JSONDecodeError, ValueError):
         return {"outline": [{"topic": "Research Findings", "subtopics": ["Key Aspects", "Detailed Analysis"]}]}
-
-
-def _build_outline_text(research_outline: list[dict[str, Any]]) -> tuple[str, list[str]]:
-    """Build a single Markdown outline string with flat numbering and the
-    slash-command help, plus the flat_items list the parser indexes against."""
-    lines: list[str] = ["### Research Outline\n"]
-    flat_items: list[str] = []
-    item_num = 1
-    for topic_item in research_outline:
-        topic = topic_item.get("topic", "")
-        flat_items.append(topic)
-        lines.append(f"**{item_num}. {topic}**")
-        item_num += 1
-        for sub in topic_item.get("subtopics", []):
-            flat_items.append(sub)
-            lines.append(f"   {item_num}. {sub}")
-            item_num += 1
-        lines.append("")
-    lines.append(
-        "Reply with one of:\n"
-        "- `/k 1,3,5` or `/keep 1, 3, 5` — keep only those items\n"
-        "- `/r 2,4` or `/remove 2, 4` — remove those items\n"
-        "- `/continue` (or `/c`) — proceed with all items as-is"
-    )
-    return "\n".join(lines), flat_items
-
-
-async def _emit_outline(ctx, research_outline):
-    text, _ = _build_outline_text(research_outline)
-    await ctx.events.emit(MessageEvent(content=text))

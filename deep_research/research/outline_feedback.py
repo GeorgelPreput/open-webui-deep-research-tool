@@ -34,78 +34,54 @@ async def _emit_message(ctx: RunContext, content: str) -> None:
     await ctx.events.emit(MessageEvent(content=content))
 
 
-async def process_user_outline_feedback(
-    ctx: RunContext, outline_items: list[dict[str, Any]], original_query: str
-) -> dict[str, Any]:
-    """Process user feedback on research outline items by asking for feedback in chat"""
-    # Number each outline item (maintain hierarchy but flatten for numbering)
-    numbered_outline = []
-    flat_items = []
+def render_outline_prompt(
+    research_outline: list[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    """Render the outline-feedback prompt + flat_items.
 
-    # Process the hierarchical outline structure
+    Returns:
+        (message_content, flat_items)
+
+    ``flat_items[N-1]`` is the item the user means when they type ``N`` in
+    a ``/k`` / ``/r`` slash command. ``process_outline_feedback_continuation``
+    in this same module is the only consumer of that contract — keep the
+    two in lockstep.
+    """
+    lines: list[str] = ["### Research Outline\n"]
+    flat_items: list[str] = []
     item_num = 1
-    for topic_item in outline_items:
+    for topic_item in research_outline:
         topic = topic_item.get("topic", "")
-        subtopics = topic_item.get("subtopics", [])
-
-        # Add main topic with number
         flat_items.append(topic)
-        numbered_outline.append(f"{item_num}. {topic}")
+        lines.append(f"**{item_num}. {topic}**")
         item_num += 1
-
-        # Add subtopics with numbers
-        for subtopic in subtopics:
-            flat_items.append(subtopic)
-            numbered_outline.append(f"{item_num}. {subtopic}")
+        for sub in topic_item.get("subtopics", []):
+            flat_items.append(sub)
+            lines.append(f"   {item_num}. {sub}")
             item_num += 1
-
-    # Prepare the outline display
-    outline_display = "\n".join(numbered_outline)
-
-    # Emit a message with instructions using improved slash commands
-    feedback_message = (
-        "### Research Outline\n\n"
-        f"{outline_display}\n\n"
+        lines.append("")
+    lines.append(
         "**Please provide feedback on this research outline.**\n\n"
         "You can:\n"
-        "- Use commands like `/keep 1,3,5-7` or `/remove 2,4,8-10` to select specific items by number\n"
-        "- Or simply describe what topics you want to focus on or avoid in natural language\n\n"
+        "- Use commands like `/keep 1,3,5-7` or `/remove 2,4,8-10` to "
+        "select specific items by number\n"
+        "- Or simply describe what topics you want to focus on or "
+        "avoid in natural language\n\n"
         "Examples:\n"
-        "- `/k 1,3,5-7` or `/keep 1, 3, 5-7` (keep only items 1,3,5,6,7)\n"
-        "- `/r 2,4,8-10` or `/remove 2, 4, 8-10` (remove items 2,4,8,9,10)\n"
+        "- `/k 1,3,5-7` or `/keep 1, 3, 5-7` (keep only items "
+        "1,3,5,6,7)\n"
+        "- `/r 2,4,8-10` or `/remove 2, 4, 8-10` (remove items "
+        "2,4,8,9,10)\n"
         "- `/continue` or `/c` (keep all items as-is)\n"
-        '- "Focus on historical aspects and avoid technical details"\n'
-        '- "I\'m more interested in practical applications than theoretical concepts"\n\n'
-        "If you want to continue with all items, just reply `/continue`, `continue`, or leave your message empty.\n\n"
-        "**I'll pause here to await your response before continuing the research.**"
+        "- \"Focus on historical aspects and avoid technical details\"\n"
+        "- \"I'm more interested in practical applications than "
+        "theoretical concepts\"\n\n"
+        "If you want to continue with all items, just reply "
+        "`/continue`, `continue`, or leave your message empty.\n\n"
+        "**I'll pause here to await your response before continuing "
+        "the research.**"
     )
-
-    await _emit_message(ctx, feedback_message)
-
-    # Set flag to indicate we're waiting for feedback
-    ctx.state.update_state(ctx.conversation_id, "waiting_for_outline_feedback", True)
-    ctx.state.update_state(ctx.conversation_id,
-        "outline_feedback_data",
-        {
-            "outline_items": outline_items,
-            "flat_items": flat_items,
-            "numbered_outline": numbered_outline,
-            "original_query": original_query,
-        },
-    )
-
-    # Return a default response (this will be overridden in the next call).
-    # _feedback_message is included so the caller can return it directly as the
-    # pipe() return value — OWUI >=0.9 overwrites emitted content with the return
-    # value on final save, so returning "" would produce an empty assistant message.
-    return {
-        "kept_items": flat_items,
-        "removed_items": [],
-        "kept_indices": list(range(len(flat_items))),
-        "removed_indices": [],
-        "preference_vector": {"pdv": None, "strength": 0.0, "impact": 0.0},
-        "_feedback_message": feedback_message,
-    }
+    return "\n".join(lines), flat_items
 
 async def process_natural_language_feedback(
     ctx: RunContext, user_message: str, flat_items: list[str]

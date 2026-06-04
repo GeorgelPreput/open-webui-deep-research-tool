@@ -35,8 +35,17 @@ services are pure remote HTTP APIs.
 
 - **Open WebUI** ≥ 0.9.5 recommended (older works with degraded progress
   UI — see [docs/compatibility.md](./docs/compatibility.md)).
-- An OWUI admin API key (`sk-...`) with permission to embeddings, chat
-  completions, retrieval, files, knowledge, and chat persistence.
+- An OWUI API key (`sk-...`). **`DR_OWUI_API_KEY` must be an admin
+  token** if you run the **OpenAPI Tool Server** with writeback enabled
+  (the default) — the server uses it to post writeback events to OWUI's
+  per-message `/event` endpoint on behalf of arbitrary users, and that
+  endpoint only admin-bypasses chat ownership for admin tokens. A
+  non-admin key works for the OWUI Function and MCP runtimes, or for
+  the OpenAPI Tool Server with `DR_JOBS_WRITEBACK_ENABLED=false`. The
+  OpenAPI Tool Server refuses to start if `DR_OWUI_API_KEY` is unset
+  while writeback is enabled. Either way the token needs permission to
+  embeddings, chat completions, retrieval, files, knowledge, and chat
+  persistence.
 - A search provider configured in OWUI Settings → Web Search.
 - An embedding model registered in OWUI Settings → Models.
 - Python 3.11+ if you're running the OpenAPI Tool or MCP runtimes
@@ -60,6 +69,13 @@ DR_EMBEDDINGS_API_KEY=sk-emb-key
 Chat and embeddings can share a backend or be split. For production layout
 (separate keys per surface, K8s/Helm manifests, throttling for low-TPM
 embedding providers), see [docs/deployment.md](./docs/deployment.md).
+
+> ⚠ **Admin-key requirement (OpenAPI Tool Server only).** The placeholder
+> `sk-owui-admin-key` above is intentional: with writeback enabled (the
+> default), this token must have OWUI's `admin` role. The server refuses
+> to start if `DR_OWUI_API_KEY` is unset, and `GET /health` surfaces a
+> structured warning when the key is set but not admin. See
+> [OpenAPI Tool server § live writeback](#2-openapi-tool-server-docker).
 
 ### 1. OWUI Function (in-container)
 
@@ -100,7 +116,7 @@ plus a self-polling live-progress iframe.
 | `cancel_research_job` | `POST /research_jobs/{job_id}/cancel` | Best-effort cancellation; the engine bails at the next phase boundary. |
 | _(live view)_ | `GET /live_view/{job_id}` | Renders the progress iframe HTML (view-token authenticated). |
 | _(live view JSON)_ | `GET /live_view/{job_id}/status` | JSON snapshot used by the iframe's polling loop. |
-| _(health)_ | `GET /health` | Liveness check. |
+| _(health)_ | `GET /health` | Liveness check; returns `config_warnings` as JSON (admin-token misconfiguration, missing public base URL, OWUI-side header-forwarding misconfig, etc.). |
 
 ```bash
 docker build -t deep-research-openapi -f deep_research/entrypoints/openapi_tool/Dockerfile .
@@ -157,21 +173,34 @@ for the current chat. The tool prompts the LLM to emit a verbatim
 slash-command instruction so the user knows how to drive the outline-
 feedback step.
 
-**Live writeback to chat content (recommended)**: when OWUI is started
-with `ENABLE_FORWARD_USER_INFO_HEADERS=true` and `DR_OWUI_API_KEY` is an
-admin token, the topic list and final report land directly in the
-assistant message as the engine produces them. The LLM no longer needs
-to repeat the topic list — the user sees it in chat in real time, types
-their `/k 1,3,5` reply, and the final report appears in the next tool-
-call message. Status pills and side-panel citations also stream in via
-the same channel. The mechanism is OWUI's per-message
+**Live writeback to chat content (recommended)** requires two things:
+
+1. **`DR_OWUI_API_KEY` set to an OWUI admin token.** Writeback POSTs to
+   OWUI's per-message `/event` endpoint on behalf of arbitrary users; a
+   non-admin token can only write its own chats. The server refuses to
+   start without the key (with writeback enabled); a non-admin key
+   surfaces as a `OWUI_API_KEY_NOT_ADMIN` warning on `GET /health`.
+2. **`ENABLE_FORWARD_USER_INFO_HEADERS=true` on the OWUI container** so
+   `X-OpenWebUI-Chat-Id` / `X-OpenWebUI-Message-Id` reach the tool
+   server. Without these headers, jobs record `chat_id=None` and
+   writeback is silently disabled (Phase 1 verbatim-instruction
+   fallback still works). The tool server detects the missing headers
+   on the first authenticated request and surfaces the warning code
+   `OWUI_HEADERS_NOT_FORWARDED` via `/health`.
+
+When both are in place, the topic list and final report land directly
+in the assistant message as the engine produces them. The LLM no longer
+needs to repeat the topic list — the user sees it in chat in real time,
+types their `/k 1,3,5` reply, and the final report appears in the next
+tool-call message. Status pills and side-panel citations also stream in
+via the same channel. The mechanism is OWUI's per-message
 `POST /api/v1/chats/{id}/messages/{message_id}/event` endpoint, which
 admin-bypasses chat ownership (so the tool server's admin key can write
-to any user's chat). Without `ENABLE_FORWARD_USER_INFO_HEADERS=true` on
-the OWUI side the headers don't reach the tool server and writeback is
-silently disabled (Phase 1 verbatim-instruction fallback still works).
-Set `DR_JOBS_WRITEBACK_ENABLED=false` to disable writeback explicitly
-even when the headers and key are available.
+to any user's chat).
+
+Set `DR_JOBS_WRITEBACK_ENABLED=false` to disable writeback explicitly;
+in that mode a non-admin `DR_OWUI_API_KEY` is fine and the iframe-only
+UX still works.
 
 **Embedding-quota tip**: if KB ingestion is the bottleneck (low-TPM
 embedding key), set `DR_PERSISTENCE_DISABLE_KB_PERSISTENCE=true` to

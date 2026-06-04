@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from deep_research.entrypoints.openapi_tool import server as srv
+from deep_research.entrypoints.openapi_tool.config_audit import ConfigWarning
 from deep_research.entrypoints.openapi_tool.jobs import (
     JobPhase,
     JobRecord,
@@ -67,6 +68,7 @@ async def app_with_state(tmp_path: pathlib.Path):
             app.router.routes.append(route)
     app.state.job_store = store
     app.state.runner = runner
+    app.state.config_warnings = []
     try:
         yield app, store, runner
     finally:
@@ -377,3 +379,93 @@ def test_openapi_schema_lists_v2_operations(client):
     start_op = paths["/research_jobs"]["post"]
     assert start_op["operationId"] == "start_research_job"
     assert "verbatim" in start_op["description"].lower()
+
+
+def test_health_returns_empty_config_warnings_when_clean(client):
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["config_warnings"] == []
+
+
+def test_health_returns_config_warnings_when_present(app_with_state, client):
+    app, _, _ = app_with_state
+    app.state.config_warnings = [
+        ConfigWarning(
+            code="MISSING_PUBLIC_BASE_URL",
+            severity="info",
+            message="public base URL unset",
+            remediation="set DR_OPENAPI_PUBLIC_BASE_URL",
+        ),
+        ConfigWarning(
+            code="OWUI_API_KEY_NOT_ADMIN",
+            severity="warning",
+            message="key is not admin",
+            remediation="use an admin key",
+        ),
+    ]
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    codes = [w["code"] for w in body["config_warnings"]]
+    assert codes == ["MISSING_PUBLIC_BASE_URL", "OWUI_API_KEY_NOT_ADMIN"]
+    # Severity is preserved
+    by_code = {w["code"]: w for w in body["config_warnings"]}
+    assert by_code["MISSING_PUBLIC_BASE_URL"]["severity"] == "info"
+    assert by_code["OWUI_API_KEY_NOT_ADMIN"]["severity"] == "warning"
+
+
+def test_headers_not_forwarded_appends_warning_once(app_with_state, client):
+    """Authenticated request without X-OpenWebUI-Chat-Id appends
+    OWUI_HEADERS_NOT_FORWARDED to app.state.config_warnings; a second
+    identical call does NOT duplicate it (one-shot per process)."""
+    app, _, _ = app_with_state
+
+    resp1 = client.post(
+        "/research_jobs",
+        json={"prompt": "Q1"},
+        headers={"Authorization": "Bearer user-token"},
+    )
+    assert resp1.status_code == 200
+
+    codes = [w.code for w in app.state.config_warnings]
+    assert codes == ["OWUI_HEADERS_NOT_FORWARDED"]
+
+    resp2 = client.post(
+        "/research_jobs",
+        json={"prompt": "Q2"},
+        headers={"Authorization": "Bearer user-token"},
+    )
+    assert resp2.status_code == 200
+
+    # Still exactly one — the one-shot flag prevents duplicates
+    codes_after = [w.code for w in app.state.config_warnings]
+    assert codes_after == ["OWUI_HEADERS_NOT_FORWARDED"]
+
+
+def test_headers_not_forwarded_silent_when_chat_id_present(app_with_state, client):
+    """When the OWUI headers DO arrive, no warning is appended."""
+    app, _, _ = app_with_state
+
+    resp = client.post(
+        "/research_jobs",
+        json={"prompt": "Q"},
+        headers={
+            "Authorization": "Bearer user-token",
+            "X-OpenWebUI-Chat-Id": "chat-1",
+            "X-OpenWebUI-Message-Id": "msg-1",
+        },
+    )
+    assert resp.status_code == 200
+    assert app.state.config_warnings == []
+
+
+def test_headers_not_forwarded_silent_when_no_auth(app_with_state, client):
+    """No Authorization header at all → no warning (operator/test caller, not OWUI)."""
+    app, _, _ = app_with_state
+
+    resp = client.post("/research_jobs", json={"prompt": "Q"})
+    assert resp.status_code == 200
+    assert app.state.config_warnings == []

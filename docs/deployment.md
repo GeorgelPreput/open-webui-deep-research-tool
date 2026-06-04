@@ -370,14 +370,27 @@ Then confirm:
   see [Compatibility › chat persistence caveat](./compatibility.md#chat-persistence-caveat).
 - (OpenAPI Tool runtime) `DR_OPENAPI_PUBLIC_BASE_URL` resolves from
   the user's browser to the tool server's listening port. Open
-  `<DR_OPENAPI_PUBLIC_BASE_URL>/health` in a browser; if you get JSON
-  `{"status":"ok"}` the live-progress iframe will be reachable too.
+  `<DR_OPENAPI_PUBLIC_BASE_URL>/health` in a browser; you should see
+  `{"status":"ok", "config_warnings": []}` when everything is wired
+  correctly. A non-empty `config_warnings` array surfaces
+  misconfiguration as `{code, severity, message, remediation}` dicts —
+  see [troubleshooting › "Phase 2 writeback configured but nothing
+  appears in chat"](./troubleshooting.md) for the code taxonomy.
+- (Phase 2 writeback — OpenAPI server side) The OpenAPI Tool Server
+  refuses to start with a `RuntimeError` if `DR_OWUI_API_KEY` is unset
+  while `DR_JOBS_WRITEBACK_ENABLED=true` (the default). Either set the
+  admin key or disable writeback explicitly with
+  `DR_JOBS_WRITEBACK_ENABLED=false`. A `DR_OWUI_API_KEY` that's set but
+  not an admin token doesn't block startup but appears in `/health` as
+  `OWUI_API_KEY_NOT_ADMIN` — runtime writeback POSTs would fail with 401.
 - (Phase 2 writeback — OWUI side) Set
   `ENABLE_FORWARD_USER_INFO_HEADERS=true` on the OWUI container so the
   `X-OpenWebUI-Chat-Id` / `X-OpenWebUI-Message-Id` headers reach the
   tool server. Without these, the writeback channel falls back to the
   polling-only iframe and the LLM still has to repeat the topic list
-  by hand.
+  by hand. The tool server detects the missing headers on the first
+  authenticated request and surfaces `OWUI_HEADERS_NOT_FORWARDED` via
+  `/health`.
 
 ---
 

@@ -220,6 +220,20 @@ class OWUIClient:
             return resp
         return []
 
+    # ---- Session user (admin probe) ----
+
+    async def get_session_user(self) -> dict:
+        """Return the OWUI session-user object for the API token.
+
+        Calls ``GET /api/v1/auths/``, which uses ``Depends(get_current_user)``
+        and admits any valid token. The response JSON includes ``role``, so
+        callers can probe admin status by reading ``role == 'admin'``
+        directly instead of inferring it from a 401/403 on an admin-only
+        endpoint. Used by the OpenAPI Tool Server's startup config audit.
+        """
+        resp = await self._request("GET", "/api/v1/auths/")
+        return resp if isinstance(resp, dict) else {}
+
     # ---- Web ----
 
     async def web_search(self, queries: list[str]) -> dict:

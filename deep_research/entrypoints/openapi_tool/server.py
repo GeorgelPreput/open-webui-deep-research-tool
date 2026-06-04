@@ -52,6 +52,7 @@ from deep_research.config.logging import configure_logging
 from deep_research.orchestrator.coordinator import RuntimeConfig
 from deep_research.progress.embed import render_progress_embed_html
 
+from .config_audit import ConfigWarning, audit_writeback_configuration
 from .jobs import (
     JobPhase,
     JobRecord,
@@ -123,6 +124,16 @@ async def lifespan(app: FastAPI):
     valves = load_valves_from_env(prefix="DR_")
     configure_logging(valves)
 
+    if valves.jobs.writeback_enabled and not os.environ.get("DR_OWUI_API_KEY"):
+        raise RuntimeError(
+            "DR_OWUI_API_KEY is required when DR_JOBS_WRITEBACK_ENABLED is "
+            "true (default). The OpenAPI Tool Server uses this token to post "
+            "writeback events to OWUI on behalf of arbitrary users; the "
+            "token must have OWUI's admin role. Set DR_OWUI_API_KEY to an "
+            "admin API key, or set DR_JOBS_WRITEBACK_ENABLED=false to "
+            "disable writeback."
+        )
+
     config = RuntimeConfig(
         data_dir=os.environ.get("DR_DATA_DIR", "/data/deep_research"),
         base_url=os.environ.get("DR_OWUI_BASE_URL", "http://localhost:8080"),
@@ -159,6 +170,14 @@ async def lifespan(app: FastAPI):
     app.state.coord = coord
     app.state.valves = valves
 
+    app.state.config_warnings = await audit_writeback_configuration(
+        valves, os.environ, coord
+    )
+    for w in app.state.config_warnings:
+        logger.warning(
+            "Config audit: [%s] %s — %s", w.code, w.message, w.remediation
+        )
+
     db_path = pathlib.Path(config.data_dir) / "jobs.sqlite"
     store = JobStore(db_path, busy_timeout_ms=valves.jobs.sqlite_busy_timeout_ms)
     await store.start()
@@ -181,11 +200,6 @@ async def lifespan(app: FastAPI):
             valves.jobs.outbox_poll_interval_ms,
             valves.jobs.outbox_max_attempts,
             valves.jobs.outbox_max_backoff_s,
-        )
-    elif valves.jobs.writeback_enabled and writeback_client is None:
-        logger.warning(
-            "writeback_enabled=true but DR_OWUI_API_KEY is unset; the iframe "
-            "and chat-content writeback are disabled until the env var is set."
         )
     app.state.outbox = outbox
 
@@ -335,9 +349,40 @@ async def start_research_job(
     req: StartResearchRequest,
     request: Request,
     token: _ApiToken,
+    creds: _BearerCreds,
 ) -> StartResearchResponse:
     chat_id = request.headers.get("X-OpenWebUI-Chat-Id")
     message_id = request.headers.get("X-OpenWebUI-Message-Id")
+
+    if (
+        creds is not None
+        and creds.credentials
+        and not chat_id
+        and not getattr(request.app.state, "_forward_headers_warned", False)
+    ):
+        request.app.state._forward_headers_warned = True
+        warning = ConfigWarning(
+            code="OWUI_HEADERS_NOT_FORWARDED",
+            severity="warning",
+            message=(
+                "An authenticated request arrived without "
+                "X-OpenWebUI-Chat-Id. OWUI is not forwarding user-info "
+                "headers; writeback is silently disabled."
+            ),
+            remediation=(
+                "On the OWUI container, set "
+                "ENABLE_FORWARD_USER_INFO_HEADERS=true and restart."
+            ),
+        )
+        existing = getattr(request.app.state, "config_warnings", None)
+        if existing is None:
+            existing = []
+            request.app.state.config_warnings = existing
+        existing.append(warning)
+        logger.warning(
+            "Config audit (runtime): [%s] %s — %s",
+            warning.code, warning.message, warning.remediation,
+        )
 
     store: JobStore = request.app.state.job_store
     runner: JobRunner = request.app.state.runner
@@ -547,5 +592,17 @@ async def live_view_status(
 
 
 @app.get("/health", tags=["health"])
-async def health() -> dict:
-    return {"status": "ok"}
+async def health(request: Request) -> dict:
+    warnings = getattr(request.app.state, "config_warnings", [])
+    return {
+        "status": "ok",
+        "config_warnings": [
+            {
+                "code": w.code,
+                "severity": w.severity,
+                "message": w.message,
+                "remediation": w.remediation,
+            }
+            for w in warnings
+        ],
+    }

@@ -115,27 +115,51 @@ The tool server is running, `DR_OWUI_API_KEY` is set, and the LLM made
 the call — but the topic list / final report doesn't appear in the
 assistant message.
 
-- **Cause 1 — headers not forwarded:** `ENABLE_FORWARD_USER_INFO_HEADERS`
-  defaults to `false` on the OWUI side. Without it, the
-  `X-OpenWebUI-Chat-Id` / `X-OpenWebUI-Message-Id` headers don't reach
-  the tool server, so the runner has no binding for writeback.
-  **Check:** the tool server log for a job start should include
-  `chat_id=` and the value should be non-empty (not `None`).
+**Start with `GET /health`** — the OpenAPI Tool Server's config audit
+runs at startup and the runtime header-forwarding detector trips on
+the first authenticated request without `X-OpenWebUI-Chat-Id`:
+
+```bash
+curl -s http://<openapi-host>:8000/health | jq .config_warnings
+# Returns a list of {code, severity, message, remediation} dicts.
+# Empty list = audit found nothing wrong.
+```
+
+Match the `code` field against the causes below.
+
+- **Cause 1 — `OWUI_HEADERS_NOT_FORWARDED`:**
+  `ENABLE_FORWARD_USER_INFO_HEADERS` defaults to `false` on the OWUI
+  side. Without it, the `X-OpenWebUI-Chat-Id` /
+  `X-OpenWebUI-Message-Id` headers don't reach the tool server, so the
+  runner has no binding for writeback. The tool server logs this as a
+  warning the first time an authenticated request arrives without the
+  chat-id header, and the warning is surfaced via `/health`.
   **Fix:** set `ENABLE_FORWARD_USER_INFO_HEADERS=true` on the OWUI
   container, restart OWUI.
-- **Cause 2 — admin key wrong:** `DR_OWUI_API_KEY` is set but it isn't
-  an admin token. The `/event` endpoint requires admin (regular user
-  tokens are scoped to chats the user owns; the writeback path needs
-  to write into chats owned by *other* users).
-  **Check:** `curl -i -H "Authorization: Bearer $DR_OWUI_API_KEY" \
-  "http://<owui>/api/v1/users/" | head -1` should return 200, not 403.
+- **Cause 2 — `OWUI_API_KEY_NOT_ADMIN`:** `DR_OWUI_API_KEY` is set but
+  it isn't an admin token. The `/event` endpoint requires admin
+  (regular user tokens are scoped to chats the user owns; the
+  writeback path needs to write into chats owned by *other* users).
+  **Diagnostic check** (returns the role directly):
+  ```bash
+  curl -s -H "Authorization: Bearer $DR_OWUI_API_KEY" \
+    "$DR_OWUI_BASE_URL/api/v1/auths/" | jq .role
+  # → "admin" if everything is correct; "user" or similar means
+  # the token is not admin. A non-admin token would receive 401 on
+  # /event POSTs at runtime.
+  ```
   **Fix:** issue a fresh admin token in OWUI Admin Settings → Users.
-- **Cause 3 — writeback disabled:** `DR_JOBS_WRITEBACK_ENABLED=false`.
-  **Fix:** unset the env var or set it to `true`.
+- **Cause 3 — writeback disabled by valve:**
+  `DR_JOBS_WRITEBACK_ENABLED=false`. No warning code; the server
+  intentionally skipped wiring the outbox.
+  **Fix:** unset the env var or set it to `true` (the server will
+  refuse to start until `DR_OWUI_API_KEY` is also set).
 - **Cause 4 — ephemeral chat:** the chat's `chat_id` starts with
   `local:`. OWUI's `/event` accepts the POST but the event is dropped
   by design (local chats don't persist). **Workaround:** create a
-  proper (non-ephemeral) chat in OWUI before calling the tool.
+  proper (non-ephemeral) chat in OWUI before calling the tool. (No
+  audit warning: this is a per-request behaviour, not a startup
+  misconfig.)
 
 ---
 
