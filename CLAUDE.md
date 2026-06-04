@@ -127,6 +127,88 @@ Skip conditions in `_event_to_outbox` / bootstrap / final-writeback:
 ephemeral-chat marker — the `/event` endpoint accepts the POST but
 the event is dropped, so we don't waste an HTTP round-trip.
 
+### Phase 2 deferred items and decisions
+
+These are intentional non-implementations from the Phase 2 rollout —
+documented so a future session doesn't try to "fix" something that's
+already the deliberate behaviour, and so the rationale is preserved
+when someone does want to revisit.
+
+**No `build_initial_snapshot(record)` helper.** The Phase 2 plan named
+this factory but the implementation inlines the equivalent dict-merge
+into `_enqueue_bootstrap_embed` at
+`deep_research/entrypoints/openapi_tool/runner.py:443-468` instead.
+The snapshot consumed by the bootstrap iframe is exactly the same one
+the live-view iframe polls for, already cached in
+`self._snapshots[job_id]`; we just stamp `{"query": record.prompt}` on
+top before rendering. Extracting a separate factory for one caller is
+premature abstraction. If a second caller appears (e.g., a future
+"resume after restart" path that rehydrates the snapshot from
+`JobRecord` fields), extract it then.
+
+**MCP cancellation is implicit, not wired to a FastMCP hook.**
+FastMCP 3.x's `Context` doesn't expose a direct cancel signal a tool
+function can subscribe to. The MCP runtime relies on anyio cancelling
+the enclosing task when the client sends a cancel notification, which
+surfaces as `asyncio.CancelledError` inside the tool function. The
+`deep_research` MCP entrypoint
+(`deep_research/entrypoints/mcp/server.py`) catches that, calls
+`cancel_token.cancel()` on its locally-held `CancellationToken`, and
+re-raises. Net behaviour: cancellation unwinds the engine, but the
+phase-boundary checks in `ctx.raise_if_cancelled()` only fire if the
+engine is between awaits when cancel arrives (the natural `CancelledError`
+from anyio handles the await-blocked case directly). This is the
+closest mapping FastMCP 3.x permits; revisit if a future FastMCP
+release exposes a first-class cancel hook in `Context`.
+
+**`PERSISTED_EVENT_TYPES` accepts both `source` and `citation`.**
+OWUI's docs treat these as aliases for the side-panel citation event.
+Phase 2 settles on emitting `source` (from `CitationEvent.to_dict()`
+in `deep_research/progress/events.py`) and the
+`OWUIClient.post_message_event` validator at
+`deep_research/adapter/client.py:21-23` permits either. If OWUI ever
+splits the two into distinct semantics (currently they look like
+historical aliases), pick one and remove the other from the validator
+set. The runner's `_event_to_outbox` should stay pinned to whichever
+side wins.
+
+**Outbox cancellation on shutdown is not flushed.** When the lifespan
+shutdown handler runs `OutboxWorker.stop()`, any rows whose
+`delivered_at IS NULL` stay in the table. On the next process start,
+the worker picks them up and continues delivery — this is durability
+by design (a process crash mid-writeback resumes correctly). The
+trade-off is that a *clean* shutdown leaves rows undelivered until
+the next start; we don't drain-on-stop. Acceptable because the rows
+target message_ids that still exist in OWUI's chat table on restart.
+Don't add a defensive "drain on stop" call — it would block shutdown
+on OWUI availability.
+
+**Multi-process / multi-replica OpenAPI Tool Server is out of scope
+for v1.** Both the `JobStore` (`research_jobs` table) and the
+`OutboxWorker` (`owui_outbox` table) live in a single sqlite file at
+`{DR_DATA_DIR}/jobs.sqlite`. Two server processes writing to the same
+sqlite file produce `database is locked` errors at scale; sqlite
+serialises writes via file locks and busy_timeout only buys time. The
+deeper issue: `Coordinator._state_manager` and the four
+`CacheBundle` caches are process-shared *within* one process. Two
+server processes have two independent copies, so a request that hit
+process #1 for `start_research_job` and process #2 for
+`submit_research_feedback` would resume on the wrong replica with an
+empty state manager — the engine would either invent fresh outline
+data or fail. Horizontal scaling needs (a) PostgreSQL or equivalent
+for the two tables and (b) either sticky sessions keyed on
+`conversation_id` or moving the engine state into the shared store.
+Neither is wired today; the runtime documents itself as single-process.
+
+(Note: same-process concurrency across different users / different
+`conversation_id`s is fully supported and is *not* the same problem.
+`ResearchStateManager` dispenses per-conversation dicts and every
+`Coordinator.run()` call builds a fresh `RunContext` — no
+cross-conversation taint inside a single process. The earlier
+implementation's contamination bug was caused by per-call state being
+held on module/Pipe-level attributes; the new package has no such
+sites by construction.)
+
 ---
 
 ## Concurrency contract (the engine)
