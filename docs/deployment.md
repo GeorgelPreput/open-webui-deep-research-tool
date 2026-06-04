@@ -394,6 +394,39 @@ Then confirm:
 
 ---
 
+## OWUI-side configuration
+
+A few settings live on the OWUI container (not the tool server) and
+materially affect the OpenAPI Tool runtime:
+
+| OWUI env var | Default | What it does |
+|---|---|---|
+| `ENABLE_FORWARD_USER_INFO_HEADERS` | `false` | When `true`, OWUI forwards `X-OpenWebUI-Chat-Id` / `X-OpenWebUI-Message-Id` to OpenAPI tool calls. **Required for Phase 2 writeback** — without it the runtime degrades to Phase 1 (the LLM emits the slash-command grammar itself). |
+| `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` | ~10 min | The hard ceiling on any single tool-call HTTP request from OWUI to the tool server. The v2 two-call design exists because of this — `start_research_job` and `submit_research_feedback` both return in well under a second, with the long-running engine running in the background. Tuning it *down* risks breaking the outline phase (~10–30s typical); leave at default unless you have a specific reason. |
+| `ENABLE_ADMIN_CHAT_ACCESS` | `false` | Affects the full chat-update endpoint, **not** the per-message `/event` endpoint Phase 2 uses (`/event` admin-bypasses chat ownership unconditionally). Leave at default unless you also need admin access to other users' chats via `GET /api/v1/chats/{id}`. |
+
+### Tool-server connection modes
+
+OWUI exposes two ways for the user-facing UI to reach a tool server:
+
+- **Global Tool Server** — the OWUI *backend* calls the tool server
+  via aiohttp. CORS is irrelevant; the request originates server-side.
+  An admin operator configures the connection once; all users see it.
+  This is the recommended mode for the Deep Research OpenAPI runtime.
+- **User Tool Server** — the user's *browser* calls the tool server
+  directly (cross-origin from `/api`). The browser will not expose any
+  response header to JS unless it's in
+  `Access-Control-Expose-Headers`. The OpenAPI server already sets
+  `expose_headers=["Content-Disposition"]`
+  (`deep_research/entrypoints/openapi_tool/server.py`), which is what
+  lets the cross-origin Rich-UI dispatcher see the `inline` disposition
+  and render the iframe. If you front the tool server with a reverse
+  proxy / ingress, make sure that proxy preserves the
+  `Access-Control-Expose-Headers` response header — stripping it
+  breaks User Tool Server mode silently.
+
+---
+
 ## Security
 
 - **Distinct keys per surface.** Three keys, three rate-limit domains, three

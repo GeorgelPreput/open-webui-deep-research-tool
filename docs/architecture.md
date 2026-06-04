@@ -116,6 +116,16 @@ record's `revision` advances. The iframe's URL is in the response of
 `start_research_job` and is authenticated by a per-job view token
 (sha256-hashed at rest).
 
+The iframe is sandboxed by OWUI's `FullHeightIframe.svelte` with
+`allow-scripts` only — no `allow-same-origin`. From inside the iframe
+there are no cookies, no `localStorage`, no access to the parent
+window's APIs; the cross-origin `fetch()` to the tool server works
+because the OpenAPI server's CORS config is permissive
+(`allow_origins=["*"]`). The iframe is also one-way: it can display
+content but can't write to the assistant message. Substantive content
+(topic list, final report) reaches chat history through the `/event`
+writeback channel, not through the iframe.
+
 ---
 
 ## Package layout

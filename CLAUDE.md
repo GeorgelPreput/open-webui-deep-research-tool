@@ -61,6 +61,55 @@ OpenAPI runner populates it). It rebinds on each
 `submit_research_feedback` call so the Phase 2 writeback channel
 posts to the *new* tool-call assistant message, not the prior one.
 
+### OWUI external-tool model — constraints that shape the v2 design
+
+Three OWUI facts force the two-call workflow + JSON-only responses +
+iframe-via-`/event` writeback shape. Documenting them here so a future
+session doesn't propose "simpler" designs that hit the same walls.
+
+**OWUI's per-call timeout `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER` (default
+~10 min, operator-set on the OWUI side)** is the hard ceiling on any
+single tool-call HTTP request. A multi-minute research run cannot
+block one HTTP call without risking 504. That's why
+`start_research_job` and `submit_research_feedback` both return in
+well under a second, with the engine running in a background
+`asyncio.Task`. Don't propose "just block synchronously" — it works
+for the outline phase (~10–30s) but breaks on the long research leg.
+
+**The `(html, context)` tuple-response form is unreachable for
+external OpenAPI tool servers.** OWUI's `process_tool_result` requires
+both `Content-Type: text/html` AND a 2-element list/tuple body to
+deliver Rich UI + structured LLM context together. But aiohttp's
+`response.json()` (used in OWUI's `execute_tool_server`) is strict on
+content-type: an HTML response falls back to `response.text()` and
+yields a `str`, not a list. The two conditions are mutually exclusive
+on the wire. This is *why* `start_research_job` returns JSON and the
+iframe is posted via the `/event` channel rather than returned
+directly as HTML+tuple from the tool call.
+
+**`message.embeds` is replace-not-append in the external-tool path.**
+OWUI's `Chat.svelte` sets `message.embeds = data.embeds`
+unconditionally for the external-tool branch — the `replace: true`
+flag the Function path sets is *irrelevant* on the OpenAPI runtime
+because there's no append behaviour to opt out of. Each tool-call
+message gets its own message-embeds slot anyway. Don't "fix" the
+missing `replace: true` in the OpenAPI outbox writebacks; it would
+change nothing.
+
+**OWUI iframe sandbox constraints (`FullHeightIframe.svelte`).** The
+iframe is mounted sandboxed `allow-scripts` *without*
+`allow-same-origin` (user toggle `iframeSandboxAllowSameOrigin` off
+by default). Inside the iframe: no cookies, no `localStorage`, no
+`parent.fetch`. Cross-origin `fetch()` to the tool server works only
+because `server.py` sets `allow_origins=["*"]` in its CORS config.
+Also: `iframeSandboxAllowScripts` (default on) — if the user disables
+it, both the height-postMessage script and the self-polling script
+stop running. `render_progress_embed_html` has no fixed-height CSS
+fallback, so a scripts-disabled iframe collapses. Anything added to
+the embed must assume opaque-origin / no-storage / no-cookies;
+Alpine.js-style inline frameworks are fine, anything requiring
+same-origin storage isn't.
+
 ### `/event` endpoint admin-bypass
 
 OWUI's per-message endpoint
@@ -597,6 +646,32 @@ is a str elsewhere.
 lock*. `asyncio.Lock` is **not reentrant**, so they must use distinct locks
 (`_vocab_emb_load_lock` and `_vocab_load_lock`). A single shared lock deadlocks
 the whole run (hangs forever). Keep them separate.
+
+### `render_progress_embed_html` has two render modes
+
+`progress/embed.py::render_progress_embed_html(snapshot, *, poll_url=None,
+view_token=None)` is one function with two output flavours:
+
+  - **Push mode** (`poll_url=None`, used by the OWUI Function runtime):
+    emits the topic-categories DOM + the height-postMessage script.
+    Progress updates arrive via `__event_emitter__` with
+    `{"type":"embeds", "data":{"embeds":[...], "replace":True}}` —
+    the iframe is recreated on each push. Caller:
+    `progress/embed.py::refresh_progress_embed`.
+  - **Self-poll mode** (`poll_url` + `view_token` set, used by the
+    OpenAPI live view): same DOM plus an inline script that polls
+    `{poll_url}?token={view_token}&since_version=N` every 2s and
+    reloads the iframe on a revision bump. The iframe HTML is
+    rendered once with `poll_url` baked in at job-create time so
+    chat-history replay works with no server involvement. Callers:
+    `entrypoints/openapi_tool/runner.py::_enqueue_bootstrap_embed`
+    and the `/live_view/{job_id}` route handler in
+    `entrypoints/openapi_tool/server.py`.
+
+Same function, two code paths sharing one DOM template. Modifying one
+(adding a new snapshot field, changing the CSP nonce flow, etc.) risks
+silently breaking the other; assert the relevant flavour in tests when
+you touch this file.
 
 ### Local smoke test (no live OWUI required)
 
