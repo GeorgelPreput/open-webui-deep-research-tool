@@ -87,12 +87,14 @@ class StartResearchResponse(BaseModel):
                 "status": "running",
                 "next_action": "await_user_selection",
                 "user_facing_instruction": (
-                    "I've started the preliminary research. A live progress "
-                    "view is appearing in this message. When the topic list "
-                    "is ready you'll see it appear right here — reply with "
-                    "/k <numbers> to keep specific topics, /r <numbers> to "
-                    "remove specific topics, or /continue to research all "
-                    "topics as-is."
+                    "I've started the preliminary research. When the topic "
+                    "list is ready you'll see it appear right here — reply "
+                    "with `/k <numbers>` to keep specific topics, "
+                    "`/r <numbers>` to remove specific topics, or "
+                    "`/continue` to research all topics as-is. A live "
+                    "progress view will appear once you've chosen which "
+                    "topics to research. You can cancel at any time by "
+                    "replying `/q` or `/quit`."
                 ),
             }
         }
@@ -121,12 +123,13 @@ class StartResearchResponse(BaseModel):
             "the user what to do next."
         ),
         default=(
-            "I've started the preliminary research. A live progress "
-            "view is appearing in this message. When the topic list "
+            "I've started the preliminary research. When the topic list "
             "is ready you'll see it appear right here — reply with "
-            "/k <numbers> to keep specific topics, /r <numbers> to "
-            "remove specific topics, or /continue to research all "
-            "topics as-is."
+            "`/k <numbers>` to keep specific topics, `/r <numbers>` to "
+            "remove specific topics, or `/continue` to research all "
+            "topics as-is. A live progress view will appear once you've "
+            "chosen which topics to research. You can cancel at any time "
+            "by replying `/q` or `/quit`."
         ),
     )
 

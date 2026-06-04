@@ -68,6 +68,16 @@ With `interactive_research=True` (default):
 If `interactive_research=False`, step 1 runs straight through into
 research cycles in the first turn.
 
+The OpenAPI Tool Server is built around the outline-feedback gate
+being on (`valves.persistence.interactive_research=True`, default).
+Disabling it bypasses the gate entirely — the engine runs end-to-end
+on the first `start_research_job` call. In that mode, the iframe
+doesn't appear until the engine emits its first `refresh_progress_embed`
+mid-`cycles` (which can be tens of seconds in). The
+`interactive_research=False` configuration is intended for the MCP
+entrypoint (which has a different UX model) and for unusual customer
+requests; the OpenAPI runtime documents itself as gate-on by default.
+
 ### How the OpenAPI Tool runtime maps this two-turn shape
 
 The OWUI Function runtime gets two-turn behaviour for free: OWUI calls

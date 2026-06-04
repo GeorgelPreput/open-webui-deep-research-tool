@@ -235,6 +235,47 @@ exists; #1 fires when it's ready). The intentional duplication is
 documented here so a future cleanup pass doesn't accidentally
 collapse them.
 
+The `/q` and `/quit` cancel commands live in **two** sites, not three,
+because they're never parsed by the engine's
+`process_outline_feedback_continuation` as a normal command — they
+raise `asyncio.CancelledError` if they reach the parser at all (the
+LLM is expected to route them to `cancel_research_job` directly). The
+two sites:
+
+  1. `deep_research/entrypoints/openapi_tool/server.py::CANCEL_DESCRIPTION`
+     — the tool-description text the LLM reads.
+  2. `deep_research/entrypoints/openapi_tool/schemas.py::StartResearchResponse.user_facing_instruction`
+     — the user-facing teaser the LLM is told to emit verbatim.
+
+**Terminal writebacks no longer clear the iframe.** Both successful
+completion and cancellation go through `_enqueue_terminal_writeback`
+in `deep_research/entrypoints/openapi_tool/runner.py`, which posts a
+`status` pill (`done=true`) and a `replace` with the message body.
+The iframe (last `refresh_progress_embed` snapshot, typically showing
+the categorised topic dashboard) is preserved. Prior behaviour cleared
+the iframe with `embeds: []`; that destroyed the user's progress
+reference and is no longer done. The matching writeback test pinned in
+`tests/test_openapi_writeback_e2e.py::test_writeback_sequence_through_full_lifecycle`
+explicitly asserts no `embeds: []` clear is enqueued.
+
+**`runner.cancel` handles two paths.** When the engine task is
+actively running, cancellation flows through the token → phase
+boundary → `asyncio.CancelledError` → handler in `_run_initial` /
+`_run_feedback`. When the task is already `.done()` (paused at the
+outline-feedback gate), the handler won't fire; `runner.cancel`
+updates the phase + enqueues the writeback inline. Both paths land at
+the same `_enqueue_terminal_writeback` helper. Pinned by
+`tests/test_openapi_runner.py::test_cancel_at_gate_marks_cancelled`
+and the matching e2e
+`tests/test_openapi_writeback_e2e.py::test_gate_cancel_posts_status_and_replace`.
+
+**Bootstrap iframe is no longer posted in the preliminary phase.**
+`start_job` does not call `_enqueue_bootstrap_embed`; the iframe is
+first posted on `submit_feedback` (the moment the engine moves into
+research and the live snapshot becomes meaningful). The only
+user-visible content in the preliminary tool-call message is the
+topic-list `MessageEvent → replace`.
+
 **Config warning code taxonomy.** The OpenAPI Tool Server runs a
 startup configuration audit
 (`deep_research/entrypoints/openapi_tool/config_audit.py`) plus one

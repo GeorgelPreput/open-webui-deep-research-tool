@@ -122,7 +122,11 @@ class JobRunner:
                 "synthesis_tokens": 0,
                 "total_tokens": 0,
             }
-        await self._enqueue_bootstrap_embed(record, view_token, marker="bootstrap")
+        # No bootstrap embed in the preliminary phase: the only useful
+        # content the engine produces before the outline gate is the topic
+        # list (delivered as a MessageEvent → replace). The iframe is
+        # bootstrapped on submit_feedback, which is when the engine moves
+        # into research and the live snapshot becomes meaningful.
         async with self._lock:
             task = asyncio.create_task(
                 self._run_initial(record, cancel_token=cancel_token, owui_user_token=owui_user_token)
@@ -153,7 +157,7 @@ class JobRunner:
                 f"Job {job_id} is in phase {record.phase.value}, not awaiting feedback"
             )
 
-        if cancel_token is None or cancel_token.is_cancelled():
+        if cancel_token is None:
             cancel_token = CancellationToken()
         view_token = self._view_tokens.get(job_id, "")
         if view_token:
@@ -171,7 +175,16 @@ class JobRunner:
             self._tasks[job_id] = task
 
     async def cancel(self, job_id: str, *, timeout: float = 30.0) -> None:
-        """Signal cancellation and wait briefly for the task to unwind."""
+        """Signal cancellation and ensure the job lands in CANCELLED.
+
+        Two paths:
+          - Task is running: signal token + wait for unwind. The
+            ``CancelledError`` handler in ``_run_initial`` / ``_run_feedback``
+            updates the phase and posts the terminal writeback.
+          - Task is done (gate cancellation: engine paused at outline
+            feedback, task already returned): the handler won't fire;
+            update the phase and post the writeback inline.
+        """
         async with self._lock:
             token = self._cancellation_tokens.get(job_id)
             task = self._tasks.get(job_id)
@@ -180,6 +193,25 @@ class JobRunner:
         if task is not None and not task.done():
             with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 await asyncio.wait_for(task, timeout=timeout)
+            return
+
+        record = await self._store.get(job_id)
+        if record is None or record.phase in TERMINAL_PHASES:
+            return
+        await self._store.update(
+            job_id, phase=JobPhase.CANCELLED, completed_at=_now_iso()
+        )
+        self._mark_phase(job_id, JobPhase.CANCELLED)
+        await self._enqueue_terminal_writeback(
+            record,
+            content=(
+                "_Research cancelled by user._\n\n"
+                "The run was stopped before completion; no report was generated."
+            ),
+            status_description="Cancelled by user",
+            status_level="warning",
+            dedupe_suffix="cancelled",
+        )
 
     async def shutdown(self, *, timeout: float = 5.0) -> None:
         """Signal every active job and wait for unwind, best-effort."""
@@ -252,12 +284,28 @@ class JobRunner:
                 # returns a final answer immediately (no outline gate).
                 # Land it in the same tool-call message so the LLM doesn't
                 # need to retrieve the answer text.
-                await self._enqueue_final_writeback(record, report.content)
+                await self._enqueue_terminal_writeback(
+                    record,
+                    content=report.content,
+                    status_description="Research complete",
+                    status_level="info",
+                    dedupe_suffix="final",
+                )
         except asyncio.CancelledError:
             await self._store.update(
                 record.job_id, phase=JobPhase.CANCELLED, completed_at=_now_iso()
             )
             self._mark_phase(record.job_id, JobPhase.CANCELLED)
+            await self._enqueue_terminal_writeback(
+                record,
+                content=(
+                    "_Research cancelled by user._\n\n"
+                    "The run was stopped before completion; no report was generated."
+                ),
+                status_description="Cancelled by user",
+                status_level="warning",
+                dedupe_suffix="cancelled",
+            )
             raise
         except Exception as exc:
             logger.exception("Job %s initial run failed", record.job_id)
@@ -307,15 +355,32 @@ class JobRunner:
                 completed_at=_now_iso(),
             )
             self._mark_phase(record.job_id, JobPhase.COMPLETED)
-            # Phase 2: writeback the final report as message content, then
-            # clear the iframe. The user sees the report in the second
-            # tool-call message without the LLM having to retrieve it.
-            await self._enqueue_final_writeback(record, report.content)
+            # Phase 2: writeback the final report as message content. The
+            # user sees the report in the tool-call message without the
+            # LLM having to retrieve it; the iframe's last snapshot is
+            # preserved alongside.
+            await self._enqueue_terminal_writeback(
+                record,
+                content=report.content,
+                status_description="Research complete",
+                status_level="info",
+                dedupe_suffix="final",
+            )
         except asyncio.CancelledError:
             await self._store.update(
                 record.job_id, phase=JobPhase.CANCELLED, completed_at=_now_iso()
             )
             self._mark_phase(record.job_id, JobPhase.CANCELLED)
+            await self._enqueue_terminal_writeback(
+                record,
+                content=(
+                    "_Research cancelled by user._\n\n"
+                    "The run was stopped before completion; no report was generated."
+                ),
+                status_description="Cancelled by user",
+                status_level="warning",
+                dedupe_suffix="cancelled",
+            )
             raise
         except Exception as exc:
             logger.exception("Job %s feedback run failed", record.job_id)
@@ -466,18 +531,26 @@ class JobRunner:
             dedupe_key=f"{record.job_id}:{message_id}:embeds:{marker}",
         )
 
-    async def _enqueue_final_writeback(
+    async def _enqueue_terminal_writeback(
         self,
         record: JobRecord,
+        *,
         content: str,
+        status_description: str,
+        status_level: str,
+        dedupe_suffix: str,
     ) -> None:
-        """Post the final report as message content, then clear the iframe.
+        """Post the final status pill + message content to the assistant message.
 
-        Called from ``_run_feedback`` (and the rare ``_run_initial`` short-
-        circuit completion path) once ``coord.run`` returns. Two rows are
-        enqueued in order: a ``replace`` carrying the report markdown,
-        then an ``embeds`` row with an empty list to wipe the iframe.
-        Re-reads the record to pick up the rebound ``target_message_id``.
+        Shared by success (final report) and cancellation paths. Does NOT
+        enqueue an ``embeds: []`` clear — the iframe's last state (topic
+        list / progress dashboard) is preserved in the message for user
+        reference. Re-reads the record to pick up the rebound
+        ``target_message_id``.
+
+        ``status_level`` is captured for telemetry/future use; the OWUI
+        ``status`` payload schema only carries ``description`` + ``done``
+        today.
         """
         if self._outbox is None:
             return
@@ -488,6 +561,18 @@ class JobRunner:
         if target is None:
             return
         chat_id, message_id = target
+
+        seq = self._status_dedupe_counter.get(refreshed.job_id, 0) + 1
+        self._status_dedupe_counter[refreshed.job_id] = seq
+        await self._outbox.enqueue(
+            outbox_id=str(uuid.uuid4()),
+            job_id=refreshed.job_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            event_type="status",
+            payload={"description": status_description, "done": True},
+            dedupe_key=f"{refreshed.job_id}:{message_id}:status:{seq}:{dedupe_suffix}",
+        )
         await self._outbox.enqueue(
             outbox_id=str(uuid.uuid4()),
             job_id=refreshed.job_id,
@@ -495,16 +580,7 @@ class JobRunner:
             message_id=message_id,
             event_type="replace",
             payload={"content": content},
-            dedupe_key=f"{refreshed.job_id}:{message_id}:replace:final",
-        )
-        await self._outbox.enqueue(
-            outbox_id=str(uuid.uuid4()),
-            job_id=refreshed.job_id,
-            chat_id=chat_id,
-            message_id=message_id,
-            event_type="embeds",
-            payload={"embeds": [], "replace": True},
-            dedupe_key=f"{refreshed.job_id}:{message_id}:embeds:clear",
+            dedupe_key=f"{refreshed.job_id}:{message_id}:replace:{dedupe_suffix}",
         )
 
     def _mark_phase(self, job_id: str, phase: JobPhase) -> None:

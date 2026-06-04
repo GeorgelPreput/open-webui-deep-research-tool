@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -207,6 +208,14 @@ async def process_outline_feedback_continuation(ctx: RunContext, user_message: s
 
     # Process the user input
     user_input = user_message.strip()
+
+    # Defensive: if the LLM mis-routes a cancel command through this tool
+    # instead of cancel_research_job, surface the cancel intent rather than
+    # falling through to the natural-language feedback path. The LLM is
+    # expected to call cancel_research_job directly; this is the belt to
+    # the tool-description's braces.
+    if user_input.lower() in ("/q", "/quit"):
+        raise asyncio.CancelledError("user requested cancellation via /q")
 
     # If user just wants to continue with all items
     if user_input.lower() in ("continue", "/continue", "/c") or not user_input:

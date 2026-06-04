@@ -6,7 +6,14 @@ share a flat-items contract. If the rendered numbering ever drifts from
 the parser's indexing, the user's ``/k 1,3,5`` reply silently picks the
 wrong items. These tests pin both sides.
 """
-from deep_research.research.outline_feedback import render_outline_prompt
+import asyncio
+
+import pytest
+
+from deep_research.research.outline_feedback import (
+    process_outline_feedback_continuation,
+    render_outline_prompt,
+)
 
 
 SAMPLE_OUTLINE = [
@@ -85,3 +92,31 @@ def test_missing_topic_key_renders_empty_string():
     assert flat_items == ["", "only sub"]
     assert "**1. **" in text
     assert "   2. only sub" in text
+
+
+class _FakeStateManager:
+    def __init__(self) -> None:
+        self._state: dict[str, dict] = {}
+
+    def get_state(self, cid: str) -> dict:
+        return self._state.setdefault(cid, {})
+
+
+class _FakeCtx:
+    """Minimal ctx surface for the parser short-circuit case — the cancel
+    branch runs before any of the heavier ctx attributes are touched."""
+
+    def __init__(self) -> None:
+        self.state = _FakeStateManager()
+        self.conversation_id = "conv-test"
+
+
+@pytest.mark.parametrize("cmd", ["/q", "/quit", "/Q", "  /quit  "])
+def test_parser_raises_cancelled_on_slash_q(cmd):
+    """The parser short-circuits /q and /quit (case-insensitive, with
+    surrounding whitespace) to asyncio.CancelledError so the engine's
+    CancelledError handler in JobRunner picks it up and posts the
+    terminal cancellation writeback."""
+    ctx = _FakeCtx()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(process_outline_feedback_continuation(ctx, cmd))

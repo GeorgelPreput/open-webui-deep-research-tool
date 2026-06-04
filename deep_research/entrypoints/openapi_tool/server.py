@@ -110,7 +110,10 @@ GET_DESCRIPTION = (
 CANCEL_DESCRIPTION = (
     "Request cancellation of a research job. Returns immediately; the "
     "engine bails at the next phase boundary (typically within seconds "
-    "to a minute depending on the active phase)."
+    "to a minute depending on the active phase).\n\n"
+    "Call this tool when the user types `/q` or `/quit`, or makes any "
+    "natural-language cancellation request (\"stop\", \"cancel\", "
+    "\"never mind\")."
 )
 
 LIVE_VIEW_DESCRIPTION = (

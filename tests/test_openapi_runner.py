@@ -214,6 +214,30 @@ async def test_cancel_marks_cancelled(runner, coord, store):
     assert refreshed.completed_at is not None
 
 
+async def test_cancel_at_gate_marks_cancelled(runner, coord, store):
+    """Cancellation while the engine is paused at the outline gate (the
+    task is already .done()) must still land the job in CANCELLED. The
+    CancelledError handler doesn't fire here; runner.cancel updates the
+    phase inline."""
+    record = _make_record("cx-gate")
+    await store.create(record)
+
+    async def _on_run(kwargs):
+        coord.state_manager.set_waiting(kwargs["conversation_id"], True)
+        return Report(content="", conversation_id=kwargs["conversation_id"])
+
+    coord.on_run = _on_run
+    await runner.start_job(record, view_token="vt", owui_user_token="tok")
+    await runner._tasks[record.job_id]
+    assert runner._tasks[record.job_id].done()
+
+    await runner.cancel("cx-gate", timeout=2.0)
+
+    refreshed = await store.get("cx-gate")
+    assert refreshed.phase == JobPhase.CANCELLED
+    assert refreshed.completed_at is not None
+
+
 async def test_shutdown_cancels_all_active_jobs(coord, store):
     runner = JobRunner(coord=coord, store=store, outbox=None, public_base_url="")
     rec_a = _make_record("sd-a")

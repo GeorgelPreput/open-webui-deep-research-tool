@@ -5,13 +5,16 @@ completion sequence with a fake Coordinator and a fake OWUIClient on the
 writeback path. Asserts the *full* sequence of persisted event types
 posted to OWUI, in order:
 
-  1. ``embeds`` (bootstrap iframe on the first tool-call message)
-  2. ``status`` events emitted during phase 1 (initial queries)
-  3. ``replace`` (the topic list from the outline gate, as a MessageEvent)
-  4. ``embeds`` (bootstrap iframe on the SECOND tool-call message)
-  5. ``status`` / ``source`` during phase 2 (research → finalize)
+  1. ``status`` events emitted during phase 1 (initial queries)
+  2. ``replace`` (the topic list from the outline gate, as a MessageEvent)
+  3. ``embeds`` (bootstrap iframe on the SECOND tool-call message — the
+     preliminary phase no longer bootstraps an iframe)
+  4. ``status`` / ``source`` during phase 2 (research → finalize)
+  5. ``status`` (terminal "Research complete" pill with ``done=True``)
   6. ``replace`` (final report)
-  7. ``embeds`` (clear)
+
+No trailing ``embeds: []`` clear: the iframe's last snapshot is
+preserved in the message for user reference.
 
 Also asserts:
   - Long-name aliases (``chat:message:embeds`` etc.) never appear; only
@@ -29,6 +32,7 @@ import pytest
 import pytest_asyncio
 
 from deep_research.adapter.client import PERSISTED_EVENT_TYPES
+from deep_research.core.cancellation import CancellationToken
 from deep_research.core.types import Report
 from deep_research.entrypoints.openapi_tool.jobs import (
     JobPhase,
@@ -163,7 +167,10 @@ async def runner(coord: _FakeCoord, store: JobStore, outbox: OutboxWorker):
 async def _wait_task(runner: JobRunner, job_id: str) -> None:
     t = runner._tasks.get(job_id)
     if t is not None:
-        await t
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
 
 
 async def test_writeback_sequence_through_full_lifecycle(
@@ -214,13 +221,17 @@ async def test_writeback_sequence_through_full_lifecycle(
     # All event types are short-name (persisted) variants
     assert all(t in PERSISTED_EVENT_TYPES for t in types), types
 
-    # The first emitted writeback is the bootstrap iframe
-    assert types[0] == "embeds"
     # Message goes to first tool-call message
     first_msg_calls = [c for c in client.calls if c["message_id"] == "msg-1"]
     second_msg_calls = [c for c in client.calls if c["message_id"] == "msg-2"]
     assert first_msg_calls, "expected at least one writeback to msg-1"
     assert second_msg_calls, "expected writebacks to the rebound msg-2"
+
+    # No bootstrap iframe on msg-1: the preliminary phase doesn't post
+    # one. The first writeback to msg-1 is the topic-list replace (or a
+    # preceding status event).
+    first_types = [c["event_type"] for c in first_msg_calls]
+    assert "embeds" not in first_types, first_types
 
     # Topic-list replace appears (from MessageEvent)
     assert any(
@@ -232,16 +243,23 @@ async def test_writeback_sequence_through_full_lifecycle(
     # Status event landed
     assert any(c["event_type"] == "status" for c in first_msg_calls)
 
-    # Second-message: bootstrap iframe + status + citation + final replace + clear
+    # Second-message: bootstrap iframe + status + citation + terminal
+    # status + final replace (NO trailing embeds:[] clear).
     second_types = [c["event_type"] for c in second_msg_calls]
     assert second_types[0] == "embeds"  # bootstrap on msg-2
     assert "status" in second_types
     assert "source" in second_types  # CitationEvent
-    # Final replace + clear embeds happen at the end
-    assert second_types[-2] == "replace"
-    assert "Final report" in second_msg_calls[-2]["data"]["content"]
-    assert second_types[-1] == "embeds"
-    assert second_msg_calls[-1]["data"]["embeds"] == []  # iframe cleared
+    # Terminal sequence: status(done=True, "Research complete") then replace(report).
+    assert second_types[-2] == "status"
+    assert second_msg_calls[-2]["data"]["description"] == "Research complete"
+    assert second_msg_calls[-2]["data"]["done"] is True
+    assert second_types[-1] == "replace"
+    assert "Final report" in second_msg_calls[-1]["data"]["content"]
+    # The iframe is no longer cleared at the end.
+    assert not any(
+        c["event_type"] == "embeds" and c["data"].get("embeds") == []
+        for c in client.calls
+    ), "terminal writeback must NOT enqueue an embeds:[] clear"
 
 
 async def test_writeback_skipped_when_chat_id_none(
@@ -280,6 +298,119 @@ async def test_writeback_skipped_when_chat_id_is_local(
     await outbox.drain_once(limit=64)
 
     assert client.calls == []  # OWUI local: chats don't persist the event
+
+
+async def test_running_phase_cancel_posts_status_and_replace(
+    runner, coord, outbox, client, store
+):
+    """A mid-phase cancellation posts a 'Cancelled by user' status + a
+    replace carrying the cancellation notice. No embeds:[] clear."""
+    record = _make_record(job_id="cx-mid", chat_id="chat-c", target_message_id="msg-c")
+    await store.create(record)
+
+    released = asyncio.Event()
+
+    async def on_run(kwargs):
+        sink = kwargs["sink"]
+        await sink(StatusEvent(description="working"))
+        cancel = kwargs.get("cancellation_token")
+        while not (isinstance(cancel, CancellationToken) and cancel.is_cancelled()):
+            await asyncio.sleep(0.01)
+        released.set()
+        raise asyncio.CancelledError("cancelled by user")
+
+    coord.on_run = on_run
+    await runner.start_job(record, view_token="vt", owui_user_token="ut")
+    await asyncio.sleep(0.05)
+    await runner.cancel(record.job_id, timeout=2.0)
+    assert released.is_set()
+    await _wait_task(runner, record.job_id)
+    await outbox.drain_once(limit=64)
+
+    refreshed = await store.get(record.job_id)
+    assert refreshed.phase == JobPhase.CANCELLED
+
+    types = [c["event_type"] for c in client.calls]
+    # Terminal sequence: status(done=True, "Cancelled by user") then replace(notice).
+    assert types[-2] == "status"
+    assert client.calls[-2]["data"]["description"] == "Cancelled by user"
+    assert client.calls[-2]["data"]["done"] is True
+    assert types[-1] == "replace"
+    assert "cancelled" in client.calls[-1]["data"]["content"].lower()
+    # No embeds:[] clear.
+    assert not any(
+        c["event_type"] == "embeds" and c["data"].get("embeds") == []
+        for c in client.calls
+    )
+
+
+async def test_gate_cancel_posts_status_and_replace(
+    runner, coord, outbox, client, store
+):
+    """A cancellation issued while the engine is paused at the outline
+    gate (task already done) still posts the terminal writeback. The
+    CancelledError handler isn't reached; runner.cancel posts inline."""
+    record = _make_record(job_id="cx-gate", chat_id="chat-g", target_message_id="msg-g")
+    await store.create(record)
+
+    async def on_run(kwargs):
+        coord.state_manager.set_waiting(kwargs["conversation_id"])
+        return Report(content="", conversation_id=kwargs["conversation_id"])
+
+    coord.on_run = on_run
+    await runner.start_job(record, view_token="vt", owui_user_token="ut")
+    await _wait_task(runner, record.job_id)
+    # Engine is now paused at the outline gate; the task is done.
+    assert runner._tasks[record.job_id].done()
+
+    await runner.cancel(record.job_id, timeout=2.0)
+    await outbox.drain_once(limit=64)
+
+    refreshed = await store.get(record.job_id)
+    assert refreshed.phase == JobPhase.CANCELLED
+    assert refreshed.completed_at is not None
+
+    types = [c["event_type"] for c in client.calls]
+    assert types[-2] == "status"
+    assert client.calls[-2]["data"]["description"] == "Cancelled by user"
+    assert client.calls[-2]["data"]["done"] is True
+    assert types[-1] == "replace"
+    assert "cancelled" in client.calls[-1]["data"]["content"].lower()
+    assert not any(
+        c["event_type"] == "embeds" and c["data"].get("embeds") == []
+        for c in client.calls
+    )
+
+
+async def test_cancel_writeback_skipped_for_local_chat_and_none(
+    runner, coord, outbox, client, store
+):
+    """Cancellation paths must respect the same writeback skip rules as
+    in-flight events: ``chat_id`` None or ``local:`` → no writeback."""
+    for case_id, chat_id, target_message_id in (
+        ("cx-none", None, None),
+        ("cx-local", "local:abc", "msg-x"),
+    ):
+        client.calls.clear()
+        record = _make_record(
+            job_id=case_id, chat_id=chat_id, target_message_id=target_message_id
+        )
+        await store.create(record)
+
+        async def on_run(kwargs):
+            cancel = kwargs.get("cancellation_token")
+            while not (isinstance(cancel, CancellationToken) and cancel.is_cancelled()):
+                await asyncio.sleep(0.01)
+            raise asyncio.CancelledError("cancelled")
+
+        coord.on_run = on_run
+        await runner.start_job(record, view_token="vt", owui_user_token="ut")
+        await asyncio.sleep(0.05)
+        await runner.cancel(record.job_id, timeout=2.0)
+        await _wait_task(runner, record.job_id)
+        await outbox.drain_once(limit=64)
+
+        assert client.calls == [], (case_id, client.calls)
 
 
 async def test_short_event_names_only(runner, coord, outbox, client, store):
