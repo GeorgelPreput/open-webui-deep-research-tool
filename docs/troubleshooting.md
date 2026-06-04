@@ -155,11 +155,12 @@ Match the `code` field against the causes below.
   **Fix:** unset the env var or set it to `true` (the server will
   refuse to start until `DR_OWUI_API_KEY` is also set).
 - **Cause 4 — ephemeral chat:** the chat's `chat_id` starts with
-  `local:`. OWUI's `/event` accepts the POST but the event is dropped
-  by design (local chats don't persist). **Workaround:** create a
-  proper (non-ephemeral) chat in OWUI before calling the tool. (No
-  audit warning: this is a per-request behaviour, not a startup
-  misconfig.)
+  `local:`. The OpenAPI Tool Server now refuses these at
+  `start_research_job` time with HTTP 409 and code
+  `unsaved_chat_unsupported`. The user should send any brief message
+  in the chat first to promote it from `local:<random>` to a
+  persisted UUID, then re-run the research. (No `/health` audit
+  warning: this is a per-request behaviour, not a startup misconfig.)
 
 ---
 

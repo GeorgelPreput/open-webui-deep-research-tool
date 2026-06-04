@@ -9,6 +9,7 @@ class BibliographyEntry(TypedDict):
     id: int
     title: str
     url: str
+    snippet: str  # 500-char excerpt from master_source_table[url].content_preview
 
 
 class BibliographyData(TypedDict):

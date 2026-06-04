@@ -89,7 +89,13 @@ START_DESCRIPTION = (
     "next step.\n\n"
     "When the user replies with their selection (e.g. `/k 1,3,5`, "
     "`/r 8,9,10`, or `/continue`), call `submit_research_feedback` with "
-    "the user's verbatim reply."
+    "the user's verbatim reply.\n\n"
+    "If this tool returns HTTP 409 with code `unsaved_chat_unsupported`, "
+    "tell the user that this chat is ephemeral and ask them to send any "
+    "brief message (even \"hi\") so OWUI persists the chat, then ask "
+    "them to re-run the research. Do not retry the tool call until the "
+    "user replies — the chat must be saved before the tool can stream "
+    "progress into it."
 )
 
 FEEDBACK_DESCRIPTION = (
@@ -339,7 +345,12 @@ def _public_base_for(request: Request) -> str:
     responses={
         409: {
             "model": ErrorResponse,
-            "description": "An active research job already exists for this chat.",
+            "description": (
+                "Job cannot be created in this chat. Codes: "
+                "`already_running` (an active job exists for this chat) "
+                "or `unsaved_chat_unsupported` (the chat is an OWUI "
+                "ephemeral `local:` chat)."
+            ),
         },
         503: {
             "model": ErrorResponse,
@@ -356,6 +367,19 @@ async def start_research_job(
 ) -> StartResearchResponse:
     chat_id = request.headers.get("X-OpenWebUI-Chat-Id")
     message_id = request.headers.get("X-OpenWebUI-Message-Id")
+
+    if chat_id and chat_id.startswith("local:"):
+        raise _error(
+            409,
+            "unsaved_chat_unsupported",
+            (
+                "This chat is ephemeral (its ID starts with 'local:'). "
+                "Deep Research can't post progress or the final report "
+                "to an unsaved chat. Send any brief message in this "
+                "chat first so OWUI persists it, then re-run the "
+                "research."
+            ),
+        )
 
     if (
         creds is not None

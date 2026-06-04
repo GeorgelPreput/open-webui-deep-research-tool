@@ -83,9 +83,9 @@ async def run_finalize(ctx: RunContext, ps: dict[str, Any]) -> Report:
         url = (entry.get("url") or "").strip() if isinstance(entry, dict) else ""
         if not url:
             continue
-        title = (entry.get("title") or url).strip() if isinstance(entry, dict) else url
-        snippet_raw = entry.get("snippet") if isinstance(entry, dict) else None
-        snippet = (snippet_raw or "")[:500] if snippet_raw else None
+        # url filter above is the dict-shape gatekeeper; entry is a populated dict past this point.
+        title = (entry.get("title") or url).strip()
+        snippet = entry.get("snippet") or None  # "" → None to match CitationEvent default
         await ctx.events.emit(CitationEvent(url=url, title=title, snippet=snippet))
 
     return Report(

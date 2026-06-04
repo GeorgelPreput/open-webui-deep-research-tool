@@ -172,6 +172,42 @@ historical aliases), pick one and remove the other from the validator
 set. The runner's `_event_to_outbox` should stay pinned to whichever
 side wins.
 
+**Citation/source mapping has dedicated tests; do not add defensive
+filters.** `_event_to_outbox`'s CitationEvent branch at
+`deep_research/entrypoints/openapi_tool/runner.py:481-491` is pinned by
+five tests:
+`tests/test_openapi_outbox.py::test_source_payload_round_trip`,
+`tests/test_openapi_writeback_e2e.py::test_citation_event_maps_to_source_row`,
+`...::test_multiple_citations_with_same_url_deduplicate`,
+`...::test_runner_emits_source_not_citation`, and
+`...::test_runner_does_not_filter_empty_url_citation`. Two pinned contracts
+are non-obvious and the tests will fail loudly if accidentally reverted:
+(a) URL alone is the dedupe identity; same URL + different snippet = the
+first emission wins via `INSERT OR IGNORE`. (b) The runner passes
+CitationEvent through even with empty `url`; the sole gatekeeper is
+`deep_research/orchestrator/phases/finalize.py:83-85`. Do not add a
+"defensive" empty-URL filter to the runner — splitting responsibility
+across two sites makes future maintenance ambiguous.
+
+`CitationEvent.snippet` is populated from
+`master_source_table[url].content_preview` via `BibliographyEntry.snippet`
+(set in `deep_research/synthesis/citations.py::generate_bibliography`).
+Every CitationEvent emitted from `finalize.py:89` carries up to a 500-char
+excerpt that renders as the `document` array in OWUI's side-panel
+citation. The 500-char cap is enforced at source-registration time, NOT
+at emit time — do not re-truncate. Sites that populate `content_preview`:
+
+  - `deep_research/web/fetch.py:226` — primary HTML/PDF cache path
+  - `deep_research/web/fetch.py:398` — archived-source registration
+    (Wayback-style)
+  - `deep_research/web/paywall.py:247` — paywall-stripper PDF path
+  - `deep_research/web/search.py:175` — search-result registration
+  - `deep_research/synthesis/sections.py:452` — URLs cited in a section
+    but not previously fetched; populates `content_preview=""` by design
+    (no fresh source text at synthesis time). Surfaces in OWUI as a
+    citation with an empty `document` array — same shape as the
+    pre-wiring fallback.
+
 **Outbox cancellation on shutdown is not flushed.** When the lifespan
 shutdown handler runs `OutboxWorker.stop()`, any rows whose
 `delivered_at IS NULL` stay in the table. On the next process start,
@@ -246,6 +282,22 @@ two sites:
      — the tool-description text the LLM reads.
   2. `deep_research/entrypoints/openapi_tool/schemas.py::StartResearchResponse.user_facing_instruction`
      — the user-facing teaser the LLM is told to emit verbatim.
+
+**`local:` chats are refused at `start_research_job`.** The OpenAPI
+Tool Server returns 409 with code `unsaved_chat_unsupported` for any
+`X-OpenWebUI-Chat-Id` starting with `local:` (OWUI's ephemeral chat
+marker). Writeback to a `local:` chat would silently no-op — OWUI's
+`/event` returns 200 but drops the event because the chat doesn't
+persist — and starting a multi-minute research run invisible to the
+user is bad value. The LLM is instructed (via the appended paragraph
+in `START_DESCRIPTION`) to relay the refusal message and ask the user
+to send a brief message in the chat to promote it from
+`local:<random>` to a persisted UUID. The `_writeback_target` skip
+in `deep_research/entrypoints/openapi_tool/runner.py:64-65` stays as
+defence-in-depth for any pre-upgrade JobRecord still in
+`jobs.sqlite` and to keep the existing
+`tests/test_openapi_writeback_e2e.py::test_writeback_skipped_when_chat_id_is_local`
+invariant honest.
 
 **Terminal writebacks no longer clear the iframe.** Both successful
 completion and cancellation go through `_enqueue_terminal_writeback`

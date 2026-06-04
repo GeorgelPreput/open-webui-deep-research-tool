@@ -262,6 +262,149 @@ async def test_writeback_sequence_through_full_lifecycle(
     ), "terminal writeback must NOT enqueue an embeds:[] clear"
 
 
+async def test_citation_event_maps_to_source_row(
+    runner, coord, outbox, client, store
+):
+    """A CitationEvent emitted through the runner sink lands as a `source`
+    outbox row whose `data` matches CitationEvent.to_dict()["data"]. Pinned
+    per-key (not whole-dict) so future additions to the event payload don't
+    force unrelated test churn.
+    """
+    record = _make_record(job_id="cite-map")
+    await store.create(record)
+
+    citation = CitationEvent(
+        url="https://example.com/a",
+        title="Example Title",
+        snippet="A short excerpt.",
+    )
+
+    async def on_run(kwargs):
+        sink = kwargs["sink"]
+        await sink(citation)
+        return Report(content="ok", conversation_id=kwargs["conversation_id"])
+
+    coord.on_run = on_run
+    await runner.start_job(record, view_token="vt", owui_user_token="ut")
+    await _wait_task(runner, record.job_id)
+    await outbox.drain_once(limit=64)
+
+    source_calls = [c for c in client.calls if c["event_type"] == "source"]
+    assert len(source_calls) == 1
+    data = source_calls[0]["data"]
+    # Per-key assertions — survive future field additions to CitationEvent.
+    assert data["type"] == "external"
+    assert data["source"] == {"type": "external", "name": "Example Title"}
+    assert data["document"] == ["A short excerpt."]
+    assert data["metadata"] == [{"source": "https://example.com/a"}]
+
+
+async def test_multiple_citations_with_same_url_deduplicate(
+    runner, coord, outbox, client, store
+):
+    """Two CitationEvents with the same URL but different snippets produce
+    exactly one outbox row reaching OWUI — the first emission's snippet
+    survives (`INSERT OR IGNORE` semantics against the UNIQUE dedupe_key
+    constraint). Pins URL-as-canonical-identity + first-wins; a future change
+    to overwrite-semantics would break this test deliberately.
+    """
+    record = _make_record(job_id="cite-dedup")
+    await store.create(record)
+
+    first = CitationEvent(
+        url="https://example.com/dup",
+        title="First",
+        snippet="First snippet.",
+    )
+    second = CitationEvent(
+        url="https://example.com/dup",
+        title="Second",
+        snippet="Second snippet.",
+    )
+
+    async def on_run(kwargs):
+        sink = kwargs["sink"]
+        await sink(first)
+        await sink(second)
+        return Report(content="ok", conversation_id=kwargs["conversation_id"])
+
+    coord.on_run = on_run
+    await runner.start_job(record, view_token="vt", owui_user_token="ut")
+    await _wait_task(runner, record.job_id)
+    await outbox.drain_once(limit=64)
+
+    source_calls = [c for c in client.calls if c["event_type"] == "source"]
+    assert len(source_calls) == 1, (
+        f"expected first-wins dedupe; got {len(source_calls)} source rows"
+    )
+    # First-wins: the surviving row carries the first emission's title/snippet.
+    data = source_calls[0]["data"]
+    assert data["source"]["name"] == "First"
+    assert data["document"] == ["First snippet."]
+
+
+async def test_runner_emits_source_not_citation(
+    runner, coord, outbox, client, store
+):
+    """`PERSISTED_EVENT_TYPES` accepts both `source` and `citation` as
+    historical OWUI aliases (see deep_research/adapter/client.py:22-24).
+    Phase 2 settled on emitting `source` from
+    `_event_to_outbox` (runner.py:488). Pin that choice so an accidental
+    switch to `citation` would break the test.
+    """
+    record = _make_record(job_id="cite-name")
+    await store.create(record)
+
+    async def on_run(kwargs):
+        sink = kwargs["sink"]
+        await sink(CitationEvent(url="https://example.com/x", title="X"))
+        return Report(content="ok", conversation_id=kwargs["conversation_id"])
+
+    coord.on_run = on_run
+    await runner.start_job(record, view_token="vt", owui_user_token="ut")
+    await _wait_task(runner, record.job_id)
+    await outbox.drain_once(limit=64)
+
+    citation_event_types = [
+        c["event_type"] for c in client.calls
+        if c["event_type"] in ("source", "citation")
+    ]
+    assert citation_event_types == ["source"], citation_event_types
+
+
+async def test_runner_does_not_filter_empty_url_citation(
+    runner, coord, outbox, client, store
+):
+    """The runner's `_event_to_outbox` does NOT filter CitationEvents with
+    empty `url`. The emit-side gatekeeper at
+    `deep_research/orchestrator/phases/finalize.py:83-85` is the sole filter
+    in normal operation (`if not url: continue`). This test pins the
+    pass-through behaviour so a defensive filter is not added to the runner
+    by mistake — keeping responsibility in one place avoids the
+    "filtered twice / filtered nowhere" ambiguity.
+    """
+    record = _make_record(job_id="cite-empty-url")
+    await store.create(record)
+
+    async def on_run(kwargs):
+        sink = kwargs["sink"]
+        await sink(CitationEvent(url="", title="No URL", snippet="x"))
+        return Report(content="ok", conversation_id=kwargs["conversation_id"])
+
+    coord.on_run = on_run
+    await runner.start_job(record, view_token="vt", owui_user_token="ut")
+    await _wait_task(runner, record.job_id)
+    await outbox.drain_once(limit=64)
+
+    source_calls = [c for c in client.calls if c["event_type"] == "source"]
+    assert len(source_calls) == 1, (
+        "Runner must pass CitationEvent through even with empty url; "
+        "finalize.py is the sole gatekeeper"
+    )
+    # The empty url survives end-to-end into the OWUI payload.
+    assert source_calls[0]["data"]["metadata"] == [{"source": ""}]
+
+
 async def test_writeback_skipped_when_chat_id_none(
     runner, coord, outbox, client, store
 ):

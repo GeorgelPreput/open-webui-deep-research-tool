@@ -154,12 +154,16 @@ async def generate_bibliography(
             )
             title = f"Source {global_id}"
 
-        # Add bibliography entry using the actual correlated URL
+        # Add bibliography entry using the actual correlated URL.
+        # snippet sourced from master_source_table[url].content_preview
+        # (already 500-char capped at source-registration time); falls
+        # back to "" on the missing-URL warning path above.
         bibliography.append(
             {
                 "id": global_id,
                 "title": title,
                 "url": url,
+                "snippet": master_source_table.get(url, {}).get("content_preview", ""),
             }
         )
 

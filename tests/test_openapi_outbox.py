@@ -277,3 +277,34 @@ async def test_worker_loop_wakes_on_enqueue(
             break
         await asyncio.sleep(0.05)
     assert autoworker.delivered_count == 1
+
+
+async def test_source_payload_round_trip(
+    worker: OutboxWorker, fake_client: _FakeOWUIClient
+):
+    """A 'source' row preserves its nested payload field-for-field through
+    the outbox to the writeback client. The CitationEvent → outbox mapping
+    builds payloads with this shape (type/source/document/metadata stacked
+    inside `data`); a regression that flattened or reshaped it would still
+    pass the existing status-shaped tests, so we exercise it explicitly here.
+    """
+    payload = {
+        "type": "external",
+        "source": {"type": "external", "name": "Example Title"},
+        "document": ["A short excerpt from the source."],
+        "metadata": [{"source": "https://example.com/a"}],
+    }
+    await worker.enqueue(
+        outbox_id="ob-src",
+        job_id="job-1",
+        chat_id="c",
+        message_id="m",
+        event_type="source",
+        payload=payload,
+        dedupe_key="job-1:m:source:https://example.com/a",
+    )
+    await worker.drain_once()
+    assert len(fake_client.calls) == 1
+    call = fake_client.calls[0]
+    assert call["event_type"] == "source"
+    assert call["data"] == payload

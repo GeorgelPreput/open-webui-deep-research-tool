@@ -177,6 +177,33 @@ async def test_409_does_not_fire_when_existing_job_terminal(app_with_state):
     assert resp.status_code == 200
 
 
+async def test_start_research_job_409_for_local_chat_id(app_with_state):
+    app, _, runner = app_with_state
+    client = TestClient(app)
+    resp = client.post(
+        "/research_jobs",
+        json={"prompt": "summarise X"},
+        headers={"X-OpenWebUI-Chat-Id": "local:abc123"},
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["code"] == "unsaved_chat_unsupported"
+    assert "ephemeral" in detail["message"].lower()
+    # No JobRecord was created, no runner call made.
+    assert runner.start_calls == []
+
+
+async def test_start_research_job_allows_persisted_chat_id(app_with_state):
+    app, _, _ = app_with_state
+    client = TestClient(app)
+    resp = client.post(
+        "/research_jobs",
+        json={"prompt": "summarise X"},
+        headers={"X-OpenWebUI-Chat-Id": "11111111-2222-3333-4444-555555555555"},
+    )
+    assert resp.status_code == 200
+
+
 async def test_submit_feedback_404_unknown(app_with_state):
     app, _, _ = app_with_state
     client = TestClient(app)
