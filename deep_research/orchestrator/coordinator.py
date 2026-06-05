@@ -334,6 +334,57 @@ class Coordinator:
             async with self._inflight_lock:
                 self._inflight.discard(inflight_key)
 
+    async def prewarm_vocabulary(
+        self,
+        *,
+        user: RunUser,
+        conversation_id: str,
+        chat_id: str | None,
+        token: BearerTokenProvider,
+        sink: Sink,
+        target_message_id: str | None = None,
+    ) -> None:
+        """Warm the process-shared vocabulary embedding cache.
+
+        Spawned by the OpenAPI runner at ``AWAITING_OUTLINE_FEEDBACK`` so
+        the ~10-minute cold-cache embedding load happens during the
+        otherwise-idle gate-wait window, not during the user-visible
+        ``generate_replacement_topics`` step on feedback resume. The work
+        serialises on ``semantics.vocabulary._vocab_emb_load_lock``: if
+        the user submits feedback before this finishes, the engine's own
+        ``load_vocabulary_embeddings`` call waits on the same lock and
+        reuses the partial work — no duplicate batches.
+
+        Progress is emitted to ``sink`` via ``StatusEvent`` (see
+        ``semantics.vocabulary._emit_vocab_progress``) so the iframe
+        revision keeps advancing.
+        """
+        from deep_research.semantics.vocabulary import load_vocabulary_embeddings
+
+        bearer = await token.get_token()
+        token_handle = set_current_token(bearer)
+        log_handle = None
+        try:
+            ctx = await self._build_context(
+                user, conversation_id, chat_id, token, "", [], sink,
+                target_message_id=target_message_id,
+            )
+            log_handle = set_log_context(
+                conversation_id=ctx.conversation_id,
+                chat_id=ctx.chat_id or "-",
+                run_id=ctx.run_id,
+                request_id=ctx.request_id,
+            )
+            await ctx.events.start()
+            try:
+                await load_vocabulary_embeddings(ctx)
+            finally:
+                await ctx.events.stop()
+        finally:
+            if log_handle is not None:
+                reset_log_context(log_handle)
+            reset_current_token(token_handle)
+
     async def _emit_degraded_warnings(self, ctx: RunContext) -> None:
         """Emit a one-shot warning the first time each throttle goes degraded.
 

@@ -152,6 +152,14 @@ class JobRunner:
         # Phase C. Prevents the cancel-vs-natural-completion race
         # from swallowing the user's cancel intent.
         self._cancel_requested: set[str] = set()
+        # Background vocabulary-embedding pre-warm tasks, one per job,
+        # spawned when the engine pauses at the outline-feedback gate.
+        # The pre-warm shares the engine's process-global vocab cache
+        # via ``semantics.vocabulary._vocab_emb_load_lock`` so a
+        # concurrent ``submit_feedback`` simply waits on the same load.
+        # Cancelled on shutdown and on terminal phase (no point keeping
+        # work running for a job the user has already cancelled).
+        self._prewarm_tasks: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------------ helpers
 
@@ -216,6 +224,9 @@ class JobRunner:
         self._snapshots.pop(job_id, None)
         self._status_dedupe_counter.pop(job_id, None)
         self._cancel_requested.discard(job_id)
+        prewarm = self._prewarm_tasks.pop(job_id, None)
+        if prewarm is not None and not prewarm.done():
+            prewarm.cancel()
         # _job_locks intentionally NOT dropped — see `_lock_for`
         # docstring for the rationale.
 
@@ -239,6 +250,58 @@ class JobRunner:
             loop.call_soon(self._maybe_drop_job_state, job_id)
 
         task.add_done_callback(_cb)
+
+    def _spawn_vocab_prewarm(
+        self, record: JobRecord, *, owui_user_token: str
+    ) -> None:
+        """Kick off a background vocabulary-embedding pre-warm task.
+
+        Called from ``_run_initial`` once the engine has paused at the
+        outline-feedback gate (``AWAITING_OUTLINE_FEEDBACK``). The
+        pre-warm runs on the same ``conversation_id`` so it shares the
+        process-global vocab cache with the engine; the engine's own
+        ``load_vocabulary_embeddings`` call on feedback resume will
+        either find the cache hot or block on the same lock (no
+        duplicate batches).
+
+        Idempotent: a second call for a job that already has a pre-warm
+        task in flight is a no-op. The task self-removes from
+        ``_prewarm_tasks`` via a done-callback; ``_maybe_drop_job_state``
+        and ``shutdown`` cancel any still-running tasks.
+
+        Best-effort: failures inside the pre-warm are logged but do not
+        affect job phase or writebacks. The engine fallback (lazy load
+        on feedback resume) still works.
+        """
+        if record.job_id in self._prewarm_tasks:
+            return
+        sink = self._make_sink(record.job_id)
+        user = RunUser(id=record.user_id, name=record.user_name)
+
+        async def _runner() -> None:
+            try:
+                await self._coord.prewarm_vocabulary(
+                    user=user,
+                    conversation_id=record.conversation_id,
+                    chat_id=record.chat_id,
+                    token=StaticToken(owui_user_token),
+                    sink=sink,
+                    target_message_id=record.target_message_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Vocab pre-warm failed for job %s", record.job_id
+                )
+
+        task = asyncio.create_task(_runner())
+        self._prewarm_tasks[record.job_id] = task
+
+        def _done(t: asyncio.Task) -> None:
+            self._prewarm_tasks.pop(record.job_id, None)
+
+        task.add_done_callback(_done)
 
     def _schedule_cleanup(self, job_id: str) -> None:
         """Schedule ``_maybe_drop_job_state`` from a non-task context.
@@ -530,13 +593,22 @@ class JobRunner:
         async with self._registry_lock:
             tokens = list(self._cancellation_tokens.values())
             tasks = list(self._tasks.values())
+            prewarms = list(self._prewarm_tasks.values())
         for t in tokens:
             t.cancel()
+        for prewarm in prewarms:
+            if not prewarm.done():
+                prewarm.cancel()
         for task in tasks:
             if task.done():
                 continue
             with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 await asyncio.wait_for(task, timeout=timeout)
+        for prewarm in prewarms:
+            if prewarm.done():
+                continue
+            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                await asyncio.wait_for(prewarm, timeout=timeout)
 
     def get_snapshot(self, job_id: str) -> dict[str, Any]:
         return dict(self._snapshots.get(job_id, {}))
@@ -581,6 +653,13 @@ class JobRunner:
                     outline_json=json.dumps(outline_items) if outline_items else None,
                 )
                 self._mark_phase(record.job_id, JobPhase.AWAITING_OUTLINE_FEEDBACK)
+                # The user is now reading the outline; this is the only
+                # idle window in the run. Warm the vocab embeddings here
+                # so the engine doesn't pay the cold-cache cost during
+                # `generate_replacement_topics` on feedback resume.
+                self._spawn_vocab_prewarm(
+                    record, owui_user_token=owui_user_token
+                )
             else:
                 if record.job_id in self._cancel_requested:
                     # Cancel was requested between Coordinator.run

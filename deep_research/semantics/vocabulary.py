@@ -6,8 +6,15 @@ import httpx
 import numpy as np
 
 from deep_research.core.types import RunContext
+from deep_research.progress.events import StatusEvent
 
 logger = logging.getLogger("deep_research.semantics.vocabulary")
+
+# Emit a StatusEvent every N batches during vocab embedding generation so the
+# iframe revision advances even when the embedding throttle paces requests
+# slowly. ~25 batches at the documented 1 req/s pacing = ~25s between pulses,
+# enough to keep the UI alive without flooding the writeback channel.
+_VOCAB_PROGRESS_EVERY_N_BATCHES = 25
 
 _vocabulary_cache: list[str] | None = None
 _vocabulary_embeddings: dict[str, list[float]] | None = None
@@ -16,6 +23,32 @@ _vocabulary_embeddings: dict[str, list[float]] | None = None
 # reentrant and a single shared lock deadlocks (nested acquire).
 _vocab_load_lock = asyncio.Lock()
 _vocab_emb_load_lock = asyncio.Lock()
+
+
+async def _emit_vocab_progress(ctx: RunContext, done: int, total: int) -> None:
+    """Best-effort StatusEvent emit so a long vocab-embedding load keeps
+    the iframe revision moving.
+
+    Why: the load can take many minutes on a cold cache (10k words at a
+    throttled embeddings rate). Without these pulses, the engine sits in
+    a tight loop with the sink silent, the iframe polls return the same
+    snapshot, and the user-visible chat stays pinned at the last
+    ``replace`` event. The pulses don't carry payload — they only bump
+    the revision counter so the iframe shows "alive".
+    """
+    events = getattr(ctx, "events", None)
+    if events is None:
+        return
+    try:
+        await events.emit(
+            StatusEvent(
+                description=f"Loading vocabulary embeddings ({done}/{total})",
+                level="info",
+                done=False,
+            )
+        )
+    except Exception:  # noqa: BLE001 — best-effort: never let progress break the load
+        logger.debug("Vocab progress emit failed", exc_info=True)
 
 
 async def create_context_vocabulary(
@@ -189,12 +222,17 @@ async def load_vocabulary_embeddings(ctx: RunContext) -> dict[str, list[float]]:
             logger.info(
                 f"Generating embeddings for {len(vocab)} vocabulary words (batch_size={batch_size})"
             )
+            await _emit_vocab_progress(ctx, 0, len(vocab))
             all_embeddings = []
             embedding_model = ctx.valves.models.embedding_model
+            batch_index = 0
             for i in range(0, len(vocab), batch_size):
                 batch = vocab[i : i + batch_size]
                 batch_result = await ctx.embeddings.embeddings(embedding_model, batch)
                 all_embeddings.extend(batch_result)
+                batch_index += 1
+                if batch_index % _VOCAB_PROGRESS_EVERY_N_BATCHES == 0:
+                    await _emit_vocab_progress(ctx, len(all_embeddings), len(vocab))
 
             _vocabulary_embeddings = {
                 word: emb
@@ -211,6 +249,7 @@ async def load_vocabulary_embeddings(ctx: RunContext) -> dict[str, list[float]]:
         logger.info(
             f"Generated embeddings for {len(_vocabulary_embeddings)} vocabulary words"
         )
+        await _emit_vocab_progress(ctx, len(_vocabulary_embeddings), len(vocab))
         try:
             valid_words = list(_vocabulary_embeddings.keys())
             valid_embs = list(_vocabulary_embeddings.values())

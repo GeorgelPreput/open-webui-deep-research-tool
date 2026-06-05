@@ -179,7 +179,18 @@ FEEDBACK_DESCRIPTION = (
     "verbatim (e.g. `/k 1,3,5`, `/keep 1, 3, 5`, `/r 2,4,8-10`, "
     "`/continue`, or freeform text). Returns immediately while the engine "
     "resumes; the user sees research progress, citations, and the final "
-    "report stream into their chat message directly."
+    "report stream into their chat message directly.\n\n"
+    "**After a 200 response, do NOT call this tool again, do NOT call "
+    "`get_research_job`, and do NOT speculate about the engine's state.** "
+    "The engine is now running in the background; progress streams "
+    "directly into the user's chat and live-progress iframe — you cannot "
+    "see it from here, and the absence of an immediate visible change "
+    "does NOT mean the run has stalled or that the chat is ephemeral. "
+    "If the user's next message expresses impatience (\"is it running?\", "
+    "\"please continue\", \"hello?\"), simply acknowledge that the "
+    "research is in progress and the results will appear when the engine "
+    "finishes. Only call `cancel_research_job` if the user explicitly "
+    "asks to stop (`/q`, `/quit`, or unambiguous natural-language cancel)."
 )
 
 GET_DESCRIPTION = (
