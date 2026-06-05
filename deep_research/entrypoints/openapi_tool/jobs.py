@@ -218,9 +218,10 @@ class JobStore:
             if self._conn is not None:
                 return
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = await aiosqlite.connect(self._db_path)
+            self._conn = await aiosqlite.connect(
+                self._db_path, timeout=self._busy_timeout_ms / 1000.0
+            )
             self._conn.row_factory = aiosqlite.Row
-            await self._conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout_ms)}")
             await self._conn.execute("PRAGMA journal_mode = WAL")
             await self._conn.execute("PRAGMA foreign_keys = ON")
             await self._conn.executescript(_SCHEMA)
