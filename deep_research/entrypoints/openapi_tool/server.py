@@ -24,12 +24,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import logging
 import os
 import pathlib
 import secrets
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from uuid import uuid4
 
 from fastapi import (
@@ -59,7 +61,7 @@ from .jobs import (
     history_to_json,
 )
 from .outbox import OutboxWorker
-from .runner import JobRunner
+from .runner import ActiveJobExistsError, FeedbackCancelledError, JobRunner
 from .schemas import (
     CancelResponse,
     ErrorResponse,
@@ -71,7 +73,84 @@ from .schemas import (
     StartResearchResponse,
 )
 
+if TYPE_CHECKING:
+    from deep_research.adapter.client import OWUIClient
+
 logger = logging.getLogger("deep_research.entrypoints.openapi")
+
+
+_AUDIT_TIMEOUT_S = 30.0
+
+
+async def _run_audit_with_timeout(
+    valves: Any,
+    env: Mapping[str, str],
+    writeback_client: OWUIClient | None,
+    *,
+    timeout_s: float = _AUDIT_TIMEOUT_S,
+) -> list[ConfigWarning]:
+    """Run the startup audit with an upper time bound.
+
+    A briefly-unreachable OWUI at boot would otherwise hang the lifespan
+    on the admin probe's HTTP timeout. On `asyncio.TimeoutError` we
+    synthesise an `OWUI_API_KEY_PROBE_FAILED` warning — the same code
+    the audit's `except Exception` branch emits — so callers see one
+    stable shape for "probe couldn't run" regardless of cause.
+    """
+    try:
+        return await asyncio.wait_for(
+            audit_writeback_configuration(valves, env, writeback_client),
+            timeout=timeout_s,
+        )
+    except TimeoutError:
+        logger.warning(
+            "Config audit: admin probe to OWUI timed out after %.1fs; "
+            "starting server with OWUI_API_KEY_PROBE_FAILED warning.",
+            timeout_s,
+        )
+        return [
+            ConfigWarning(
+                code="OWUI_API_KEY_PROBE_FAILED",
+                severity="warning",
+                message=(
+                    f"Probe to GET /api/v1/auths/ did not return within "
+                    f"{timeout_s:.0f}s at startup. OWUI may be unreachable; "
+                    "writeback POSTs may fail at runtime."
+                ),
+                remediation=(
+                    "Verify the OWUI base URL is reachable from this pod. "
+                    "Once OWUI is reachable, restart the tool server to "
+                    "re-run the probe."
+                ),
+            )
+        ]
+
+
+def _maybe_floor_warning(valves: Any) -> ConfigWarning | None:
+    """Synthesise the `CLEANUP_INTERVAL_FLOORED` warning when the operator
+    set `DR_JOBS_CLEANUP_INTERVAL_S` below the 60s floor.
+
+    The retention loop floors the runtime interval at 60s; this function
+    surfaces that decision in `/health` so operators don't have to read
+    source to discover their value was overridden.
+    """
+    configured = int(valves.jobs.cleanup_interval_s)
+    if configured >= 60:
+        return None
+    return ConfigWarning(
+        code="CLEANUP_INTERVAL_FLOORED",
+        severity="info",
+        message=(
+            f"DR_JOBS_CLEANUP_INTERVAL_S={configured}s is below the 60s "
+            "minimum and was floored to 60s. The retention sweep runs "
+            "every 60s."
+        ),
+        remediation=(
+            "Set DR_JOBS_CLEANUP_INTERVAL_S to 60 or higher. If you "
+            "need faster cleanup, lower completed_retention_s or "
+            "failed_retention_s instead."
+        ),
+    )
 
 
 START_DESCRIPTION = (
@@ -113,10 +192,20 @@ GET_DESCRIPTION = (
 CANCEL_DESCRIPTION = (
     "Request cancellation of a research job. Returns immediately; the "
     "engine bails at the next phase boundary (typically within seconds "
-    "to a minute depending on the active phase).\n\n"
-    "Call this tool when the user types `/q` or `/quit`, or makes any "
-    "natural-language cancellation request (\"stop\", \"cancel\", "
-    "\"never mind\")."
+    "to a minute depending on the active phase). Cancellation is "
+    "**irreversible** — there is no undo and no resume; the user must "
+    "start a new research job from scratch.\n\n"
+    "**When to call:** unambiguous slash commands `/q` or `/quit`. "
+    "Forward these immediately, without a confirmation question.\n\n"
+    "**When NOT to call:** ambiguous natural-language phrases ("
+    "\"stop\", \"cancel\", \"never mind\", \"wait\", \"hold on\") may "
+    "express frustration, a question about the run, or a request to "
+    "narrow scope — they are not unambiguous cancellation requests. "
+    "Before calling this tool on natural language, ask the user one "
+    "short clarifying question (\"Cancel the research entirely, or "
+    "would you like to narrow the scope?\") and only call cancel if "
+    "they confirm. False-positive cancels destroy in-flight work and "
+    "are user-hostile."
 )
 
 LIVE_VIEW_DESCRIPTION = (
@@ -176,12 +265,22 @@ async def lifespan(app: FastAPI):
     app.state.coord = coord
     app.state.valves = valves
 
-    app.state.config_warnings = await audit_writeback_configuration(
-        valves, os.environ, coord
+    app.state.config_warnings = await _run_audit_with_timeout(
+        valves, os.environ, coord.writeback_client
     )
+    app.state.config_warnings_lock = asyncio.Lock()
     for w in app.state.config_warnings:
         logger.warning(
             "Config audit: [%s] %s — %s", w.code, w.message, w.remediation
+        )
+
+    floor_warning = _maybe_floor_warning(valves)
+    if floor_warning is not None:
+        async with app.state.config_warnings_lock:
+            app.state.config_warnings.append(floor_warning)
+        logger.warning(
+            "Config audit: [%s] %s — %s",
+            floor_warning.code, floor_warning.message, floor_warning.remediation,
         )
 
     db_path = pathlib.Path(config.data_dir) / "jobs.sqlite"
@@ -198,14 +297,17 @@ async def lifespan(app: FastAPI):
             poll_interval_s=max(0.05, valves.jobs.outbox_poll_interval_ms / 1000.0),
             max_attempts=valves.jobs.outbox_max_attempts,
             max_backoff_s=valves.jobs.outbox_max_backoff_s,
+            max_retry_after_s=valves.jobs.outbox_max_retry_after_s,
             busy_timeout_ms=valves.jobs.sqlite_busy_timeout_ms,
         )
         await outbox.start()
         logger.info(
-            "OutboxWorker started (writeback enabled); poll_interval_ms=%d max_attempts=%d max_backoff_s=%d",
+            "OutboxWorker started (writeback enabled); poll_interval_ms=%d "
+            "max_attempts=%d max_backoff_s=%d max_retry_after_s=%d",
             valves.jobs.outbox_poll_interval_ms,
             valves.jobs.outbox_max_attempts,
             valves.jobs.outbox_max_backoff_s,
+            valves.jobs.outbox_max_retry_after_s,
         )
     app.state.outbox = outbox
 
@@ -383,47 +485,35 @@ async def start_research_job(
             ),
         )
 
-    if (
-        creds is not None
-        and creds.credentials
-        and not chat_id
-        and not getattr(request.app.state, "_forward_headers_warned", False)
-    ):
-        request.app.state._forward_headers_warned = True
-        warning = ConfigWarning(
-            code="OWUI_HEADERS_NOT_FORWARDED",
-            severity="warning",
-            message=(
-                "An authenticated request arrived without "
-                "X-OpenWebUI-Chat-Id. OWUI is not forwarding user-info "
-                "headers; writeback is silently disabled."
-            ),
-            remediation=(
-                "On the OWUI container, set "
-                "ENABLE_FORWARD_USER_INFO_HEADERS=true and restart."
-            ),
-        )
-        existing = getattr(request.app.state, "config_warnings", None)
-        if existing is None:
-            existing = []
-            request.app.state.config_warnings = existing
-        existing.append(warning)
-        logger.warning(
-            "Config audit (runtime): [%s] %s — %s",
-            warning.code, warning.message, warning.remediation,
-        )
+    if creds is not None and creds.credentials and not chat_id:
+        async with request.app.state.config_warnings_lock:
+            if not getattr(request.app.state, "_forward_headers_warned", False):
+                request.app.state._forward_headers_warned = True
+                warning = ConfigWarning(
+                    code="OWUI_HEADERS_NOT_FORWARDED",
+                    severity="warning",
+                    message=(
+                        "An authenticated request arrived without "
+                        "X-OpenWebUI-Chat-Id. OWUI is not forwarding user-info "
+                        "headers; writeback is silently disabled."
+                    ),
+                    remediation=(
+                        "On the OWUI container, set "
+                        "ENABLE_FORWARD_USER_INFO_HEADERS=true and restart."
+                    ),
+                )
+                existing = getattr(request.app.state, "config_warnings", None)
+                if existing is None:
+                    existing = []
+                    request.app.state.config_warnings = existing
+                existing.append(warning)
+                logger.warning(
+                    "Config audit (runtime): [%s] %s — %s",
+                    warning.code, warning.message, warning.remediation,
+                )
 
     store: JobStore = request.app.state.job_store
     runner: JobRunner = request.app.state.runner
-
-    if chat_id:
-        existing = await store.find_active_by_chat(chat_id)
-        if existing is not None and existing.phase not in TERMINAL_PHASES:
-            raise _error(
-                409,
-                "already_running",
-                f"Active job exists for this chat: {existing.job_id}",
-            )
 
     job_id = str(uuid4())
     view_token = secrets.token_urlsafe(32)
@@ -442,13 +532,28 @@ async def start_research_job(
         revision=0,
         view_token_hash=view_token_hash,
     )
-    await store.create(record)
-    await runner.start_job(record, view_token=view_token, owui_user_token=token)
+    try:
+        await runner.start_job(
+            record, view_token=view_token, owui_user_token=token
+        )
+    except ActiveJobExistsError:
+        # The sqlite UNIQUE partial index rejected the insert at
+        # JobRunner.start_job. Re-fetch the winning row to give the
+        # LLM a useful job_id in the 409 message.
+        active = (
+            await store.find_active_by_chat(chat_id) if chat_id else None
+        )
+        if active is not None:
+            msg = f"Active job exists for this chat: {active.job_id}"
+        else:
+            msg = "Active job exists for this chat."
+        raise _error(409, "already_running", msg) from None
 
     return StartResearchResponse(
         job_id=job_id,
         status="running",
         next_action="await_user_selection",
+        view_token=view_token,
     )
 
 
@@ -489,7 +594,27 @@ async def submit_research_feedback(
     if new_message_id and new_message_id != record.target_message_id:
         await store.rebind_target_message(job_id, new_message_id)
 
-    await runner.submit_feedback(job_id, req.selection)
+    try:
+        await runner.submit_feedback(job_id, req.selection)
+    except FeedbackCancelledError as exc:
+        # Race-window backstop: a concurrent cancel moved the phase
+        # while the runner was awaiting the start task outside the
+        # per-job lock. Distinct code so consumers can tell this
+        # from the common "client called feedback on a job that was
+        # never paused" case the handler fast-path serves.
+        raise _error(409, "cancelled_during_feedback", str(exc)) from None
+    except RuntimeError as exc:
+        # Defence in depth: the handler's pre-check above normally
+        # catches the wrong-phase case before reaching here, but a
+        # concurrent transition between the check and the runner
+        # call would surface as RuntimeError from the runner's own
+        # Phase A check.
+        raise _error(409, "not_awaiting_feedback", str(exc)) from None
+    except KeyError:
+        # Race: the record was deleted between the handler's
+        # `store.get` and the runner's own re-read.
+        raise _error(404, "unknown_job", job_id) from None
+
     return FeedbackResponse(
         job_id=job_id,
         status="running",
@@ -573,7 +698,10 @@ async def live_view(
     record = await store.get(job_id)
     if record is None:
         raise HTTPException(status_code=404)
-    if hashlib.sha256(token.encode("utf-8")).hexdigest() != record.view_token_hash:
+    if not hmac.compare_digest(
+        hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        record.view_token_hash,
+    ):
         raise HTTPException(status_code=403)
 
     snapshot = _progress_dict_for(record, runner)
@@ -604,7 +732,10 @@ async def live_view_status(
     record = await store.get(job_id)
     if record is None:
         raise HTTPException(status_code=404)
-    if hashlib.sha256(token.encode("utf-8")).hexdigest() != record.view_token_hash:
+    if not hmac.compare_digest(
+        hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        record.view_token_hash,
+    ):
         raise HTTPException(status_code=403)
 
     if since_version is not None and record.revision == since_version:
@@ -623,6 +754,10 @@ async def live_view_status(
 @app.get("/health", tags=["health"])
 async def health(request: Request) -> dict:
     warnings = getattr(request.app.state, "config_warnings", [])
+    outbox: OutboxWorker | None = getattr(request.app.state, "outbox", None)
+    outbox_counts: dict[str, int] | None = None
+    if outbox is not None:
+        outbox_counts = await outbox.count_by_status()
     return {
         "status": "ok",
         "config_warnings": [
@@ -634,4 +769,5 @@ async def health(request: Request) -> dict:
             }
             for w in warnings
         ],
+        "outbox": outbox_counts,
     }

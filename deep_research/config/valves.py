@@ -147,6 +147,21 @@ class EmbeddingsThrottleValves(_ThrottleFieldsMixin):
     batch_max_inputs: int = 64
 
 
+class WritebackThrottleValves(_ThrottleFieldsMixin):
+    """Throttle knobs for the OpenAPI Tool Server's writeback ``OWUIClient``.
+
+    The writeback channel posts to OWUI's per-message ``/event`` endpoint with
+    a static admin token and also calls ``upload_file`` for KB ingestion, which
+    triggers OWUI's own embedding pipeline downstream. A research run emits
+    dozens of events (status pills, citations, final report, iframe replaces)
+    plus 1+ uploads per cycle; without a throttle, an outbox drain burst goes
+    straight at OWUI and into the same embedding provider quota the engine is
+    already pulling on. Defaults to ``max_rps=0`` (gate disabled) so existing
+    deployments see no behaviour change unless operators tune it.
+    """
+    pass
+
+
 class JobsValves(BaseModel):
     """OpenAPI Tool Server job-store and writeback knobs."""
     completed_retention_s: int = 30 * 24 * 3600
@@ -158,6 +173,11 @@ class JobsValves(BaseModel):
     outbox_poll_interval_ms: int = 250
     outbox_max_attempts: int = 10
     outbox_max_backoff_s: int = 60
+    # Hard ceiling on server-supplied ``Retry-After`` for outbox writebacks.
+    # Defaults to 10 minutes — generous because the server told us this value
+    # and clamping it causes "retried too soon, throttled harder". Production
+    # runs last 40–90 min so a 10-min deferral fits inside the run window.
+    outbox_max_retry_after_s: int = 600
 
 
 class AdvancedValves(BaseModel):
@@ -192,4 +212,7 @@ class Valves(BaseModel):
     llm_throttle: LLMThrottleValves = Field(default_factory=LLMThrottleValves)
     embeddings_throttle: EmbeddingsThrottleValves = Field(
         default_factory=EmbeddingsThrottleValves
+    )
+    writeback_throttle: WritebackThrottleValves = Field(
+        default_factory=WritebackThrottleValves
     )

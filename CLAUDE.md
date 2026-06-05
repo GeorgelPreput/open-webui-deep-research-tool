@@ -33,8 +33,10 @@ exists.
 The OpenAPI Tool Server was rewritten around a **two-call** workflow:
 
   - `POST /research_jobs` starts a job and returns immediately with a
-    `job_id` plus `user_facing_instruction` (verbatim text the LLM
-    must surface so the user knows the slash-command grammar).
+    `job_id`, a per-job `view_token` (the cleartext live-view token;
+    sha256-hashed at rest), and `user_facing_instruction` (verbatim
+    text the LLM must surface so the user knows the slash-command
+    grammar).
   - `POST /research_jobs/{job_id}/feedback` forwards the user's
     `/k 1,3,5` / `/r 2,4` / `/continue` (or freeform) reply and
     resumes the engine.
@@ -42,8 +44,19 @@ The OpenAPI Tool Server was rewritten around a **two-call** workflow:
   - `POST /research_jobs/{job_id}/cancel` cooperative cancellation
     via a `CancellationToken` checked at every phase boundary.
   - `GET /live_view/{job_id}` HTML iframe — per-job view tokens,
-    sha256-hashed at rest, self-polling.
+    sha256-hashed at rest, self-polling. View-token equality is
+    compared with `hmac.compare_digest` for constant-time safety.
   - `GET /live_view/{job_id}/status` JSON snapshot used by the iframe.
+
+The cleartext `view_token` returned on the start response is only
+needed when an OpenAPI consumer renders the iframe URL itself
+(`/live_view/{job_id}?token={view_token}`) — typically the
+writeback-disabled or non-OWUI deployment case. In the normal
+writeback-enabled flow the iframe HTML, with the cleartext baked into
+the polling script's `data-bootstrap` attribute by
+`progress/embed.py::render_progress_embed_html`, is posted to the chat
+row directly via the writeback channel, and chat-history replay works
+without the LLM having to retain the token.
 
 Job state lives in a durable `aiosqlite` store
 (`deep_research/entrypoints/openapi_tool/jobs.py`). A server restart
@@ -60,6 +73,54 @@ between calls. See `entrypoints/openapi_tool/runner.py`.
 OpenAPI runner populates it). It rebinds on each
 `submit_research_feedback` call so the Phase 2 writeback channel
 posts to the *new* tool-call assistant message, not the prior one.
+
+**Per-job lock invariant (`JobRunner`).** All lifecycle transitions
+(`start_job`, `submit_feedback`, `cancel`) for a given `job_id` are
+serialised by a per-job `asyncio.Lock` held by
+`JobRunner._job_locks[job_id]`. The runner uses a two-tier scheme:
+`_registry_lock` (held for microseconds) covers mutations of the
+`_job_locks` dict and is also the cross-job lock used by `shutdown`;
+each per-job lock covers a single job's transitions. `submit_feedback`
+and `cancel` follow the same **Phase A → release → Phase B →
+re-acquire → Phase C** shape, releasing the lock during the engine-task
+wait (Phase B) and re-acquiring it for the finalisation (Phase C) —
+holding the lock across an indefinite engine wait would block
+concurrent cancel. Phase C re-validates against the store-read record;
+a concurrent cancel during Phase B surfaces as `FeedbackCancelledError`
+in `submit_feedback` (mapped to HTTP 409
+`cancelled_during_feedback`) or is bridged by `_cancel_requested` in
+`cancel`. The `_cancel_requested: set[str]` intent flag prevents the
+cancel-vs-natural-completion race from swallowing the user's cancel
+intent: the success branches of `_run_initial` / `_run_feedback`
+check the flag *before* writing COMPLETED to the store, so a cancel
+arriving mid-finalisation lets the task return without setting a
+terminal phase and `cancel()`'s Phase C lands CANCELLED. Per-job
+state dicts (`_tasks`, `_cancellation_tokens`, `_owui_tokens`,
+`_view_tokens`, `_snapshots`, `_status_dedupe_counter`,
+`_cancel_requested`) are GC'd on terminal phase via a task
+done-callback scheduling `_maybe_drop_job_state` through `call_soon`.
+`_job_locks` is intentionally NOT GC'd: a coroutine that has already
+received a lock reference but not yet acquired it could race a newcomer
+that creates a fresh lock for the same `job_id`, breaking the
+serialisation invariant. Lock leak is bounded by observed active
+`job_id`s — small (~100 bytes per terminal job) and the server
+short-circuits new calls for terminal jobs at the handler layer.
+
+**Sqlite UNIQUE partial index as defence in depth.**
+`research_jobs` has a `CREATE UNIQUE INDEX ... ON research_jobs(chat_id)
+WHERE chat_id IS NOT NULL AND phase NOT IN ('completed', 'failed',
+'cancelled')` enforcing "one active job per chat" at the database
+layer. `JobRunner.start_job` catches `aiosqlite.IntegrityError` from
+`store.create` and translates it to `ActiveJobExistsError`, which the
+server handler maps to HTTP 409 `already_running`. A pre-migration
+query in `JobStore.start` resolves any pre-existing duplicate active
+rows (older row marked FAILED with `error_text` carrying the
+`pre_migration` token) so the UNIQUE index can be created cleanly on
+databases that pre-date this constraint. The index is single-process
+defence: see "Multi-process / multi-replica" deferred item — two
+server processes writing to the same sqlite file still serialise via
+file locks and `IntegrityError` is the user-visible failure under
+contention, NOT clean 409 routing.
 
 ### OWUI external-tool model — constraints that shape the v2 design
 
@@ -176,6 +237,66 @@ Skip conditions in `_event_to_outbox` / bootstrap / final-writeback:
 ephemeral-chat marker — the `/event` endpoint accepts the POST but
 the event is dropped, so we don't waste an HTTP round-trip.
 
+**Outbox row status enum.** `owui_outbox` has a `status` column
+(`pending | retrying | delivered | abandoned`) alongside `delivered_at`.
+Convention: `delivered_at IS NOT NULL` means "terminal, do not
+redeliver" (so the worker's pending query stays simple); `status`
+distinguishes "delivered" (POST 2xx, true success) from "abandoned"
+(gave up after `max_attempts` or rejected for a non-retriable reason
+like a corrupt payload JSON blob). Ops counting "successful
+deliveries" MUST filter on `status = 'delivered'`, NOT on
+`delivered_at IS NOT NULL`. A pre-`status` DB is migrated in-place on
+`OutboxWorker.start` via `_migrate_schema`; the migration cannot
+reconstruct true-vs-abandoned for legacy rows and back-fills both as
+'delivered' with a one-shot info log line (PRAGMA `table_info`
+gates the ALTER so re-runs are no-ops). The counts are exposed via
+`OutboxWorker.count_by_status()` and surfaced live (not cached) under
+the `outbox` key of `GET /health` — a local sqlite `GROUP BY` is
+microseconds, so the caching rationale that applies to the OWUI admin
+probe does NOT apply here.
+
+**Outbox Retry-After honours the server's value.** The worker's
+`_compute_backoff` calls `extract_retry_after_seconds(exc)` for every
+transient error type the helper can read headers from (`AdapterError`,
+`httpx.HTTPStatusError`, any mapping-headers duck-type). When present,
+the server-supplied value replaces the default exponential delay
+entirely. The two ceilings have different jobs and are NOT collapsible:
+
+| Knob | Purpose | Default |
+|---|---|---|
+| `jobs.outbox_max_backoff_s` | Cap on **default** exponential delay | 60 s |
+| `jobs.outbox_max_retry_after_s` | Cap on **server-supplied** Retry-After | 600 s |
+
+The 10-min default for `outbox_max_retry_after_s` matches production
+observation: runs last 40–90 min, so a 10-min deferral fits inside the
+run window without delaying the chat row's user-visible terminal write
+past the run itself. Do not collapse the two knobs — clamping
+Retry-After down to `max_backoff_s` is the "retried too soon, throttled
+harder" anti-pattern the header exists to override.
+
+**Writeback `OWUIClient` is throttled.** The writeback client is
+constructed with its own `HttpThrottle` (label `owui_writeback`, valve
+group `writeback_throttle`). It is functionally distinct from
+`jobs.outbox_max_retry_after_s`: the throttle gates dispatched HTTP
+calls (token bucket + min-interval) at the *client* layer; the ceiling
+bounds the *worker*'s `next_attempt_at` math after a failure. Both
+exist because the writeback path has two distinct burst surfaces —
+`/event` posts (HTTP-cheap, OWUI side) and `upload_file` KB ingestion
+(downstream-triggers OWUI's own embedding pipeline, so quota-expensive
+on the model provider). The throttle covers both via `OWUIClient`'s
+`_request` and `upload_file` paths.
+
+Counters: `record_attempt` / `record_success` / `record_retry` /
+`record_429` are wired on the writeback throttle in `OWUIClient` via
+`with_retry`'s `on_transient` / `on_exhausted` callbacks — same shape
+as `LLMProviderClient`. Degraded mode is therefore live on the
+writeback path if operators tune `writeback_throttle.max_delay_seconds`.
+
+Defaults ship the writeback throttle disabled
+(`max_requests_per_second=0`, `min_interval_ms=0`) so existing
+deployments observe no behaviour change. Operators tune via
+`DR_WRITEBACK_THROTTLE_*` env vars.
+
 ### Phase 2 deferred items and decisions
 
 These are intentional non-implementations from the Phase 2 rollout —
@@ -285,6 +406,13 @@ for the two tables and (b) either sticky sessions keyed on
 `conversation_id` or moving the engine state into the shared store.
 Neither is wired today; the runtime documents itself as single-process.
 
+The UNIQUE partial index on `research_jobs(chat_id) WHERE phase NOT IN
+terminal` (see "OpenAPI Tool Server runtime") strengthens the
+single-process invariant but does NOT make multi-process safe: two
+processes racing on `INSERT` for the same `chat_id` still produce
+`IntegrityError` rather than a clean 409 routing, and the in-process
+per-job lock in `JobRunner` isn't shared across processes.
+
 (Note: same-process concurrency across different users / different
 `conversation_id`s is fully supported and is *not* the same problem.
 `ResearchStateManager` dispenses per-conversation dicts and every
@@ -332,6 +460,18 @@ two sites:
   2. `deep_research/entrypoints/openapi_tool/schemas.py::StartResearchResponse.user_facing_instruction`
      — the user-facing teaser the LLM is told to emit verbatim.
 
+Site #1's tool-description text requires the LLM to confirm any
+natural-language cancel before calling; only the unambiguous slash
+commands `/q` and `/quit` are forwarded without a confirmation
+question. The parser branch in
+`process_outline_feedback_continuation` signals the engine's
+`CancellationToken` (via `getattr(ctx, "cancellation_token", None)`)
+before raising `asyncio.CancelledError`, so any post-unwind
+`is_cancelled()` reader observes the cancel correctly. All slash
+commands (`/k`, `/keep`, `/r`, `/remove`, `/q`, `/quit`, `/continue`,
+`/c`) are case-insensitive — the parser uses `re.IGNORECASE` on the
+keep/remove patterns and `.lower()` on the single-word commands.
+
 **`local:` chats are refused at `start_research_job`.** The OpenAPI
 Tool Server returns 409 with code `unsaved_chat_unsupported` for any
 `X-OpenWebUI-Chat-Id` starting with `local:` (OWUI's ephemeral chat
@@ -359,6 +499,14 @@ reference and is no longer done. The matching writeback test pinned in
 `tests/test_openapi_writeback_e2e.py::test_writeback_sequence_through_full_lifecycle`
 explicitly asserts no `embeds: []` clear is enqueued.
 
+The helper takes a `kind: Literal["final", "cancelled"]` argument;
+both kinds share a single `terminal` dedupe suffix, so a cancel
+arriving during a successful final-writeback enqueue cannot produce a
+mismatched status/body pair — `INSERT OR IGNORE` lets whichever
+event-type row inserts first survive. Pinned by
+`tests/test_openapi_writeback_e2e.py::test_terminal_writeback_dedupes_when_final_wins`
+and `..._when_cancel_wins`.
+
 **`runner.cancel` handles two paths.** When the engine task is
 actively running, cancellation flows through the token → phase
 boundary → `asyncio.CancelledError` → handler in `_run_initial` /
@@ -369,6 +517,12 @@ the same `_enqueue_terminal_writeback` helper. Pinned by
 `tests/test_openapi_runner.py::test_cancel_at_gate_marks_cancelled`
 and the matching e2e
 `tests/test_openapi_writeback_e2e.py::test_gate_cancel_posts_status_and_replace`.
+
+User-typed `/q` / `/quit` arriving via the outline-feedback parser
+signals the same `CancellationToken` (via `getattr(ctx,
+"cancellation_token", None)`) before raising
+`asyncio.CancelledError`, so a downstream phase-boundary check sees
+the cancel even when the raise unwinds before the runner's handler.
 
 **Bootstrap iframe is no longer posted in the preliminary phase.**
 `start_job` does not call `_enqueue_bootstrap_embed`; the iframe is
@@ -386,18 +540,27 @@ runtime detector inside `start_research_job`. Results are cached on
 The stable `code` values:
 
   - `MISSING_OWUI_API_KEY` — `DR_OWUI_API_KEY` unset while
-    `valves.jobs.writeback_enabled=True`. The lifespan also fails
-    fast (raises `RuntimeError`) on this exact condition before the
-    audit runs; the audit retains the check so a future ops escape
-    hatch that disables the fail-fast still surfaces the warning.
+    `valves.jobs.writeback_enabled=True`. The lifespan fails fast
+    (raises `RuntimeError`) on this exact condition and the server
+    refuses to start. The startup log line carries this code; it is
+    NOT emitted into `app.state.config_warnings`, so `/health` will
+    never return it. (The audit module no longer re-checks this
+    condition — the lifespan fail-fast is the canonical site.)
   - `OWUI_API_KEY_NOT_ADMIN` — probe (`OWUIClient.get_session_user()`
     → `GET /api/v1/auths/`) returned `role != "admin"`. Writeback
     POSTs would 401 at runtime; the server still starts.
-  - `OWUI_API_KEY_PROBE_FAILED` — the admin probe raised. Could be
-    transient infrastructure (OWUI not yet up); does NOT fail-fast.
+  - `OWUI_API_KEY_PROBE_FAILED` — the admin probe raised, returned a
+    non-dict body (mapped via `AdapterError`), or did not return
+    within the 30s lifespan budget. Could be transient infrastructure
+    (OWUI not yet up); does NOT fail-fast.
   - `MISSING_PUBLIC_BASE_URL` — `DR_OPENAPI_PUBLIC_BASE_URL` unset.
     Severity `info` (degraded UX, not broken) — the iframe falls
     back to the inbound request's host header.
+  - `CLEANUP_INTERVAL_FLOORED` — operator set
+    `DR_JOBS_CLEANUP_INTERVAL_S` below 60s. Severity `info` (runtime
+    is correct; the retention sweep still floors to 60s — this code
+    surfaces the floored value). Emitted once at lifespan time;
+    appears in `/health` until the next pod restart.
   - `OWUI_HEADERS_NOT_FORWARDED` — detected at runtime (not startup):
     the first authenticated request to `start_research_job` arrived
     without `X-OpenWebUI-Chat-Id`. One-shot per process via
@@ -423,7 +586,43 @@ restart anyway.
 `OWUI_API_KEY_NOT_ADMIN` and `OWUI_API_KEY_PROBE_FAILED` do not
 fail-fast because the former can't be checked synchronously before
 the event loop is up and the latter is often a transient infra
-issue. `MISSING_PUBLIC_BASE_URL` is informational only.
+issue. `MISSING_PUBLIC_BASE_URL` is informational only. The startup
+audit probe is bounded by a 30s `asyncio.wait_for` (see
+`_run_audit_with_timeout` in `entrypoints/openapi_tool/server.py`);
+a timeout falls back to enqueuing `OWUI_API_KEY_PROBE_FAILED` in
+`config_warnings` so a briefly-unreachable OWUI does not stall the
+lifespan or trip K8s readinessProbe.
+
+### Runner failure logging
+
+Three exception paths in `deep_research/entrypoints/openapi_tool/runner.py`
+log instead of swallowing silently. These are positive invariants; do
+not restore the silent-suppress shape during cleanup.
+
+  - `_make_sink` — both the `_update_snapshot` call and the
+    `_event_to_outbox` call are wrapped in `try/except Exception`
+    with `logger.exception`. The engine continues running after a bad
+    event (so one malformed event doesn't cascade into a job-wide
+    writeback freeze), but each failure leaves a traceback with the
+    job id and the offending event class.
+  - The outer `except Exception` in `_run_initial` and `_run_feedback`
+    wraps the `_store.update(phase=FAILED, ...)` call in its own
+    `try/except Exception` with `logger.exception`, and `_mark_phase`
+    runs unconditionally. The in-memory snapshot phase tracks the
+    intended terminal phase even when the DB write itself raises
+    (sqlite IO error, transient lock contention).
+  - `_deserialise_history` logs via `logger.warning` on a corrupted
+    blob. The log line carries blob *length*, the exception class
+    name, and `str(exc)` (JSONDecodeError emits position-only
+    metadata; no content from the input). Returns `[]` so the engine
+    still resumes with the fallback path. **PII-safety invariant:**
+    do not log any fragment of the raw blob — the test
+    `test_deserialise_history_logs_on_bad_blob` pins this.
+
+The analogous risk in the *cancellation* branches (`runner.py:201-203,
+292-294, 367-369`, each calling
+`_store.update(phase=CANCELLED, ...)`) is tracked in TODO.md Group 3
+and deferred to that group's terminal-cancel-helper extraction.
 
 ---
 
@@ -438,6 +637,8 @@ OWUI instantiates `Pipe` once and calls `pipe()` concurrently for every user req
 **ContextVars do NOT propagate across `loop.run_in_executor`.** Callables submitted to `self.executor` run in pool worker threads whose ContextVar slots are unrelated to the calling Task's context. Never read per-call attributes (`self.__user__`, `self.conversation_id`, etc.) inside a function passed to `run_in_executor`; pass per-call values in as explicit closure arguments. At present this rule is observed — every executor callable in `pipe.py` captures only local args (`_run_load`, `extract_with_pypdf`, `extract_with_pdfplumber`, `extract_with_bs4`). Audit any new callbacks you add against this rule.
 
 **Same-conversation entry dedupe.** `pipe()` rejects a second invocation for a `conversation_id` already in `self._inflight`. Two concurrent calls on the same conversation would share the `ResearchStateManager` dict and corrupt state through interleaved read-modify-write across `await` boundaries; rather than retrofitting a lock around 60+ state mutation sites, the second invocation is rejected at entry with a notice.
+
+**`Coordinator._inflight` role across runtimes.** The `Coordinator` itself maintains an `_inflight` set keyed on `(user.id, conversation_id)` (see `deep_research/orchestrator/coordinator.py`) that raises `AlreadyRunningError` for a concurrent `Coordinator.run()` on the same conversation. This is the **primary** serialisation mechanism for the **Function path** (`pipe.py` doesn't have its own per-conversation lock around `Coordinator.run` — it relies on the engine's guard *and* its own pre-entry rejection in `_inflight`). For the **OpenAPI Tool Server runtime**, `Coordinator._inflight` is now a **defence-in-depth backstop**: the runner's per-job `asyncio.Lock` plus the sqlite UNIQUE partial index on `research_jobs(chat_id) WHERE phase NOT IN terminal` are the primary serialisation, and the engine guard catches anything that slips past them. Don't remove the `_inflight` code on the assumption it's redundant — it's load-bearing for the Function path.
 
 ---
 

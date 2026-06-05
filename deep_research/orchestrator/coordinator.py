@@ -90,6 +90,7 @@ class Coordinator:
         self._embeddings: EmbeddingProviderClient | None = None
         self._llm_throttle: HttpThrottle | None = None
         self._embeddings_throttle: HttpThrottle | None = None
+        self._writeback_throttle: HttpThrottle | None = None
         self._started = False
 
     async def start(self, *, writeback_token: str | None = None) -> None:
@@ -169,11 +170,23 @@ class Coordinator:
                 # chats — only viable because that endpoint admin-bypasses
                 # the chat-owner filter. A separate client keeps the static
                 # admin token isolated from the per-request user-token path.
+                # The throttle prevents a drain burst (status pills,
+                # citations, final report, iframe replaces) and KB ingestion
+                # uploads from hammering OWUI and its downstream embedding
+                # pipeline.
+                wb_t = self._valves.writeback_throttle
+                self._writeback_throttle = HttpThrottle(
+                    label="owui_writeback",
+                    max_rps=wb_t.max_requests_per_second,
+                    min_interval_ms=wb_t.min_interval_ms,
+                    max_delay_seconds=wb_t.max_delay_seconds,
+                )
                 self._writeback_client = OWUIClient(
                     base_url=self._config.base_url,
                     token_provider=StaticToken(writeback_token),
                     timeout_seconds=self._valves.advanced.http_timeout_seconds,
                     max_retries=self._valves.advanced.http_max_retries,
+                    throttle=self._writeback_throttle,
                 )
             llm_t = self._valves.llm_throttle
             emb_t = self._valves.embeddings_throttle

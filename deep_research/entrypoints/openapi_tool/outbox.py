@@ -25,13 +25,15 @@ import contextlib
 import json
 import logging
 import pathlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
-from deep_research.adapter.client import PERSISTED_EVENT_TYPES, AdapterError
+from deep_research.adapter.client import PERSISTED_EVENT_TYPES
 from deep_research.core.errors import extract_retry_after_seconds
 
 if TYPE_CHECKING:
@@ -52,6 +54,44 @@ def _iso_from(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
 
 
+class OutboxStatus(StrEnum):
+    PENDING = "pending"
+    RETRYING = "retrying"
+    DELIVERED = "delivered"
+    ABANDONED = "abandoned"
+
+
+_OUTBOX_COLUMNS: tuple[str, ...] = (
+    "outbox_id",
+    "job_id",
+    "chat_id",
+    "message_id",
+    "event_type",
+    "payload_json",
+    "dedupe_key",
+    "attempts",
+    "next_attempt_at",
+    "delivered_at",
+    "status",
+    "last_error",
+)
+
+
+def _row_getter(row: Any) -> Callable[[str], Any]:
+    """Return ``getter(name) -> value`` that works on ``aiosqlite.Row``
+    or a plain tuple/list. ``aiosqlite.Row`` supports both name and index
+    access; the positional fallback uses the canonical column order
+    declared in ``_SCHEMA``.
+    """
+    if hasattr(row, "keys"):
+        try:
+            _ = row["outbox_id"]
+            return lambda name: row[name]
+        except (IndexError, KeyError):
+            pass
+    return lambda name: row[_OUTBOX_COLUMNS.index(name)]
+
+
 @dataclass
 class OutboxRow:
     outbox_id: str
@@ -64,20 +104,25 @@ class OutboxRow:
     attempts: int = 0
     next_attempt_at: str = field(default_factory=_now_iso)
     delivered_at: str | None = None
+    status: OutboxStatus = OutboxStatus.PENDING
+    last_error: str | None = None
 
     @classmethod
-    def from_db_row(cls, row: aiosqlite.Row) -> OutboxRow:
+    def from_db_row(cls, row: Any) -> OutboxRow:
+        getter = _row_getter(row)
         return cls(
-            outbox_id=row["outbox_id"],
-            job_id=row["job_id"],
-            chat_id=row["chat_id"],
-            message_id=row["message_id"],
-            event_type=row["event_type"],
-            payload_json=row["payload_json"],
-            dedupe_key=row["dedupe_key"],
-            attempts=row["attempts"],
-            next_attempt_at=row["next_attempt_at"],
-            delivered_at=row["delivered_at"],
+            outbox_id=getter("outbox_id"),
+            job_id=getter("job_id"),
+            chat_id=getter("chat_id"),
+            message_id=getter("message_id"),
+            event_type=getter("event_type"),
+            payload_json=getter("payload_json"),
+            dedupe_key=getter("dedupe_key"),
+            attempts=int(getter("attempts")),
+            next_attempt_at=getter("next_attempt_at"),
+            delivered_at=getter("delivered_at"),
+            status=OutboxStatus(getter("status")),
+            last_error=getter("last_error"),
         )
 
 
@@ -92,11 +137,54 @@ CREATE TABLE IF NOT EXISTS owui_outbox (
     dedupe_key TEXT NOT NULL UNIQUE,
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT NOT NULL,
-    delivered_at TEXT
+    delivered_at TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending
     ON owui_outbox(delivered_at, next_attempt_at);
 """
+
+
+async def _migrate_schema(conn: aiosqlite.Connection) -> None:
+    """Add ``status`` / ``last_error`` to ``owui_outbox`` if absent.
+
+    Pre-existing rows with ``delivered_at IS NOT NULL`` back-fill to
+    'delivered'; abandoned-vs-true-success is unrecoverable from legacy
+    data. Idempotent: PRAGMA table_info gates the ALTERs, so a fresh
+    CREATE TABLE IF NOT EXISTS (which now includes the columns) skips
+    every branch.
+    """
+    async with conn.execute("PRAGMA table_info(owui_outbox)") as cur:
+        cols = {row[1] for row in await cur.fetchall()}
+    if "status" not in cols:
+        await conn.execute(
+            "ALTER TABLE owui_outbox ADD COLUMN status TEXT NOT NULL "
+            "DEFAULT 'pending'"
+        )
+        update_cur = await conn.execute(
+            "UPDATE owui_outbox SET status = 'delivered' "
+            "WHERE delivered_at IS NOT NULL"
+        )
+        rowcount = update_cur.rowcount
+        await update_cur.close()
+        if rowcount > 0:
+            logger.info(
+                "Migrated %d historical outbox rows to status=delivered; "
+                "abandoned-vs-delivered cannot be reconstructed",
+                rowcount,
+            )
+    if "last_error" not in cols:
+        await conn.execute(
+            "ALTER TABLE owui_outbox ADD COLUMN last_error TEXT"
+        )
+    # Index on status MUST be created after the column exists; legacy
+    # DBs reach this point with the ALTER above already applied, fresh
+    # DBs already have the column from CREATE TABLE.
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outbox_status ON owui_outbox(status)"
+    )
+    await conn.commit()
 
 _INSERT_SQL = """
 INSERT INTO owui_outbox (
@@ -123,11 +211,13 @@ class OutboxWorker:
     the connection.
 
     Retry policy: exponential backoff base 1s, capped at
-    ``max_backoff_s``. ``Retry-After`` from an upstream
-    :class:`AdapterError` replaces the exponential delay. After
-    ``max_attempts`` we log an error and mark the row delivered (giving
-    up), so a permanently broken target message can't deadlock the
-    queue.
+    ``max_backoff_s``. ``Retry-After`` from any transient error whose
+    headers ``extract_retry_after_seconds`` can read replaces the
+    exponential delay entirely — capped by a separate
+    ``max_retry_after_s`` ceiling (default 600s) so a misbehaving
+    upstream that returns ``Retry-After: 86400`` cannot stall the
+    queue. After ``max_attempts`` we mark the row abandoned (giving up)
+    so a permanently broken target message can't deadlock the queue.
     """
 
     def __init__(
@@ -138,6 +228,7 @@ class OutboxWorker:
         poll_interval_s: float = 0.25,
         max_attempts: int = 10,
         max_backoff_s: int = 60,
+        max_retry_after_s: int = 600,
         busy_timeout_ms: int = 5000,
     ) -> None:
         self._db_path = db_path
@@ -145,6 +236,7 @@ class OutboxWorker:
         self._poll_interval = max(0.05, float(poll_interval_s))
         self._max_attempts = max(1, int(max_attempts))
         self._max_backoff = max(1, int(max_backoff_s))
+        self._max_retry_after = max(1, int(max_retry_after_s))
         self._busy_timeout_ms = busy_timeout_ms
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
@@ -181,6 +273,7 @@ class OutboxWorker:
         )
         await self._conn.execute("PRAGMA journal_mode = WAL")
         await self._conn.executescript(_SCHEMA)
+        await _migrate_schema(self._conn)
         await self._conn.commit()
         self._stopped = False
         if spawn_loop:
@@ -287,6 +380,22 @@ class OutboxWorker:
                 row = await cur.fetchone()
         return int(row["c"]) if row is not None else 0
 
+    async def count_by_status(self) -> dict[str, int]:
+        """Return ``{status: count}`` across all rows in the table.
+
+        Indexed by ``idx_outbox_status``. Distinguishes 'delivered' (true
+        success) from 'abandoned' (gave up after retries or rejected for
+        a non-retriable reason); both have ``delivered_at`` set.
+        """
+        async with self._lock:
+            conn = self._require_conn()
+            async with conn.execute(
+                "SELECT status, COUNT(*) AS c FROM owui_outbox "
+                "GROUP BY status"
+            ) as cur:
+                rows = await cur.fetchall()
+        return {row["status"]: int(row["c"]) for row in rows}
+
     async def drain_once(self, *, limit: int = 32) -> int:
         """Process up to ``limit`` pending rows. Returns the number of
         rows attempted. Public for tests; the worker loop uses it.
@@ -320,12 +429,15 @@ class OutboxWorker:
     async def _deliver(self, row: OutboxRow) -> None:
         try:
             payload = json.loads(row.payload_json)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
             logger.error(
-                "Outbox row %s has invalid payload JSON; marking delivered to skip",
+                "Outbox row %s has invalid payload JSON; abandoning",
                 row.outbox_id,
             )
-            await self._mark_delivered(row.outbox_id)
+            await self._mark_abandoned(
+                row.outbox_id,
+                last_error=f"invalid payload JSON: {type(exc).__name__}",
+            )
             self._failed_count += 1
             return
 
@@ -344,6 +456,7 @@ class OutboxWorker:
             )
         except Exception as exc:
             new_attempts = row.attempts + 1
+            err_text = f"{type(exc).__name__}: {exc}"[:512]
             if new_attempts >= self._max_attempts:
                 logger.error(
                     "Outbox row %s gave up after %d attempts (job=%s type=%s): %s",
@@ -353,7 +466,7 @@ class OutboxWorker:
                     row.event_type,
                     exc,
                 )
-                await self._mark_delivered(row.outbox_id)
+                await self._mark_abandoned(row.outbox_id, last_error=err_text)
                 self._failed_count += 1
                 return
             delay = self._compute_backoff(exc, new_attempts)
@@ -369,9 +482,15 @@ class OutboxWorker:
             async with self._lock:
                 conn = self._require_conn()
                 await conn.execute(
-                    "UPDATE owui_outbox SET attempts = ?, next_attempt_at = ? "
-                    "WHERE outbox_id = ?",
-                    (new_attempts, next_at, row.outbox_id),
+                    "UPDATE owui_outbox SET attempts = ?, next_attempt_at = ?, "
+                    "status = ?, last_error = ? WHERE outbox_id = ?",
+                    (
+                        new_attempts,
+                        next_at,
+                        OutboxStatus.RETRYING.value,
+                        err_text,
+                        row.outbox_id,
+                    ),
                 )
                 await conn.commit()
 
@@ -379,16 +498,42 @@ class OutboxWorker:
         async with self._lock:
             conn = self._require_conn()
             await conn.execute(
-                "UPDATE owui_outbox SET delivered_at = ? WHERE outbox_id = ?",
-                (_now_iso(), outbox_id),
+                "UPDATE owui_outbox SET delivered_at = ?, status = ?, "
+                "last_error = NULL WHERE outbox_id = ?",
+                (_now_iso(), OutboxStatus.DELIVERED.value, outbox_id),
+            )
+            await conn.commit()
+
+    async def _mark_abandoned(
+        self, outbox_id: str, *, last_error: str | None
+    ) -> None:
+        """Terminal failure. Sets ``delivered_at`` so the row is removed
+        from the pending query (the queue must not redeliver), but flips
+        ``status`` to 'abandoned' so operators can filter on the real
+        outcome.
+        """
+        async with self._lock:
+            conn = self._require_conn()
+            await conn.execute(
+                "UPDATE owui_outbox SET delivered_at = ?, status = ?, "
+                "last_error = ? WHERE outbox_id = ?",
+                (
+                    _now_iso(),
+                    OutboxStatus.ABANDONED.value,
+                    last_error,
+                    outbox_id,
+                ),
             )
             await conn.commit()
 
     def _compute_backoff(self, exc: Exception, attempt: int) -> float:
-        if isinstance(exc, AdapterError):
-            retry_after = extract_retry_after_seconds(exc)
-            if retry_after is not None and retry_after > 0:
-                return float(min(retry_after, self._max_backoff))
-        # Exponential: 1s, 2s, 4s, 8s, ..., capped at max_backoff_s.
+        # Server-supplied Retry-After wins over our exponential backoff. The
+        # whole point of the header is to override default client policy.
+        # extract_retry_after_seconds reads AdapterError, httpx.HTTPStatusError,
+        # and any duck-typed exception with a Mapping ``headers`` attribute.
+        retry_after = extract_retry_after_seconds(exc)
+        if retry_after is not None and retry_after > 0:
+            return float(min(retry_after, self._max_retry_after))
+        # No Retry-After: exponential. 1s, 2s, 4s, 8s, ..., capped at max_backoff_s.
         delay = float(min(2 ** (attempt - 1), self._max_backoff))
         return delay

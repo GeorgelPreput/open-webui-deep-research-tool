@@ -6,6 +6,7 @@ endpoint without spinning up the actual ``Coordinator``.
 """
 from __future__ import annotations
 
+import asyncio
 import pathlib
 from typing import Any
 
@@ -22,6 +23,9 @@ from deep_research.entrypoints.openapi_tool.jobs import (
     JobStore,
     _now_iso,
 )
+from deep_research.entrypoints.openapi_tool.runner import JobRunner
+
+from ._runner_helpers import FakeCoord
 
 
 class _StubRunner:
@@ -66,6 +70,7 @@ async def app_with_state(tmp_path: pathlib.Path):
     app.state.job_store = store
     app.state.runner = runner
     app.state.config_warnings = []
+    app.state.config_warnings_lock = asyncio.Lock()
     try:
         yield app, store, runner
     finally:
@@ -105,6 +110,11 @@ def test_start_research_job_captures_forwarded_headers(app_with_state, client):
     assert call["target_message_id"] == "msg-fwd-1"
     assert call["owui_user_token"] == "user-token"
 
+    # view_token is surfaced to the caller and matches what the runner saw
+    assert body["view_token"]
+    assert isinstance(body["view_token"], str)
+    assert body["view_token"] == call["view_token"]
+
 
 def test_start_research_job_returns_user_facing_instruction(client):
     resp = client.post("/research_jobs", json={"prompt": "Q"})
@@ -115,10 +125,36 @@ def test_start_research_job_returns_user_facing_instruction(client):
         assert fragment in text
 
 
-async def test_409_when_active_job_for_chat_exists(app_with_state):
+def test_start_research_job_returns_view_token(app_with_state, client):
+    _, _, runner = app_with_state
+    resp = client.post("/research_jobs", json={"prompt": "Q"})
+    assert resp.status_code == 200, resp.text
+    token = resp.json()["view_token"]
+    assert isinstance(token, str)
+    # secrets.token_urlsafe(32) yields ~43 url-safe characters
+    assert len(token) >= 40
+    assert all(c.isalnum() or c in "-_" for c in token)
+    assert runner.start_calls
+    assert runner.start_calls[0]["view_token"] == token
+
+
+async def test_409_when_active_job_for_chat_exists(app_with_state, tmp_path):
+    """Drive the 409 path through the real ``JobRunner`` so the sqlite
+    UNIQUE-partial-index → ``ActiveJobExistsError`` → 409 flow is
+    exercised end-to-end. The stub runner used by other tests doesn't
+    call ``store.create`` and so cannot trigger the index."""
     app, store, _ = app_with_state
 
-    # Pre-create an active job for chat-foo
+    # Swap in a real runner against the same JobStore. _FakeCoord
+    # supplies an empty Coordinator surface; we never actually drive
+    # a job through it, we just need start_job to attempt the
+    # ``store.create`` and surface the IntegrityError.
+    coord = FakeCoord()
+    real_runner = JobRunner(coord=coord, store=store, outbox=None, public_base_url="")
+    app.state.runner = real_runner
+
+    # Pre-create an active job for chat-foo (this is the row the
+    # second insert will collide with under the UNIQUE partial index).
     existing = JobRecord(
         job_id="active-1",
         user_id="u",
@@ -134,16 +170,23 @@ async def test_409_when_active_job_for_chat_exists(app_with_state):
     )
     await store.create(existing)
 
-    client = TestClient(app)
-    resp = client.post(
-        "/research_jobs",
-        json={"prompt": "second"},
-        headers={"X-OpenWebUI-Chat-Id": "chat-foo"},
-    )
-    assert resp.status_code == 409
-    detail = resp.json()["detail"]
-    assert detail["code"] == "already_running"
-    assert "active-1" in detail["message"]
+    try:
+        client = TestClient(app)
+        resp = client.post(
+            "/research_jobs",
+            json={"prompt": "second"},
+            headers={"X-OpenWebUI-Chat-Id": "chat-foo"},
+        )
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["code"] == "already_running"
+        assert "active-1" in detail["message"]
+        # Exactly one row for chat-foo (the pre-existing one); the
+        # rejected insert did not leak.
+        only = await store.find_active_by_chat("chat-foo")
+        assert only is not None and only.job_id == "active-1"
+    finally:
+        await real_runner.shutdown()
 
 
 async def test_409_does_not_fire_when_existing_job_terminal(app_with_state):
@@ -404,6 +447,10 @@ def test_openapi_schema_lists_v2_operations(client):
     assert start_op["operationId"] == "start_research_job"
     assert "verbatim" in start_op["description"].lower()
 
+    start_resp_schema = schema["components"]["schemas"]["StartResearchResponse"]
+    assert "view_token" in start_resp_schema["properties"]
+    assert "view_token" in start_resp_schema["required"]
+
 
 def test_health_returns_empty_config_warnings_when_clean(client):
     resp = client.get("/health")
@@ -411,6 +458,54 @@ def test_health_returns_empty_config_warnings_when_clean(client):
     body = resp.json()
     assert body["status"] == "ok"
     assert body["config_warnings"] == []
+    # No OutboxWorker attached → outbox field is null so callers can
+    # distinguish "writeback disabled" from "writeback on, zero rows".
+    assert body["outbox"] is None
+
+
+async def test_health_surfaces_outbox_counts_when_writeback_enabled(
+    app_with_state, client, tmp_path: pathlib.Path
+):
+    """When ``app.state.outbox`` is set, ``/health`` returns the live
+    ``count_by_status()`` mapping. Confirms the wiring works end-to-end
+    without going through the lifespan handler.
+    """
+    from deep_research.entrypoints.openapi_tool.outbox import OutboxWorker
+
+    class _NoopClient:
+        async def post_message_event(self, *args, **kwargs):
+            return None
+
+    app, _, _ = app_with_state
+    worker = OutboxWorker(
+        db_path=tmp_path / "outbox.sqlite",
+        owui_client=_NoopClient(),
+    )
+    await worker.start(spawn_loop=False)
+    app.state.outbox = worker
+    try:
+        # Empty table: count_by_status returns {} → /health surfaces {}
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["outbox"] == {}
+
+        # Enqueue + drain one row → status='delivered' count surfaces.
+        await worker.enqueue(
+            outbox_id="hb-1",
+            job_id="job-h",
+            chat_id="c",
+            message_id="m",
+            event_type="status",
+            payload={"description": "ok", "done": False},
+            dedupe_key="job-h:m:1",
+        )
+        await worker.drain_once()
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["outbox"] == {"delivered": 1}
+    finally:
+        await worker.stop()
+        app.state.outbox = None
 
 
 def test_health_returns_config_warnings_when_present(app_with_state, client):
@@ -493,3 +588,38 @@ def test_headers_not_forwarded_silent_when_no_auth(app_with_state, client):
     resp = client.post("/research_jobs", json={"prompt": "Q"})
     assert resp.status_code == 200
     assert app.state.config_warnings == []
+
+
+def test_headers_not_forwarded_holds_lock_during_append(app_with_state, client):
+    """The runtime warning append happens inside config_warnings_lock; the
+    `append` call sits between `__aenter__` and `__aexit__` so a concurrent
+    handler couldn't observe the half-written state."""
+    app, _, _ = app_with_state
+    events: list[str] = []
+    real_lock = app.state.config_warnings_lock
+
+    class _RecordingLock:
+        async def __aenter__(self):
+            events.append("lock_acquired")
+            await real_lock.__aenter__()
+            return self
+
+        async def __aexit__(self, *exc):
+            events.append("lock_released")
+            return await real_lock.__aexit__(*exc)
+
+    class _RecordingList(list):
+        def append(self, item):
+            events.append("append")
+            return super().append(item)
+
+    app.state.config_warnings_lock = _RecordingLock()
+    app.state.config_warnings = _RecordingList()
+
+    resp = client.post(
+        "/research_jobs",
+        json={"prompt": "Q"},
+        headers={"Authorization": "Bearer user-token"},
+    )
+    assert resp.status_code == 200
+    assert events == ["lock_acquired", "append", "lock_released"]

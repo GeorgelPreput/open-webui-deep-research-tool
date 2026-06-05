@@ -15,6 +15,7 @@ from deep_research.adapter.models import (
     QueryCollectionResponse,
 )
 from deep_research.adapter.retry import with_retry
+from deep_research.adapter.throttle import HttpThrottle
 
 logger = logging.getLogger("deep_research.adapter.client")
 
@@ -69,6 +70,7 @@ class OWUIClient:
         max_retries: int = 3,
         search_semaphore: asyncio.Semaphore | None = None,
         fetch_semaphore: asyncio.Semaphore | None = None,
+        throttle: HttpThrottle | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._token_provider = token_provider
@@ -76,6 +78,7 @@ class OWUIClient:
         self._max_retries = max_retries
         self._search_sem = search_semaphore or asyncio.Semaphore(2)
         self._fetch_sem = fetch_semaphore or asyncio.Semaphore(4)
+        self._throttle = throttle
         self._client: httpx.AsyncClient | None = None
 
     async def start(self) -> None:
@@ -135,6 +138,10 @@ class OWUIClient:
             sem = semaphore
             if sem is None:
                 sem = self._fetch_sem
+
+            if self._throttle is not None:
+                await self._throttle.acquire()
+                self._throttle.record_attempt()
 
             async with sem:
                 logger.debug(
@@ -198,11 +205,29 @@ class OWUIClient:
                         status=resp.status_code,
                     ) from e
 
-        return await with_retry(
+        def _on_transient(exc: BaseException, _attempt: int, reason: str) -> None:
+            if self._throttle is None:
+                return
+            if "http_status=429" in reason:
+                self._throttle.record_429(exhausted=False)
+            self._throttle.record_retry()
+
+        def _on_exhausted(exc: BaseException, _attempt: int, reason: str) -> None:
+            if self._throttle is None:
+                return
+            if "http_status=429" in reason:
+                self._throttle.record_429(exhausted=True)
+
+        result = await with_retry(
             _do,
             max_retries=self._max_retries,
             label=f"{method} {path}",
+            on_transient=_on_transient,
+            on_exhausted=_on_exhausted,
         )
+        if self._throttle is not None:
+            self._throttle.record_success()
+        return result
 
     # ---- Models (OWUI connectivity probe) ----
 
@@ -232,7 +257,13 @@ class OWUIClient:
         endpoint. Used by the OpenAPI Tool Server's startup config audit.
         """
         resp = await self._request("GET", "/api/v1/auths/")
-        return resp if isinstance(resp, dict) else {}
+        if not isinstance(resp, dict):
+            raise AdapterError(
+                f"GET /api/v1/auths/ returned non-dict body "
+                f"({type(resp).__name__}); cannot determine role",
+                status=200,
+            )
+        return resp
 
     # ---- Web ----
 
@@ -278,6 +309,9 @@ class OWUIClient:
         params = {"process": "true" if process else "false"}
 
         async def _do() -> Any:
+            if self._throttle is not None:
+                await self._throttle.acquire()
+                self._throttle.record_attempt()
             async with self._fetch_sem:
                 resp = await self.client.post(
                     url,
@@ -295,7 +329,28 @@ class OWUIClient:
                     )
                 return resp.json()
 
-        data = await with_retry(_do, max_retries=self._max_retries, label="upload_file")
+        def _on_transient(exc: BaseException, _attempt: int, reason: str) -> None:
+            if self._throttle is None:
+                return
+            if "http_status=429" in reason:
+                self._throttle.record_429(exhausted=False)
+            self._throttle.record_retry()
+
+        def _on_exhausted(exc: BaseException, _attempt: int, reason: str) -> None:
+            if self._throttle is None:
+                return
+            if "http_status=429" in reason:
+                self._throttle.record_429(exhausted=True)
+
+        data = await with_retry(
+            _do,
+            max_retries=self._max_retries,
+            label="upload_file",
+            on_transient=_on_transient,
+            on_exhausted=_on_exhausted,
+        )
+        if self._throttle is not None:
+            self._throttle.record_success()
         return FileUploadResponse.model_validate(data)
 
     async def get_file(self, file_id: str) -> FileUploadResponse:

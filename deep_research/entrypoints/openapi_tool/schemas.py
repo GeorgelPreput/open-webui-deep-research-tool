@@ -86,6 +86,7 @@ class StartResearchResponse(BaseModel):
                 "job_id": "9c8b7a6f-1234-4567-89ab-cdef01234567",
                 "status": "running",
                 "next_action": "await_user_selection",
+                "view_token": "qGc4-redacted-example-token-value",
                 "user_facing_instruction": (
                     "I've started the preliminary research. When the topic "
                     "list is ready you'll see it appear right here — reply "
@@ -112,6 +113,18 @@ class StartResearchResponse(BaseModel):
         description=(
             "What the LLM should expect from the user next. Currently the"
             " only path: wait for the user's topic-selection reply."
+        ),
+    )
+    view_token: str = Field(
+        description=(
+            "Per-job view token (`secrets.token_urlsafe(32)`, sha256-hashed "
+            "at rest). Bake into the iframe URL as "
+            "`/live_view/{job_id}?token={view_token}` if you render the "
+            "progress iframe yourself — typically only when writeback to "
+            "OWUI is disabled. In the normal writeback-enabled flow, the "
+            "engine posts the iframe HTML directly to the chat with the "
+            "cleartext already baked into the polling script; the LLM "
+            "does not need to handle this value. Do not echo to the user."
         ),
     )
     user_facing_instruction: str = Field(

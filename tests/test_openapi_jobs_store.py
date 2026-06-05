@@ -196,3 +196,146 @@ def test_terminal_phases_constant():
     assert JobPhase.FAILED in TERMINAL_PHASES
     assert JobPhase.CANCELLED in TERMINAL_PHASES
     assert JobPhase.RESEARCHING not in TERMINAL_PHASES
+
+
+# -------------------------------------------------------- UNIQUE partial index
+
+
+async def test_unique_partial_index_rejects_duplicate_active_chat(store: JobStore):
+    """The UNIQUE partial index on (chat_id) WHERE phase NOT IN terminal
+    blocks a second non-terminal row from being inserted for the same
+    chat. After the first row goes terminal, another non-terminal row
+    for the same chat can be inserted."""
+    import aiosqlite as _aiosqlite
+
+    chat_id = "chat-unique"
+    await store.create(_make_record("u1", chat_id=chat_id, phase=JobPhase.RESEARCHING))
+
+    with pytest.raises(_aiosqlite.IntegrityError):
+        await store.create(_make_record("u2", chat_id=chat_id, phase=JobPhase.QUEUED))
+
+    # Mark the first one terminal; a third insert for the same chat now succeeds.
+    await store.update("u1", phase=JobPhase.COMPLETED, completed_at=_now_iso())
+    await store.create(_make_record("u3", chat_id=chat_id, phase=JobPhase.QUEUED))
+    active = await store.find_active_by_chat(chat_id)
+    assert active is not None and active.job_id == "u3"
+
+
+async def test_unique_partial_index_allows_multiple_null_chat(store: JobStore):
+    """NULL chat_id is excluded from the partial index — multiple
+    non-terminal rows with NULL chat_id are allowed (out-of-band
+    callers)."""
+    await store.create(_make_record("n1", chat_id=None, phase=JobPhase.QUEUED))
+    await store.create(_make_record("n2", chat_id=None, phase=JobPhase.QUEUED))
+    # Both rows survive.
+    assert await store.get("n1") is not None
+    assert await store.get("n2") is not None
+
+
+async def test_pre_migration_resolves_duplicate_active_rows(tmp_path):
+    """Open a sqlite file with raw aiosqlite, force two duplicate
+    non-terminal rows for the same chat in (bypassing the UNIQUE
+    index), close, re-open via JobStore.start. The pre-migration query
+    should mark the older duplicate FAILED so the index can be created
+    cleanly."""
+    import aiosqlite as _aiosqlite
+
+    db_path = tmp_path / "premig.sqlite"
+    # First pass: open via JobStore so the schema is built.
+    store = JobStore(db_path)
+    await store.start()
+    await store.close()
+
+    # Drop the UNIQUE index, then insert two duplicate non-terminal
+    # rows for the same chat with distinct created_at values.
+    conn = await _aiosqlite.connect(db_path)
+    conn.row_factory = _aiosqlite.Row
+    await conn.execute("DROP INDEX IF EXISTS idx_jobs_chat_active_unique")
+    older = "2026-01-01T00:00:00+00:00"
+    newer = "2026-06-01T00:00:00+00:00"
+    insert_sql = (
+        "INSERT INTO research_jobs ("
+        "job_id, user_id, user_name, conversation_id, chat_id, "
+        "target_message_id, phase, prompt, history_json, revision, "
+        "view_token_hash, created_at, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    common = ("u", "U", "conv", "chat-dup", None, "queued", "p", "[]", 0, "0" * 64)
+    await conn.execute(insert_sql, ("dup-old", *common, older, older))
+    await conn.execute(insert_sql, ("dup-new", *common, newer, newer))
+    await conn.commit()
+    await conn.close()
+
+    # Re-open via JobStore — pre-migration runs, then UNIQUE index is
+    # re-created.
+    store2 = JobStore(db_path)
+    await store2.start()
+    try:
+        old = await store2.get("dup-old")
+        new = await store2.get("dup-new")
+        assert old is not None and new is not None
+        # The older duplicate was marked FAILED with the documented
+        # error_text token.
+        assert old.phase == JobPhase.FAILED
+        assert "pre_migration" in (old.error_text or "")
+        # The newer duplicate is preserved as the active one.
+        assert new.phase == JobPhase.QUEUED
+        # Only one active row remains.
+        active = await store2.find_active_by_chat("chat-dup")
+        assert active is not None and active.job_id == "dup-new"
+    finally:
+        await store2.close()
+
+
+async def test_start_is_idempotent_under_concurrent_calls(tmp_path):
+    """Two parallel start() calls on the same JobStore both return
+    cleanly without double-connecting."""
+    s = JobStore(tmp_path / "idem.sqlite")
+    try:
+        results = await asyncio.gather(s.start(), s.start(), return_exceptions=True)
+        for r in results:
+            assert r is None, r
+        # Connection is live.
+        assert s._conn is not None
+        await s.create(_make_record("idem-1", chat_id=None))
+        assert await s.get("idem-1") is not None
+    finally:
+        await s.close()
+
+
+async def test_close_is_safe_during_start(tmp_path, monkeypatch):
+    """close() racing start() doesn't leave the connection in an
+    inconsistent state. Patch aiosqlite.connect to delay so we can
+    fire close() while start is mid-connect."""
+    import aiosqlite as _aiosqlite
+
+    original_connect = _aiosqlite.connect
+    started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    def slow_connect(*args, **kwargs):
+        async def _delayed():
+            started.set()
+            await proceed.wait()
+            return await original_connect(*args, **kwargs)
+
+        # aiosqlite.connect returns a Connection awaitable; wrap it.
+        return _delayed()
+
+    monkeypatch.setattr(_aiosqlite, "connect", slow_connect)
+
+    s = JobStore(tmp_path / "race.sqlite")
+    start_task = asyncio.create_task(s.start())
+    await started.wait()
+    # While start() is awaiting connect, fire close(). close() takes
+    # the same self._lock as start(), so it will queue until start
+    # releases.
+    close_task = asyncio.create_task(s.close())
+    # Let start finish.
+    proceed.set()
+    await asyncio.gather(start_task, close_task, return_exceptions=True)
+
+    # Post-race state: serialised by the lock so neither task leaves
+    # garbage state. We don't pin which order won (depends on event
+    # loop scheduling); just verify close completed without raising.
+    assert s._conn is None

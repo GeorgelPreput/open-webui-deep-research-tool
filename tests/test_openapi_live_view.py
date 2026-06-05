@@ -187,6 +187,117 @@ async def test_live_view_status_unknown_job_returns_404(app_with_store):
     assert resp.status_code == 404
 
 
+async def test_live_view_compare_is_constant_time_safe(app_with_store):
+    """Pin that view-token equality goes through `hmac.compare_digest` on hex
+    digests. The constant-time property itself is documented in source — Python
+    timing is too noisy to assert behaviourally. This test stores a hash that
+    differs from the token's actual sha256 hex only in the last character and
+    expects 403; that pins the comparison still rejects near-matches and is
+    operating on equal-length hex digests (not raw bytes — a bytes/hex length
+    mismatch would also fail closed but for the wrong reason).
+    """
+    app, store, _ = app_with_store
+    token = secrets.token_urlsafe(16)
+    correct_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    flipped_last = "0" if correct_hash[-1] != "0" else "1"
+    corrupted_hash = correct_hash[:-1] + flipped_last
+    record = JobRecord(
+        job_id="jv-const",
+        user_id="u",
+        user_name="U",
+        conversation_id="conv-jv-const",
+        chat_id="chat-jv-const",
+        target_message_id="msg-jv-const",
+        phase=JobPhase.RESEARCHING,
+        prompt="What is X?",
+        history_json="[]",
+        revision=1,
+        view_token_hash=corrupted_hash,
+    )
+    await store.create(record)
+
+    client = TestClient(app)
+    resp = client.get(f"/live_view/{record.job_id}", params={"token": token})
+    assert resp.status_code == 403
+
+
+async def test_live_view_status_compare_is_constant_time_safe(app_with_store):
+    """Same as test_live_view_compare_is_constant_time_safe but against the
+    polling endpoint /live_view/{id}/status."""
+    app, store, _ = app_with_store
+    token = secrets.token_urlsafe(16)
+    correct_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    flipped_last = "0" if correct_hash[-1] != "0" else "1"
+    corrupted_hash = correct_hash[:-1] + flipped_last
+    record = JobRecord(
+        job_id="jv-const-st",
+        user_id="u",
+        user_name="U",
+        conversation_id="conv-jv-const-st",
+        chat_id="chat-jv-const-st",
+        target_message_id="msg-jv-const-st",
+        phase=JobPhase.RESEARCHING,
+        prompt="What is X?",
+        history_json="[]",
+        revision=1,
+        view_token_hash=corrupted_hash,
+    )
+    await store.create(record)
+
+    client = TestClient(app)
+    resp = client.get(
+        f"/live_view/{record.job_id}/status",
+        params={"token": token},
+    )
+    assert resp.status_code == 403
+
+
+async def test_live_view_survives_runner_restart(tmp_path: pathlib.Path):
+    """Pin that the live-view endpoints depend only on durable state.
+
+    Simulates a server restart: create a JobRecord against one JobStore,
+    close it, mount the routes on a brand-new FastAPI app with a fresh
+    JobStore against the same sqlite file and a fresh _StubRunner (whose
+    in-memory `_view_tokens` is empty by construction). The original
+    cleartext token must still authenticate. Regression test for any future
+    refactor that routes the live-view auth check through the runner's
+    in-process cache rather than the durable view_token_hash.
+    """
+    db_path = tmp_path / "jobs.sqlite"
+    first_store = JobStore(db_path)
+    await first_store.start()
+    token, record = _create_record(first_store, job_id="jv-restart")
+    await first_store.create(record)
+    await first_store.close()
+
+    # Fresh process simulation: new store on the same sqlite, new runner
+    # whose _view_tokens dict (if it had one) would be empty.
+    second_store = JobStore(db_path)
+    await second_store.start()
+    second_runner = _StubRunner()
+
+    app = FastAPI()
+    for route in srv.app.routes:
+        if getattr(route, "path", "").startswith(("/live_view", "/research_jobs", "/health")):
+            app.router.routes.append(route)
+    app.state.job_store = second_store
+    app.state.runner = second_runner
+
+    try:
+        client = TestClient(app)
+        resp = client.get(
+            f"/live_view/{record.job_id}", params={"token": token}
+        )
+        assert resp.status_code == 200, resp.text
+        resp = client.get(
+            f"/live_view/{record.job_id}/status",
+            params={"token": token},
+        )
+        assert resp.status_code == 200, resp.text
+    finally:
+        await second_store.close()
+
+
 async def test_live_view_status_completed_flag(app_with_store):
     app, store, _ = app_with_store
     token, record = _create_record(store, job_id="jv-done", phase=JobPhase.COMPLETED)

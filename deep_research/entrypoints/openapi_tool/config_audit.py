@@ -13,9 +13,7 @@ returns a structured warning list. Consumers:
     arrives without ``X-OpenWebUI-Chat-Id``.
 
 Fail-fast (server refuses to start) lives in ``server.py:lifespan``,
-not here — this module produces warnings only. The
-``MISSING_OWUI_API_KEY`` check is retained so that a future ops
-escape hatch that disables the fail-fast still surfaces the warning.
+not here — this module produces warnings only.
 """
 from __future__ import annotations
 
@@ -25,8 +23,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from deep_research.adapter.client import OWUIClient
     from deep_research.config.valves import Valves
-    from deep_research.orchestrator.coordinator import Coordinator
 
 logger = logging.getLogger("deep_research.entrypoints.openapi.config_audit")
 
@@ -42,41 +40,23 @@ class ConfigWarning:
 async def audit_writeback_configuration(
     valves: Valves,
     env: Mapping[str, str],
-    coord: Coordinator,
+    writeback_client: OWUIClient | None,
 ) -> list[ConfigWarning]:
     """Audit the runtime config that controls writeback + iframe behaviour.
 
-    Returns a list of :class:`ConfigWarning` covering: missing admin
-    token (informational; the fail-fast in lifespan normally raises
-    first), non-admin token, probe network failure, and missing public
-    base URL. The list is empty when everything is set correctly.
+    Returns a list of :class:`ConfigWarning` covering: non-admin token,
+    probe network/schema failure, and missing public base URL. The list
+    is empty when everything is set correctly.
 
-    The admin probe calls ``coord.writeback_client.get_session_user()``;
-    if ``coord.writeback_client`` is None (token was unset and the
-    fail-fast was bypassed) the probe checks are skipped.
+    The admin probe calls ``writeback_client.get_session_user()``; if
+    ``writeback_client`` is None (writeback disabled or token unset) the
+    probe checks are skipped.
     """
     warnings: list[ConfigWarning] = []
 
-    if valves.jobs.writeback_enabled and not env.get("DR_OWUI_API_KEY"):
-        warnings.append(
-            ConfigWarning(
-                code="MISSING_OWUI_API_KEY",
-                severity="warning",
-                message=(
-                    "DR_OWUI_API_KEY is unset while DR_JOBS_WRITEBACK_ENABLED "
-                    "is true. Phase 2 writeback (topic list and final report "
-                    "in chat) is disabled; the iframe still works."
-                ),
-                remediation=(
-                    "Set DR_OWUI_API_KEY to an admin API key from OWUI's "
-                    "Admin Settings → Users → API Keys, or set "
-                    "DR_JOBS_WRITEBACK_ENABLED=false to opt out."
-                ),
-            )
-        )
-    elif valves.jobs.writeback_enabled and coord.writeback_client is not None:
+    if valves.jobs.writeback_enabled and writeback_client is not None:
         try:
-            session_user = await coord.writeback_client.get_session_user()
+            session_user = await writeback_client.get_session_user()
         except Exception as exc:
             warnings.append(
                 ConfigWarning(
@@ -95,7 +75,7 @@ async def audit_writeback_configuration(
                 )
             )
         else:
-            role = session_user.get("role") if isinstance(session_user, dict) else None
+            role = session_user.get("role")
             if role != "admin":
                 warnings.append(
                     ConfigWarning(

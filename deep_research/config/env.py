@@ -140,6 +140,7 @@ VALVES_GROUP_MAP: dict[str, dict[str, type]] = {
         "outbox_poll_interval_ms": int,
         "outbox_max_attempts": int,
         "outbox_max_backoff_s": int,
+        "outbox_max_retry_after_s": int,
     },
     "advanced": {
         "query_weight": float,
@@ -179,5 +180,12 @@ VALVES_GROUP_MAP: dict[str, dict[str, type]] = {
         "base_delay_seconds": float,
         "max_delay_seconds": float,
         "batch_max_inputs": int,
+    },
+    "writeback_throttle": {
+        "max_requests_per_second": float,
+        "min_interval_ms": int,
+        "max_retries": int,
+        "base_delay_seconds": float,
+        "max_delay_seconds": float,
     },
 }

@@ -39,7 +39,7 @@ class CancellationToken:
 
     def raise_if_cancelled(self) -> None:
         if self._cancelled.is_set():
-            raise asyncio.CancelledError("research cancelled by user")
+            raise asyncio.CancelledError()
 
     async def wait_cancelled(self) -> None:
         await self._cancelled.wait()

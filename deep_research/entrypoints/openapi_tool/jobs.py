@@ -121,6 +121,11 @@ class JobRecord:
         return out
 
 
+# Base schema — table + non-unique indexes. Created unconditionally on
+# every start (CREATE ... IF NOT EXISTS). Must complete before
+# _PRE_MIGRATION_DEDUPE_SQL runs so the table exists on a fresh
+# database, and before _UNIQUE_INDEX_SQL runs so the dedupe query has
+# rows to operate on.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS research_jobs (
     job_id TEXT PRIMARY KEY,
@@ -144,6 +149,39 @@ CREATE TABLE IF NOT EXISTS research_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_chat_active ON research_jobs(chat_id, phase);
 CREATE INDEX IF NOT EXISTS idx_jobs_completed_at ON research_jobs(completed_at);
+"""
+
+# Pre-migration cleanup: any existing duplicate non-terminal rows for
+# the same chat_id would block the UNIQUE partial index below. Keep
+# the most recent row per chat (ORDER BY created_at DESC) and mark
+# older duplicates FAILED so the index can be created. Safe to run on
+# every start — no-op when no duplicates exist.
+_PRE_MIGRATION_DEDUPE_SQL = """
+UPDATE research_jobs
+SET phase = 'failed',
+    error_text = COALESCE(error_text, 'superseded_by_concurrent_start_pre_migration'),
+    completed_at = COALESCE(completed_at, ?),
+    updated_at = ?
+WHERE job_id IN (
+    SELECT job_id FROM (
+        SELECT job_id,
+               ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY created_at DESC) AS rn
+        FROM research_jobs
+        WHERE chat_id IS NOT NULL
+          AND phase NOT IN ('completed', 'failed', 'cancelled')
+    )
+    WHERE rn > 1
+)
+"""
+
+# Enforces "one active job per chat" at the sqlite level. Defence in
+# depth against the in-process per-job lock in JobRunner. Runs AFTER
+# _PRE_MIGRATION_DEDUPE_SQL so existing duplicates have been resolved.
+_UNIQUE_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_chat_active_unique
+    ON research_jobs(chat_id)
+    WHERE chat_id IS NOT NULL
+      AND phase NOT IN ('completed', 'failed', 'cancelled')
 """
 
 _INSERT_SQL = """
@@ -176,14 +214,20 @@ class JobStore:
         self._lock = asyncio.Lock()
 
     async def start(self) -> None:
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self._db_path)
-        self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout_ms)}")
-        await self._conn.execute("PRAGMA journal_mode = WAL")
-        await self._conn.execute("PRAGMA foreign_keys = ON")
-        await self._conn.executescript(_SCHEMA)
-        await self._conn.commit()
+        async with self._lock:
+            if self._conn is not None:
+                return
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = await aiosqlite.connect(self._db_path)
+            self._conn.row_factory = aiosqlite.Row
+            await self._conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout_ms)}")
+            await self._conn.execute("PRAGMA journal_mode = WAL")
+            await self._conn.execute("PRAGMA foreign_keys = ON")
+            await self._conn.executescript(_SCHEMA)
+            now = _now_iso()
+            await self._conn.execute(_PRE_MIGRATION_DEDUPE_SQL, (now, now))
+            await self._conn.execute(_UNIQUE_INDEX_SQL)
+            await self._conn.commit()
 
     async def close(self) -> None:
         async with self._lock:

@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import pytest
 import pytest_asyncio
 
 from deep_research.adapter.client import AdapterError
-from deep_research.entrypoints.openapi_tool.outbox import OutboxWorker
+from deep_research.entrypoints.openapi_tool.outbox import (
+    OutboxRow,
+    OutboxStatus,
+    OutboxWorker,
+)
 
 
 class _FakeOWUIClient:
@@ -156,6 +162,15 @@ async def test_drop_after_max_attempts(
     assert await worker.count_pending() == 0
     # Three POST attempts were made
     assert len(fake_client.calls) == 3
+    async with worker._lock:
+        conn = worker._require_conn()
+        async with conn.execute(
+            "SELECT status, last_error FROM owui_outbox WHERE outbox_id = ?",
+            ("ob-1",),
+        ) as cur:
+            row = await cur.fetchone()
+    assert row["status"] == "abandoned"
+    assert row["last_error"] is not None
 
 
 async def test_dedupe_key_uniqueness(worker: OutboxWorker):
@@ -197,19 +212,19 @@ async def test_event_type_validation(worker: OutboxWorker):
 async def test_retry_after_header_overrides_exponential(
     worker: OutboxWorker, fake_client: _FakeOWUIClient
 ):
+    # worker fixture: max_backoff_s=2, max_retry_after_s defaults to 600. Use
+    # a Retry-After value larger than max_backoff_s so the test proves the
+    # cap on Retry-After was removed (when it was clamped to max_backoff_s
+    # the resulting delta would have been ~2s, not ~5s).
     fake_client.fail_first = 1
     fake_client.fail_with = AdapterError(
-        "throttled", status=429, headers={"Retry-After": "1"}
+        "throttled", status=429, headers={"Retry-After": "5"}
     )
     await _enqueue(worker)
-    # First drain fails; the second drain (after we reset next_attempt_at) succeeds.
+    before = datetime.now(UTC)
     await worker.drain_once()
-    # The row should now have a future next_attempt_at because we set Retry-After=1.
-    pending = await worker.fetch_pending()
-    # Default fetch only returns rows whose next_attempt_at is in the past, so a
-    # row deferred by Retry-After is hidden from fetch_pending until that delay
-    # elapses. Confirm it's still in the table but not pending.
-    assert pending == []
+    # Row deferred; not pending until Retry-After elapses.
+    assert await worker.fetch_pending() == []
     async with worker._lock:
         conn = worker._require_conn()
         async with conn.execute(
@@ -220,9 +235,77 @@ async def test_retry_after_header_overrides_exponential(
             row = await cur.fetchone()
     assert row["attempts"] == 1
     assert row["delivered_at"] is None
+    next_at = datetime.fromisoformat(row["next_attempt_at"])
+    delta = (next_at - before).total_seconds()
+    # 1s slack for worker's own elapsed time + ISO-second truncation.
+    assert delta >= 4.0, f"Retry-After=5 clamped: delta={delta:.2f}s"
 
 
-async def test_payload_invalid_json_marked_delivered(
+async def test_retry_after_value_capped_at_max_retry_after_s(
+    tmp_path: pathlib.Path, fake_client: _FakeOWUIClient
+):
+    """A misbehaving upstream returning Retry-After: 86400 is clamped to the
+    operator-tunable ceiling, not allowed to stall the queue."""
+    w = OutboxWorker(
+        db_path=tmp_path / "outbox.sqlite",
+        owui_client=fake_client,
+        poll_interval_s=0.05,
+        max_attempts=3,
+        max_backoff_s=2,
+        max_retry_after_s=2,
+    )
+    await w.start(spawn_loop=False)
+    try:
+        fake_client.fail_first = 1
+        fake_client.fail_with = AdapterError(
+            "throttled", status=429, headers={"Retry-After": "86400"}
+        )
+        await _enqueue(w)
+        before = datetime.now(UTC)
+        await w.drain_once()
+        async with w._lock:
+            conn = w._require_conn()
+            async with conn.execute(
+                "SELECT next_attempt_at FROM owui_outbox WHERE outbox_id = ?",
+                ("ob-1",),
+            ) as cur:
+                row = await cur.fetchone()
+        next_at = datetime.fromisoformat(row["next_attempt_at"])
+        delta = (next_at - before).total_seconds()
+        assert delta <= 3.0, f"max_retry_after_s ceiling not honoured: {delta:.2f}s"
+    finally:
+        await w.stop()
+
+
+async def test_retry_after_honoured_for_httpx_http_status_error(
+    worker: OutboxWorker, fake_client: _FakeOWUIClient
+):
+    """Step 2's broader exception-type branch: Retry-After must be read from
+    httpx.HTTPStatusError too, not only AdapterError."""
+    request = httpx.Request("POST", "http://owui.test/event")
+    response = httpx.Response(
+        429, headers={"Retry-After": "5"}, request=request
+    )
+    fake_client.fail_first = 1
+    fake_client.fail_with = httpx.HTTPStatusError(
+        "throttled", request=request, response=response
+    )
+    await _enqueue(worker)
+    before = datetime.now(UTC)
+    await worker.drain_once()
+    async with worker._lock:
+        conn = worker._require_conn()
+        async with conn.execute(
+            "SELECT next_attempt_at FROM owui_outbox WHERE outbox_id = ?",
+            ("ob-1",),
+        ) as cur:
+            row = await cur.fetchone()
+    next_at = datetime.fromisoformat(row["next_attempt_at"])
+    delta = (next_at - before).total_seconds()
+    assert delta >= 4.0, f"httpx HTTPStatusError Retry-After ignored: delta={delta:.2f}s"
+
+
+async def test_payload_invalid_json_marked_abandoned(
     worker: OutboxWorker, fake_client: _FakeOWUIClient
 ):
     # Manually insert a row with a broken JSON payload to simulate corruption
@@ -249,6 +332,15 @@ async def test_payload_invalid_json_marked_delivered(
     assert fake_client.calls == []  # no POST was attempted
     assert worker.failed_count == 1
     assert await worker.count_pending() == 0
+    async with worker._lock:
+        conn = worker._require_conn()
+        async with conn.execute(
+            "SELECT status, last_error FROM owui_outbox WHERE outbox_id = ?",
+            ("ob-broken",),
+        ) as cur:
+            row = await cur.fetchone()
+    assert row["status"] == "abandoned"
+    assert row["last_error"] is not None
 
 
 async def test_status_payload_shape(worker: OutboxWorker, fake_client: _FakeOWUIClient):
@@ -307,3 +399,154 @@ async def test_source_payload_round_trip(
     call = fake_client.calls[0]
     assert call["event_type"] == "source"
     assert call["data"] == payload
+
+
+async def test_count_by_status_distinguishes_outcomes(
+    worker: OutboxWorker, fake_client: _FakeOWUIClient
+):
+    """Delivered and abandoned rows are individually countable.
+
+    Drain ordering is deterministic: enqueue+drain `ob-ok` first while
+    `always_fail=False`, then flip `always_fail=True` and exhaust `ob-bad`.
+    """
+    await worker.enqueue(
+        outbox_id="ob-ok",
+        job_id="job-1",
+        chat_id="c",
+        message_id="m",
+        event_type="status",
+        payload={"description": "ok", "done": False},
+        dedupe_key="job-1:m:ok",
+    )
+    await worker.drain_once()
+    assert worker.delivered_count == 1
+
+    fake_client.always_fail = True
+    await worker.enqueue(
+        outbox_id="ob-bad",
+        job_id="job-1",
+        chat_id="c",
+        message_id="m",
+        event_type="status",
+        payload={"description": "bad", "done": False},
+        dedupe_key="job-1:m:bad",
+    )
+    # max_attempts=3 (set in worker fixture); drain 3× resetting
+    # next_attempt_at between iterations to land ob-bad as abandoned.
+    for _ in range(4):
+        await worker.drain_once()
+        async with worker._lock:
+            conn = worker._require_conn()
+            await conn.execute(
+                "UPDATE owui_outbox SET next_attempt_at = ? "
+                "WHERE delivered_at IS NULL",
+                ("1970-01-01T00:00:00+00:00",),
+            )
+            await conn.commit()
+
+    counts = await worker.count_by_status()
+    assert counts.get("delivered", 0) == 1
+    assert counts.get("abandoned", 0) == 1
+    # No pending or retrying rows should remain.
+    assert counts.get("pending", 0) == 0
+    assert counts.get("retrying", 0) == 0
+
+
+async def test_from_db_row_works_without_row_factory(
+    worker: OutboxWorker, fake_client: _FakeOWUIClient
+):
+    """A caller using a plain tuple-returning cursor can still build an
+    OutboxRow; pins the foreign-caller-safety contract for from_db_row.
+    """
+    await _enqueue(worker)
+    async with worker._lock:
+        conn = worker._require_conn()
+        original_factory = conn.row_factory
+        conn.row_factory = None
+        try:
+            async with conn.execute(
+                "SELECT outbox_id, job_id, chat_id, message_id, event_type, "
+                "payload_json, dedupe_key, attempts, next_attempt_at, "
+                "delivered_at, status, last_error FROM owui_outbox "
+                "WHERE outbox_id = ?",
+                ("ob-1",),
+            ) as cur:
+                tuple_row = await cur.fetchone()
+        finally:
+            conn.row_factory = original_factory
+    parsed = OutboxRow.from_db_row(tuple_row)
+    assert parsed.outbox_id == "ob-1"
+    assert parsed.status == OutboxStatus.PENDING
+    assert parsed.attempts == 0
+
+
+async def test_migration_back_fills_status_on_existing_rows(
+    tmp_path: pathlib.Path, fake_client: _FakeOWUIClient
+):
+    """An older DB without status/last_error columns gets back-filled on
+    start(): a row with delivered_at set becomes 'delivered'; a row with
+    delivered_at NULL stays 'pending' (its default).
+    """
+    import aiosqlite as _aiosqlite
+
+    db_path = tmp_path / "legacy.sqlite"
+    legacy_schema = """
+    CREATE TABLE owui_outbox (
+        outbox_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL,
+        delivered_at TEXT
+    );
+    """
+    async with _aiosqlite.connect(db_path) as conn:
+        await conn.executescript(legacy_schema)
+        await conn.execute(
+            "INSERT INTO owui_outbox (outbox_id, job_id, chat_id, message_id, "
+            "event_type, payload_json, dedupe_key, attempts, next_attempt_at, "
+            "delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                "legacy-delivered",
+                "job-1",
+                "c",
+                "m",
+                "status",
+                "{}",
+                "dk-1",
+                1,
+                "1970-01-01T00:00:00+00:00",
+                "1970-01-01T00:00:01+00:00",
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO owui_outbox (outbox_id, job_id, chat_id, message_id, "
+            "event_type, payload_json, dedupe_key, attempts, next_attempt_at, "
+            "delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                "legacy-pending",
+                "job-1",
+                "c",
+                "m",
+                "status",
+                "{}",
+                "dk-2",
+                0,
+                "1970-01-01T00:00:00+00:00",
+                None,
+            ),
+        )
+        await conn.commit()
+
+    w = OutboxWorker(db_path=db_path, owui_client=fake_client)
+    await w.start(spawn_loop=False)
+    try:
+        counts = await w.count_by_status()
+    finally:
+        await w.stop()
+    assert counts.get("delivered", 0) == 1
+    assert counts.get("pending", 0) == 1

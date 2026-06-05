@@ -175,7 +175,6 @@ async def test_writeback_sequence_through_full_lifecycle(
     runner, coord, outbox, client, store
 ):
     record = _make_record()
-    await store.create(record)
 
     # Phase 1: initial run emits a status + topic-list MessageEvent, then
     # pauses at the outline gate.
@@ -269,7 +268,6 @@ async def test_citation_event_maps_to_source_row(
     force unrelated test churn.
     """
     record = _make_record(job_id="cite-map")
-    await store.create(record)
 
     citation = CitationEvent(
         url="https://example.com/a",
@@ -307,7 +305,6 @@ async def test_multiple_citations_with_same_url_deduplicate(
     to overwrite-semantics would break this test deliberately.
     """
     record = _make_record(job_id="cite-dedup")
-    await store.create(record)
 
     first = CitationEvent(
         url="https://example.com/dup",
@@ -351,7 +348,6 @@ async def test_runner_emits_source_not_citation(
     switch to `citation` would break the test.
     """
     record = _make_record(job_id="cite-name")
-    await store.create(record)
 
     async def on_run(kwargs):
         sink = kwargs["sink"]
@@ -382,7 +378,6 @@ async def test_runner_does_not_filter_empty_url_citation(
     "filtered twice / filtered nowhere" ambiguity.
     """
     record = _make_record(job_id="cite-empty-url")
-    await store.create(record)
 
     async def on_run(kwargs):
         sink = kwargs["sink"]
@@ -407,7 +402,6 @@ async def test_writeback_skipped_when_chat_id_none(
     runner, coord, outbox, client, store
 ):
     record = _make_record(chat_id=None, target_message_id=None)
-    await store.create(record)
 
     async def on_run(kwargs):
         sink = kwargs["sink"]
@@ -426,7 +420,6 @@ async def test_writeback_skipped_when_chat_id_is_local(
     runner, coord, outbox, client, store
 ):
     record = _make_record(chat_id="local:abc123", target_message_id="m")
-    await store.create(record)
 
     async def on_run(kwargs):
         sink = kwargs["sink"]
@@ -447,7 +440,6 @@ async def test_running_phase_cancel_posts_status_and_replace(
     """A mid-phase cancellation posts a 'Cancelled by user' status + a
     replace carrying the cancellation notice. No embeds:[] clear."""
     record = _make_record(job_id="cx-mid", chat_id="chat-c", target_message_id="msg-c")
-    await store.create(record)
 
     released = asyncio.Event()
 
@@ -492,7 +484,6 @@ async def test_gate_cancel_posts_status_and_replace(
     gate (task already done) still posts the terminal writeback. The
     CancelledError handler isn't reached; runner.cancel posts inline."""
     record = _make_record(job_id="cx-gate", chat_id="chat-g", target_message_id="msg-g")
-    await store.create(record)
 
     async def on_run(kwargs):
         coord.state_manager.set_waiting(kwargs["conversation_id"])
@@ -536,7 +527,6 @@ async def test_cancel_writeback_skipped_for_local_chat_and_none(
         record = _make_record(
             job_id=case_id, chat_id=chat_id, target_message_id=target_message_id
         )
-        await store.create(record)
 
         async def on_run(kwargs):
             cancel = kwargs.get("cancellation_token")
@@ -554,11 +544,71 @@ async def test_cancel_writeback_skipped_for_local_chat_and_none(
         assert client.calls == [], (case_id, client.calls)
 
 
+async def test_terminal_writeback_dedupes_when_final_wins(
+    runner, coord, outbox, client, store
+):
+    """When the success-path terminal writeback lands first, a
+    subsequent cancel-path terminal writeback's enqueues drop via the
+    shared `terminal` dedupe suffix + INSERT OR IGNORE. The user sees
+    exactly one consistent status/body pair."""
+    record = _make_record(
+        job_id="dedupe-final",
+        chat_id="chat-df",
+        target_message_id="msg-df",
+    )
+    await store.create(record)
+
+    await runner._enqueue_terminal_writeback(
+        record, kind="final", content="Final report body"
+    )
+    await runner._enqueue_terminal_writeback(
+        record, kind="cancelled", content="Cancellation notice"
+    )
+    await outbox.drain_once(limit=64)
+
+    replace_calls = [c for c in client.calls if c["event_type"] == "replace"]
+    status_calls = [c for c in client.calls if c["event_type"] == "status"]
+    assert len(replace_calls) == 1, replace_calls
+    assert len(status_calls) == 1, status_calls
+    assert replace_calls[0]["data"]["content"] == "Final report body"
+    assert status_calls[0]["data"]["description"] == "Research complete"
+    assert status_calls[0]["data"]["done"] is True
+
+
+async def test_terminal_writeback_dedupes_when_cancel_wins(
+    runner, coord, outbox, client, store
+):
+    """Reverse ordering: when the cancel-path writeback lands first, a
+    subsequent success-path writeback drops. The user sees exactly
+    the cancellation pair."""
+    record = _make_record(
+        job_id="dedupe-cancel",
+        chat_id="chat-dc",
+        target_message_id="msg-dc",
+    )
+    await store.create(record)
+
+    await runner._enqueue_terminal_writeback(
+        record, kind="cancelled", content="Cancellation notice"
+    )
+    await runner._enqueue_terminal_writeback(
+        record, kind="final", content="Final report body"
+    )
+    await outbox.drain_once(limit=64)
+
+    replace_calls = [c for c in client.calls if c["event_type"] == "replace"]
+    status_calls = [c for c in client.calls if c["event_type"] == "status"]
+    assert len(replace_calls) == 1, replace_calls
+    assert len(status_calls) == 1, status_calls
+    assert replace_calls[0]["data"]["content"] == "Cancellation notice"
+    assert status_calls[0]["data"]["description"] == "Cancelled by user"
+    assert status_calls[0]["data"]["done"] is True
+
+
 async def test_short_event_names_only(runner, coord, outbox, client, store):
     """Belt-and-braces: walk the outbox call sequence and confirm no
     long-name aliases (``chat:message`` etc.) ever made it through."""
     record = _make_record(job_id="short-names")
-    await store.create(record)
 
     async def first_run(kwargs):
         sink = kwargs["sink"]

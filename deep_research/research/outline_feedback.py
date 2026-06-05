@@ -209,13 +209,25 @@ async def process_outline_feedback_continuation(ctx: RunContext, user_message: s
     # Process the user input
     user_input = user_message.strip()
 
-    # Defensive: if the LLM mis-routes a cancel command through this tool
-    # instead of cancel_research_job, surface the cancel intent rather than
-    # falling through to the natural-language feedback path. The LLM is
-    # expected to call cancel_research_job directly; this is the belt to
-    # the tool-description's braces.
+    # Cancel grammar. The LLM is told (via `CANCEL_DESCRIPTION` and the
+    # `user_facing_instruction` teaser) to route `/q` and `/quit` through
+    # `cancel_research_job` directly, but the LLM does mis-route in
+    # practice. This branch must precede the `/continue` short-circuit
+    # below so a `/q` slipping through as `selection` is recognised as a
+    # cancel rather than treated as "continue with all items".
+    #
+    # We signal the engine's CancellationToken before raising so any
+    # post-unwind `is_cancelled()` reader (the runner's gate-cancel
+    # branch in `cancel()` reads through `_cancellation_tokens[job_id]`,
+    # and the engine's phase-boundary `ctx.raise_if_cancelled()`)
+    # observes the cancel consistently. `getattr` keeps the branch safe
+    # when ctx lacks the attribute (test doubles, Function-runtime ctx
+    # where cancellation_token is None by construction).
     if user_input.lower() in ("/q", "/quit"):
-        raise asyncio.CancelledError("user requested cancellation via /q")
+        token = getattr(ctx, "cancellation_token", None)
+        if token is not None:
+            token.cancel()
+        raise asyncio.CancelledError()
 
     # If user just wants to continue with all items
     if user_input.lower() in ("continue", "/continue", "/c") or not user_input:
@@ -235,21 +247,25 @@ async def process_outline_feedback_continuation(ctx: RunContext, user_message: s
     slash_remove_patterns = [r"^/r\s", r"^/remove\s"]
 
     is_keep_cmd = any(
-        re.match(pattern, user_input) for pattern in slash_keep_patterns
+        re.match(pattern, user_input, re.IGNORECASE)
+        for pattern in slash_keep_patterns
     )
     is_remove_cmd = any(
-        re.match(pattern, user_input) for pattern in slash_remove_patterns
+        re.match(pattern, user_input, re.IGNORECASE)
+        for pattern in slash_remove_patterns
     )
 
     # Process slash commands
     if is_keep_cmd or is_remove_cmd:
         # Extract the item indices/ranges part
         if is_keep_cmd:
-            items_part = re.sub(r"^(/k|/keep)\s+", "", user_input).replace(",", " ")
+            items_part = re.sub(
+                r"^(/k|/keep)\s+", "", user_input, flags=re.IGNORECASE
+            ).replace(",", " ")
         else:
-            items_part = re.sub(r"^(/r|/remove)\s+", "", user_input).replace(
-                ",", " "
-            )
+            items_part = re.sub(
+                r"^(/r|/remove)\s+", "", user_input, flags=re.IGNORECASE
+            ).replace(",", " ")
 
         # Process the indices and ranges
         selected_indices: set[int] = set()
