@@ -225,12 +225,12 @@ async def load_vocabulary_embeddings(ctx: RunContext) -> dict[str, list[float]]:
             await _emit_vocab_progress(ctx, 0, len(vocab))
             all_embeddings = []
             embedding_model = ctx.valves.models.embedding_model
-            batch_index = 0
-            for i in range(0, len(vocab), batch_size):
+            for batch_index, i in enumerate(
+                range(0, len(vocab), batch_size), start=1
+            ):
                 batch = vocab[i : i + batch_size]
                 batch_result = await ctx.embeddings.embeddings(embedding_model, batch)
                 all_embeddings.extend(batch_result)
-                batch_index += 1
                 if batch_index % _VOCAB_PROGRESS_EVERY_N_BATCHES == 0:
                     await _emit_vocab_progress(ctx, len(all_embeddings), len(vocab))
 

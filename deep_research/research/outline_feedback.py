@@ -240,6 +240,7 @@ async def process_outline_feedback_continuation(ctx: RunContext, user_message: s
             "kept_indices": list(range(len(flat_items))),
             "removed_indices": [],
             "preference_vector": {"pdv": None, "strength": 0.0, "impact": 0.0},
+            "slash_command": True,
         }
 
     # Check if it's a slash command (keep or remove)
@@ -254,6 +255,14 @@ async def process_outline_feedback_continuation(ctx: RunContext, user_message: s
         re.match(pattern, user_input, re.IGNORECASE)
         for pattern in slash_remove_patterns
     )
+
+    # Track whether the user gave a structured slash-command selection
+    # (vs. natural-language feedback). The downstream
+    # `continue_research_after_feedback` uses this to decide whether to
+    # invent replacement topics: slash commands are an explicit pick
+    # from the existing outline ("here are the items I want"), not a
+    # request for different angles, so we just trim and proceed.
+    slash_command = bool(is_keep_cmd or is_remove_cmd)
 
     # Process slash commands
     if is_keep_cmd or is_remove_cmd:
@@ -384,7 +393,10 @@ async def process_outline_feedback_continuation(ctx: RunContext, user_message: s
             f"**Removing {len(removed_items)} items:**\n{removed_list}\n"
         )
 
-    await _emit_message(ctx, "Generating replacement items for removed topics...\n")
+    if removed_items and not slash_command:
+        await _emit_message(
+            ctx, "Generating replacement items for removed topics...\n"
+        )
 
     return {
         "kept_items": kept_items,
@@ -392,7 +404,99 @@ async def process_outline_feedback_continuation(ctx: RunContext, user_message: s
         "kept_indices": kept_indices,
         "removed_indices": removed_indices,
         "preference_vector": preference_vector,
+        "slash_command": slash_command,
     }
+
+def _rebuild_outline_from_kept(
+    outline_items: list[dict], kept_items: list
+) -> tuple[list[dict], list]:
+    """Rebuild the outline preserving original topic/subtopic hierarchy,
+    keeping only items the user selected.
+
+    Used by both the slash-command short-circuit (just trim and proceed)
+    and the natural-language path (which then appends replacement topics
+    on top of the trimmed structure). Pure transformation — no I/O.
+
+    A subtopic kept under a removed main-topic keeps its original parent;
+    the parent name is restored verbatim. Returns ``(new_outline,
+    new_all_topics)`` with ``new_all_topics`` flattening main-topics
+    followed by their subtopics in order.
+    """
+    new_outline: list[dict] = []
+    new_all_topics: list = []
+    for topic_item in outline_items:
+        topic = topic_item["topic"]
+        subtopics = topic_item.get("subtopics", [])
+        kept_subtopics = [s for s in subtopics if s in kept_items]
+
+        if topic in kept_items:
+            new_outline.append({"topic": topic, "subtopics": kept_subtopics})
+            new_all_topics.append(topic)
+            new_all_topics.extend(kept_subtopics)
+        elif kept_subtopics:
+            # Subtopics were kept but their main topic wasn't — restore
+            # the original main-topic name so the subtopics keep their
+            # parent context in the rebuilt outline.
+            new_outline.append({"topic": topic, "subtopics": kept_subtopics})
+            new_all_topics.append(topic)
+            new_all_topics.extend(kept_subtopics)
+    return new_outline, new_all_topics
+
+
+async def _finalize_trimmed_outline(
+    ctx: RunContext,
+    new_outline: list[dict],
+    new_all_topics: list,
+    user_message: str,
+):
+    """Wrap up the slash-command short-circuit: update outline embedding,
+    re-init dimension tracking, emit the updated outline to the user,
+    persist state, and clear the waiting flag.
+
+    Mirrors the tail of ``continue_research_after_feedback`` for the
+    natural-language replacement path (lines around 807-864 of the
+    original layout) but without the replacement-topic plumbing.
+    """
+    outline_text = " ".join(new_all_topics)
+    outline_embedding = await get_embedding(ctx, outline_text)
+
+    await initialize_research_dimensions(ctx, new_all_topics, user_message)
+
+    state = ctx.state.get_state(ctx.conversation_id)
+    research_dimensions = state.get("research_dimensions")
+    if research_dimensions:
+        ctx.state.update_state(
+            ctx.conversation_id,
+            "latest_dimension_coverage",
+            research_dimensions["coverage"].copy(),
+        )
+        ctx.trajectory_accumulator = None
+
+    updated_outline = "### Updated Research Outline\n\n"
+    for topic_item in new_outline:
+        updated_outline += f"**{topic_item['topic']}**\n"
+        for subtopic in topic_item.get("subtopics", []):
+            updated_outline += f"- {subtopic}\n"
+        updated_outline += "\n"
+    await _emit_message(ctx, updated_outline)
+    await _emit_message(
+        ctx,
+        "\n*Trimmed outline to selected items. Continuing to main research cycles...*\n\n",
+    )
+
+    ctx.state.update_state(
+        ctx.conversation_id,
+        "research_state",
+        {
+            "research_outline": new_outline,
+            "all_topics": new_all_topics,
+            "outline_embedding": outline_embedding,
+            "user_message": user_message,
+        },
+    )
+    ctx.state.update_state(ctx.conversation_id, "waiting_for_outline_feedback", False)
+    return outline_embedding
+
 
 async def continue_research_after_feedback(
     ctx: RunContext,
@@ -406,6 +510,7 @@ async def continue_research_after_feedback(
     kept_items = feedback_result["kept_items"]
     removed_items = feedback_result["removed_items"]
     preference_vector = feedback_result["preference_vector"]
+    slash_command = bool(feedback_result.get("slash_command", False))
 
     # If there are no removed items, skip the replacement logic and return original outline
     if not removed_items:
@@ -424,6 +529,43 @@ async def continue_research_after_feedback(
 
         # Clear waiting flag
         ctx.state.update_state(ctx.conversation_id, "waiting_for_outline_feedback", False)
+        return outline_items, all_topics, outline_embedding
+
+    # Slash-command short-circuit. The user gave an explicit pick from
+    # the existing outline (`/k`, `/keep`, `/r`, `/remove`) — they did
+    # not ask for different angles, so we just trim and proceed to main
+    # research without inviting LLM-generated replacement topics. Side
+    # benefit: skips the cold-cache vocab embedding load that
+    # `translate_pdv_to_words` (inside `generate_replacement_topics`)
+    # would otherwise trigger.
+    if slash_command:
+        new_outline, new_all_topics = _rebuild_outline_from_kept(
+            outline_items, kept_items
+        )
+        if new_outline:
+            outline_embedding = await _finalize_trimmed_outline(
+                ctx, new_outline, new_all_topics, user_message
+            )
+            return new_outline, new_all_topics, outline_embedding
+        # Defensive fallback: the pick reduced the outline to nothing.
+        # Keep the original outline rather than failing the run.
+        await _emit_message(
+            ctx,
+            "\n*Selection left no items; continuing with original outline.*\n\n",
+        )
+        ctx.state.update_state(
+            ctx.conversation_id,
+            "research_state",
+            {
+                "research_outline": outline_items,
+                "all_topics": all_topics,
+                "outline_embedding": outline_embedding,
+                "user_message": user_message,
+            },
+        )
+        ctx.state.update_state(
+            ctx.conversation_id, "waiting_for_outline_feedback", False
+        )
         return outline_items, all_topics, outline_embedding
 
     # Generate replacement topics for removed items if needed
