@@ -546,15 +546,22 @@ class Coordinator:
         phase_state = await _phase(
             "outline_feedback", of_phase.run_outline_feedback(ctx, phase_state)
         )
-        phase_state = await _phase(
-            "initial_queries", initial_queries.run_initial_queries(ctx, phase_state)
-        )
 
-        if phase_state.get("awaiting_outline_feedback"):
-            return Report(
-                content=phase_state.get("outline_report", ""),
-                conversation_id=ctx.conversation_id,
+        # Skip initial_queries on a feedback resume: outline_feedback has
+        # already produced the finalized outline this turn. Re-running
+        # initial_queries would regenerate the outline from scratch and
+        # re-arm the gate, looping the user back to the topic-selection
+        # prompt instead of starting the main research cycles.
+        if not phase_state.get("outline_finalized"):
+            phase_state = await _phase(
+                "initial_queries", initial_queries.run_initial_queries(ctx, phase_state)
             )
+
+            if phase_state.get("awaiting_outline_feedback"):
+                return Report(
+                    content=phase_state.get("outline_report", ""),
+                    conversation_id=ctx.conversation_id,
+                )
 
         phase_state = await _phase("outline", outline.run_outline(ctx, phase_state))
         phase_state = await _phase("cycles", cycles.run_cycles(ctx, phase_state))

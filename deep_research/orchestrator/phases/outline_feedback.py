@@ -56,4 +56,9 @@ async def run_outline_feedback(ctx: RunContext, state: dict[str, Any]) -> dict[s
     state["research_outline"] = research_outline
     state["all_topics"] = all_topics
     state["outline_embedding"] = outline_embedding
+    # Signal to the coordinator that the outline gate has been resumed
+    # this turn: `initial_queries` already ran on the prior turn (it's
+    # what produced the gate the user just answered). Re-running it now
+    # would regenerate the outline from scratch and re-arm the gate.
+    state["outline_finalized"] = True
     return state
