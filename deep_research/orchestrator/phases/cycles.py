@@ -255,7 +255,13 @@ async def _analyze_cycle_results(ctx, conv_state, cycle, max_cycles, user_messag
 
     dims = conv_state.get("research_dimensions")
     if dims:
-        conv_state["latest_dimension_coverage"] = dict(dims.get("coverage", {}))
+        # Match the shape every other writer produces — see
+        # semantics/dimensions.py, research/ranking.py,
+        # research/outline_feedback.py, persistence/chat_state.py.
+        # The previous ``dict(...)`` form crashed with TypeError because
+        # ``coverage`` is a ``list[float]`` and ``dict()`` over bare floats
+        # is not a sequence of (key, value) pairs.
+        conv_state["latest_dimension_coverage"] = list(dims.get("coverage") or [])
 
     for result in cycle_results:
         content = result.get("content", "")

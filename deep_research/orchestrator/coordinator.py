@@ -4,6 +4,8 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,20 @@ from deep_research.core.types import ChatMessage, Report, ResearchMode, RunConte
 from deep_research.progress.events import EventBus, Sink, StatusEvent
 
 logger = logging.getLogger("deep_research.orchestrator")
+
+
+def _dr_version() -> str:
+    """Best-effort lookup of the installed ``deep-research`` package version.
+
+    Falls back to ``"unknown"`` if the package is not installed in a way
+    importlib can introspect (e.g. ad-hoc editable run from a source tree
+    that was never ``pip install``ed). Logged once per process so operators
+    can correlate behaviour with a deployed build.
+    """
+    try:
+        return _pkg_version("deep-research")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 class AlreadyRunningError(RuntimeError):
@@ -135,6 +151,7 @@ class Coordinator:
                     "DR_EMBEDDINGS_API_KEY or valves.embeddings.api_key to the "
                     "embedding provider bearer token."
                 )
+            logger.info("Deep Research version=%s", _dr_version())
             # Log presence-only for API keys: confirming a key was loaded is
             # sufficient for operators, and "set"/"unset" keeps any portion of
             # the credential out of log archives.
