@@ -4,7 +4,8 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,11 @@ class MessageEvent:
 class EmbedEvent:
     html: str
     title: str | None = None
+    # Source snapshot dict the HTML was rendered from. Consumed by the
+    # OpenAPI runner to populate its in-memory snapshot cache so the
+    # self-polling live-view iframe has topic/cycle/token data after a
+    # revision-bump reload. Ignored by the OWUI Function path.
+    snapshot: dict[str, Any] | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict:
         return {"type": "embeds", "data": {

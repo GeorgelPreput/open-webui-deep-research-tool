@@ -209,4 +209,4 @@ async def refresh_progress_embed(
     ctx.state.update_state(ctx.conversation_id, "progress_embed_last_hash", digest)
     ctx.state.update_state(ctx.conversation_id, "progress_embed_revision", snapshot.get("revision", 0))
     ctx.state.update_state(ctx.conversation_id, "progress_last_updated_at", snapshot.get("updated_at", ""))
-    await ctx.events.emit(EmbedEvent(html=html_content))
+    await ctx.events.emit(EmbedEvent(html=html_content, snapshot=snapshot))

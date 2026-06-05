@@ -92,6 +92,24 @@ async def test_rebind_target_message(store: JobStore):
     assert updated.revision == 1
 
 
+async def test_bump_revision_increments_without_field_change(store: JobStore):
+    await store.create(_make_record("job-bump", phase=JobPhase.RESEARCHING))
+    before = await store.get("job-bump")
+    assert before is not None and before.revision == 0
+
+    bumped = await store.bump_revision("job-bump")
+    assert bumped.revision == 1
+    assert bumped.phase == JobPhase.RESEARCHING  # unchanged
+
+    bumped2 = await store.bump_revision("job-bump")
+    assert bumped2.revision == 2
+
+
+async def test_bump_revision_unknown_job_raises(store: JobStore):
+    with pytest.raises(KeyError):
+        await store.bump_revision("nonexistent")
+
+
 async def test_find_active_by_chat_returns_none_when_terminal(store: JobStore):
     chat_id = "chat-XYZ"
     rec = _make_record("job-6", chat_id=chat_id, phase=JobPhase.QUEUED)

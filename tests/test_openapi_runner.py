@@ -351,6 +351,55 @@ async def test_make_sink_logs_outbox_enqueue_failure(coord, store, caplog):
     await runner_with_outbox.shutdown()
 
 
+async def test_embed_event_bumps_revision_and_merges_snapshot(runner, coord, store):
+    """An engine-emitted EmbedEvent must bump record.revision (so the
+    self-polling live-view iframe reloads and the outbox dedupe key
+    stays unique per refresh) and must merge its source snapshot dict
+    into the runner's in-memory snapshot cache (so the writeback-
+    disabled path can re-render the iframe with topic/cycle data)."""
+    from deep_research.progress.events import EmbedEvent
+
+    record = _make_record("embed-rev")
+
+    arrived = asyncio.Event()
+    payload = {
+        "cycle": 2,
+        "max_cycles": 5,
+        "completed_topics": ["a", "b"],
+        "remaining_topics": ["c"],
+        "results_tokens": 1234,
+        "total_tokens": 1500,
+    }
+
+    async def _on_run(kwargs):
+        sink = kwargs["sink"]
+        await sink(EmbedEvent(html="<div>cycle 1</div>", snapshot=payload))
+        await sink(EmbedEvent(html="<div>cycle 2</div>", snapshot={**payload, "cycle": 3}))
+        arrived.set()
+        coord.state_manager.set_waiting(kwargs["conversation_id"], True)
+        return Report(content="", conversation_id=kwargs["conversation_id"])
+
+    coord.on_run = _on_run
+    await runner.start_job(record, view_token="vt", owui_user_token="tok")
+    await asyncio.wait_for(arrived.wait(), timeout=2.0)
+    await runner._tasks["embed-rev"]
+
+    refreshed = await store.get("embed-rev")
+    assert refreshed is not None
+    # Two EmbedEvents → revision incremented twice (plus once for the
+    # AWAITING_OUTLINE_FEEDBACK phase transition the fake coord triggers
+    # via set_waiting → at least 2). We assert the floor, not exact, so
+    # this stays robust to unrelated future phase bumps.
+    assert refreshed.revision >= 2
+
+    snap = runner.get_snapshot("embed-rev")
+    assert snap.get("cycle") == 3
+    assert snap.get("completed_topics") == ["a", "b"]
+    assert snap.get("remaining_topics") == ["c"]
+    assert snap.get("results_tokens") == 1234
+    assert snap.get("has_embed") is True
+
+
 async def test_make_sink_logs_snapshot_update_failure(runner, coord, store, caplog):
     """Monkey-patching `_update_snapshot` to raise must not crash the
     engine; the failure must leave a logger.exception line."""

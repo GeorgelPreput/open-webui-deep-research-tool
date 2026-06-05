@@ -303,6 +303,30 @@ class JobStore:
         """Repoint a job at a new tool-call message and bump revision."""
         return await self.update(job_id, target_message_id=new_message_id)
 
+    async def bump_revision(self, job_id: str) -> JobRecord:
+        """Bump revision + updated_at without touching other fields.
+
+        Called from the runner's event sink on each engine-emitted
+        EmbedEvent so the live-view iframe's self-polling loop sees a
+        revision change and reloads, and so the engine-embeds outbox
+        dedupe key (which embeds the revision) stays unique per refresh.
+        """
+        async with self._lock:
+            conn = self._require_conn()
+            await conn.execute(
+                "UPDATE research_jobs SET revision = revision + 1, "
+                "updated_at = ? WHERE job_id = ?",
+                (_now_iso(), job_id),
+            )
+            await conn.commit()
+            async with conn.execute(
+                "SELECT * FROM research_jobs WHERE job_id = ?", (job_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        return JobRecord.from_db_row(row)
+
     async def find_active_by_chat(self, chat_id: str) -> JobRecord | None:
         """Return the most-recent non-terminal job for a chat, if any."""
         terminal_values = tuple(p.value for p in TERMINAL_PHASES)

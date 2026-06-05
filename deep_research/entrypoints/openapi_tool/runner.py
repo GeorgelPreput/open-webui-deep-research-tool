@@ -821,6 +821,20 @@ class JobRunner:
                     job_id,
                     type(event).__name__,
                 )
+            if isinstance(event, EmbedEvent):
+                # Bump the DB revision BEFORE _event_to_outbox so the
+                # outbox dedupe key (which embeds record.revision) is
+                # unique per refresh, and so the self-polling live-view
+                # iframe sees revision advance and reloads.
+                try:
+                    await self._store.bump_revision(job_id)
+                except Exception:
+                    logger.exception(
+                        "Job %s revision bump failed; outbox dedupe and "
+                        "live-view iframe reload may be affected for "
+                        "this refresh",
+                        job_id,
+                    )
             if self._outbox is not None:
                 try:
                     await self._event_to_outbox(job_id, event)
@@ -846,6 +860,11 @@ class JobRunner:
             # The iframe polls /live_view/{id}/status for a JSON snapshot
             # and reloads itself on revision bump; the EmbedEvent HTML
             # itself is consumed by the OWUI writeback path (Phase 2).
+            # Merge the source snapshot dict so the writeback-disabled
+            # path (re-rendering from self._snapshots[job_id]) has
+            # topic / cycle / token data, not just an empty bootstrap.
+            if event.snapshot:
+                snap.update(event.snapshot)
             snap["has_embed"] = True
 
     async def _event_to_outbox(self, job_id: str, event: Any) -> None:
