@@ -63,11 +63,19 @@ async def owui_extraction_available(ctx: RunContext, kind: str) -> bool:
 
     Both kinds share the same liveness signal (ctx.client connectivity), so
     ``kind`` is accepted for call-site compatibility but does not key the cache.
-    Cached briefly per (base_url, token): a single list_models() ping tells us
-    the OWUI URL is reachable and the token is valid; if it is, both process_web
-    and process_file/upload_file will be available too. The TTL means a transient
-    failure re-probes instead of latching off, and distinct instances/tokens get
-    independent verdicts.
+    Cached briefly per (base_url, token): a single ``GET /api/v1/auths/`` ping
+    tells us the OWUI URL is reachable and the token is valid; if it is, both
+    process_web and process_file/upload_file will be available too. The TTL
+    means a transient failure re-probes instead of latching off, and distinct
+    instances/tokens get independent verdicts.
+
+    Probes ``get_session_user`` (``GET /api/v1/auths/``) rather than
+    ``/api/v1/models/list`` because the latter returns ``{"items": [...]}``
+    that depends on the API key's model access grants — a token with no
+    granted models would silently latch the probe to False even though every
+    retrieval endpoint we care about is reachable. ``/api/v1/auths/`` is
+    gated by ``get_current_user`` on the OWUI side, so any valid token
+    (any role) succeeds; the probe is a pure reachability + auth check.
     """
     base_url = getattr(ctx.client, "_base_url", "")
     try:
@@ -82,8 +90,8 @@ async def owui_extraction_available(ctx: RunContext, kind: str) -> bool:
 
     available = False
     try:
-        models = await ctx.client.list_models()
-        available = bool(models)
+        user = await ctx.client.get_session_user()
+        available = isinstance(user, dict) and bool(user)
     except Exception as e:
         logger.info(
             f"OWUI extraction unavailable ({type(e).__name__}: {e}); "

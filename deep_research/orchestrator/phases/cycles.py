@@ -48,7 +48,19 @@ async def run_cycles(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
 
     await update_token_counts(ctx)
 
+    # Stash the live outline into per-conversation state so the first
+    # progress refresh below renders the user-chosen topics; the
+    # snapshot reads `active_outline` from there as remaining_topics.
+    conv_state["active_outline"] = list(active_outline)
+    conv_state["all_topics"] = list(all_topics)
+
     cycle = ps.get("cycle", 1)
+    # Refresh the iframe before the first cycle so the user sees the
+    # outline immediately. Without this, the first refresh would happen
+    # at the end of cycle 1's iteration (potentially a minute or more
+    # after feedback was submitted).
+    await refresh_progress_embed(ctx, cycle=cycle, force=True)
+
     while cycle < max_cycles and active_outline:
         ctx.raise_if_cancelled()
         cycle += 1
@@ -114,6 +126,13 @@ async def run_cycles(ctx: RunContext, ps: dict[str, Any]) -> dict[str, Any]:
                                          cycle_results, completed_topics, irrelevant_topics,
                                          active_outline, all_topics, cycle_summaries,
                                          results_history, outline_embedding)
+
+        # Refresh the progress iframe at the end of every cycle, even when
+        # cycle_results is empty. Otherwise a run that fetches nothing (broken
+        # OWUI extraction, paywalled pages, no search results) leaves the user
+        # staring at the bootstrap-shaped iframe for the entire research loop.
+        await refresh_progress_embed(ctx, cycle=cycle, force=True)
+        await checkpoint(ctx)
 
         if not active_outline:
             await ctx.events.emit(StatusEvent(description="All research topics addressed", level="info", done=False))
@@ -245,10 +264,6 @@ async def _analyze_cycle_results(ctx, conv_state, cycle, max_cycles, user_messag
             if "similarity" in result:
                 quality = 0.5 + result["similarity"] * 0.5
             await update_dimension_coverage(ctx, content, quality)
-
-    await refresh_progress_embed(ctx, cycle=cycle, force=True)
-    await checkpoint(ctx)
-
 
 def _build_analysis_context(cycle_results, active_outline, completed_topics, irrelevant_topics, cycle_summaries):
     ctx_text = "### Current Outline:\n" + "\n".join(f"- {t}" for t in active_outline) + "\n\n"

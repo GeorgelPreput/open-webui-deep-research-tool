@@ -231,20 +231,6 @@ class OWUIClient:
 
     # ---- Models (OWUI connectivity probe) ----
 
-    async def list_models(self) -> list:
-        """Lightweight OWUI connectivity probe used by owui_extraction_available.
-
-        Returns the raw list of model dicts from OWUI's /api/v1/models/list.
-        Use ctx.llm.list_models() (LLMProviderClient) for actual model metadata
-        such as context-window sizes; this method is only for liveness checks.
-        """
-        resp = await self._request("GET", "/api/v1/models/list")
-        if isinstance(resp, dict):
-            return resp.get("data") or []
-        if isinstance(resp, list):
-            return resp
-        return []
-
     # ---- Session user (admin probe) ----
 
     async def get_session_user(self) -> dict:
