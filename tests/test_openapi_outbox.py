@@ -17,11 +17,18 @@ import pytest
 import pytest_asyncio
 
 from deep_research.adapter.client import AdapterError
+from deep_research.entrypoints.openapi_tool.jobs import (
+    JobPhase,
+    JobRecord,
+    JobStore,
+)
 from deep_research.entrypoints.openapi_tool.outbox import (
     OutboxRow,
     OutboxStatus,
     OutboxWorker,
 )
+from deep_research.entrypoints.openapi_tool.runner import JobRunner
+from deep_research.progress.events import CitationEvent
 
 
 class _FakeOWUIClient:
@@ -399,6 +406,72 @@ async def test_source_payload_round_trip(
     call = fake_client.calls[0]
     assert call["event_type"] == "source"
     assert call["data"] == payload
+
+
+async def test_citation_event_mapped_to_source_row(
+    worker: OutboxWorker,
+    fake_client: _FakeOWUIClient,
+    tmp_path: pathlib.Path,
+):
+    """The CitationEvent → outbox mapping in ``JobRunner._event_to_outbox``
+    sets ``event_type='source'`` (NOT ``'citation'`` — both are valid OWUI
+    aliases; the runner pins on ``'source'``), routes to the record's
+    chat/message, and builds ``data`` from ``CitationEvent.to_dict()['data']``.
+
+    Complements ``test_source_payload_round_trip`` (which proves only the
+    queue echoes a hand-built payload) by pinning the *mapping* itself: a
+    regression in ``CitationEvent.to_dict`` or the runner's CitationEvent
+    branch would surface here even if the queue round-trip still passed.
+    The JobStore uses a sibling sqlite file so it never contends with the
+    worker's ``outbox.sqlite``.
+    """
+    store = JobStore(tmp_path / "jobs.sqlite")
+    await store.start()
+    try:
+        record = JobRecord(
+            job_id="ct-map-1",
+            user_id="u",
+            user_name="U",
+            conversation_id="conv-ct",
+            chat_id="chat-ct",
+            target_message_id="msg-ct",
+            phase=JobPhase.RESEARCHING,
+            prompt="p",
+            history_json="[]",
+            revision=0,
+            view_token_hash="0" * 64,
+        )
+        await store.create(record)
+
+        # No Coordinator needed — we call _event_to_outbox directly.
+        runner = JobRunner(
+            coord=None,  # type: ignore[arg-type]
+            store=store,
+            outbox=worker,
+            public_base_url="",
+        )
+
+        event = CitationEvent(
+            url="https://example.com/ct",
+            title="CT Title",
+            snippet="CT excerpt.",
+        )
+        await runner._event_to_outbox(record.job_id, event)
+        await worker.drain_once()
+
+        assert len(fake_client.calls) == 1
+        call = fake_client.calls[0]
+        assert call["event_type"] == "source"
+        assert call["chat_id"] == "chat-ct"
+        assert call["message_id"] == "msg-ct"
+        assert call["data"] == {
+            "type": "external",
+            "source": {"type": "external", "name": "CT Title"},
+            "document": ["CT excerpt."],
+            "metadata": [{"source": "https://example.com/ct"}],
+        }
+    finally:
+        await store.close()
 
 
 async def test_count_by_status_distinguishes_outcomes(

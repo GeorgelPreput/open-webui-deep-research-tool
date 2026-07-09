@@ -368,12 +368,23 @@ side wins.
 **Citation/source mapping has dedicated tests; do not add defensive
 filters.** `_event_to_outbox`'s CitationEvent branch at
 `deep_research/entrypoints/openapi_tool/runner.py:481-491` is pinned by
-five tests:
-`tests/test_openapi_outbox.py::test_source_payload_round_trip`,
-`tests/test_openapi_writeback_e2e.py::test_citation_event_maps_to_source_row`,
-`...::test_multiple_citations_with_same_url_deduplicate`,
-`...::test_runner_emits_source_not_citation`, and
-`...::test_runner_does_not_filter_empty_url_citation`. Two pinned contracts
+these tests:
+`tests/test_openapi_outbox.py::test_source_payload_round_trip` (queue
+contract — a hand-built `source` payload round-trips unmangled),
+`tests/test_openapi_outbox.py::test_citation_event_mapped_to_source_row`
+(the runner-side mapping itself: `event_type='source'`, chat/message
+routing, `data` from `CitationEvent.to_dict()`), and the four
+parametrised e2e cases of
+`tests/test_openapi_writeback_e2e.py::test_citation_event_outbox_mapping`
+— `[single-citation-maps-correctly]`,
+`[same-url-deduplicates-first-wins]`,
+`[event-type-is-source-not-citation]`, and
+`[empty-url-passes-through-runner]` (these four replaced the former
+standalone `test_citation_event_maps_to_source_row` /
+`test_multiple_citations_with_same_url_deduplicate` /
+`test_runner_emits_source_not_citation` /
+`test_runner_does_not_filter_empty_url_citation` functions; each case's
+assertion is preserved verbatim in its own helper). Two pinned contracts
 are non-obvious and the tests will fail loudly if accidentally reverted:
 (a) URL alone is the dedupe identity; same URL + different snippet = the
 first emission wins via `INSERT OR IGNORE`. (b) The runner passes
