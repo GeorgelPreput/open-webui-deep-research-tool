@@ -233,8 +233,15 @@ async def test_shutdown_cancels_all_active_jobs(coord, store):
     rec_a = _make_record("sd-a")
     rec_b = _make_record("sd-b")
 
+    entered = asyncio.Event()  # signalled once BOTH engines reach the wait-loop
+    entered_count = 0
+
     async def _on_run(kwargs):
+        nonlocal entered_count
         cancel = kwargs.get("cancellation_token")
+        entered_count += 1
+        if entered_count >= 2:
+            entered.set()
         while not (isinstance(cancel, CancellationToken) and cancel.is_cancelled()):
             await asyncio.sleep(0.01)
         raise asyncio.CancelledError("shutdown")
@@ -242,7 +249,9 @@ async def test_shutdown_cancels_all_active_jobs(coord, store):
     coord.on_run = _on_run
     await runner.start_job(rec_a, view_token="va", owui_user_token="tok")
     await runner.start_job(rec_b, view_token="vb", owui_user_token="tok")
-    await asyncio.sleep(0.05)
+    # Wait for both engines to actually enter their wait-loops — replaces
+    # the prior `asyncio.sleep(0.05)` timing primitive.
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
     await runner.shutdown(timeout=2.0)
 
     for jid in ("sd-a", "sd-b"):
