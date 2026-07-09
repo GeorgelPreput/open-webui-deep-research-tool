@@ -581,13 +581,17 @@ def test_headers_not_forwarded_silent_when_chat_id_present(app_with_state, clien
     assert app.state.config_warnings == []
 
 
-def test_headers_not_forwarded_silent_when_no_auth(app_with_state, client):
-    """No Authorization header at all → no warning (operator/test caller, not OWUI)."""
+def test_headers_not_forwarded_fires_without_bearer(app_with_state, client):
+    """Detector gates on chat-id absence ALONE: a request with no bearer and
+    no X-OpenWebUI-Chat-Id still trips OWUI_HEADERS_NOT_FORWARDED. This closes
+    the blind spot where an OWUI tool server configured auth:none with header
+    forwarding off would silently disable writeback with no operator signal."""
     app, _, _ = app_with_state
 
     resp = client.post("/research_jobs", json={"prompt": "Q"})
     assert resp.status_code == 200
-    assert app.state.config_warnings == []
+    codes = [w.code for w in app.state.config_warnings]
+    assert codes == ["OWUI_HEADERS_NOT_FORWARDED"]
 
 
 def test_headers_not_forwarded_holds_lock_during_append(app_with_state, client):

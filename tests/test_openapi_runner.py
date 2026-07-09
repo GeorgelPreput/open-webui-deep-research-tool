@@ -717,7 +717,6 @@ async def test_job_state_gc_after_terminal_phase(runner, coord, store):
     assert "gc-1" not in runner._cancellation_tokens
     assert "gc-1" not in runner._owui_tokens
     assert "gc-1" not in runner._view_tokens
-    assert "gc-1" not in runner._status_dedupe_counter
     assert "gc-1" not in runner._cancel_requested
     # Lock is intentionally NOT GC'd (see _lock_for docstring).
     assert "gc-1" in runner._job_locks
@@ -753,3 +752,183 @@ async def test_job_state_gc_does_not_fire_for_non_terminal_task_end(runner, coor
     snap = runner._snapshots.get("gc-deferred", {})
     assert snap.get("phase") == JobPhase.BOOTSTRAPPING.value
     assert "gc-deferred" in runner._tasks  # still present
+
+
+# --------------------------------------------------- dedupe identity (Groups 07/08)
+
+
+class _RecordingOutbox:
+    """Records every enqueue kwargs; always reports a successful insert.
+
+    Lets a test assert the exact ``dedupe_key`` the runner emits without
+    involving the durable sqlite worker (that path is covered by
+    ``test_status_dedupe_survives_simulated_restart`` below).
+    """
+
+    def __init__(self) -> None:
+        self.rows: list[dict] = []
+
+    async def enqueue(self, **kwargs):
+        self.rows.append(kwargs)
+        return True
+
+
+def _runner_with_recording_outbox(coord, store) -> tuple[JobRunner, _RecordingOutbox]:
+    outbox = _RecordingOutbox()
+    runner = JobRunner(
+        coord=coord, store=store, outbox=outbox, public_base_url="http://t/"
+    )
+    return runner, outbox
+
+
+async def test_status_dedupe_key_is_deterministic_content_hash(coord, store):
+    """Two StatusEvents with identical (description, done) at the same
+    revision produce the SAME dedupe key (INSERT OR IGNORE collapses
+    them) — a content hash, not a per-process counter, so the key is
+    stable across restarts."""
+    import re
+
+    from deep_research.progress.events import StatusEvent
+
+    runner, outbox = _runner_with_recording_outbox(coord, store)
+    await store.create(_make_bound_record("st-det"))
+
+    ev = StatusEvent(description="Researching topic A", level="info", done=False)
+    await runner._event_to_outbox("st-det", ev)
+    await runner._event_to_outbox("st-det", ev)
+
+    keys = [r["dedupe_key"] for r in outbox.rows]
+    assert len(keys) == 2
+    assert keys[0] == keys[1]
+    # Format: {job}:{message}:status:rev{revision}:{sha256[:16]}.
+    assert re.fullmatch(r"st-det:msg-1:status:rev0:[0-9a-f]{16}", keys[0])
+
+
+async def test_status_dedupe_differentiates_on_description(coord, store):
+    """Distinct descriptions in the same revision both insert."""
+    from deep_research.progress.events import StatusEvent
+
+    runner, outbox = _runner_with_recording_outbox(coord, store)
+    await store.create(_make_bound_record("st-diff"))
+
+    await runner._event_to_outbox(
+        "st-diff", StatusEvent(description="A", level="info", done=False)
+    )
+    await runner._event_to_outbox(
+        "st-diff", StatusEvent(description="B", level="info", done=False)
+    )
+
+    keys = [r["dedupe_key"] for r in outbox.rows]
+    assert keys[0] != keys[1]
+
+
+async def test_status_dedupe_differentiates_on_revision(coord, store):
+    """The same (description, done) emitted at two revisions both insert.
+
+    Pins the revision segment of the key so a future 'drop the revision'
+    refactor fails loudly."""
+    from deep_research.progress.events import StatusEvent
+
+    runner, outbox = _runner_with_recording_outbox(coord, store)
+    await store.create(_make_bound_record("st-rev"))
+
+    ev = StatusEvent(description="same", level="info", done=False)
+    await runner._event_to_outbox("st-rev", ev)  # revision 0
+    await store.bump_revision("st-rev")  # revision 1
+    await runner._event_to_outbox("st-rev", ev)
+
+    keys = [r["dedupe_key"] for r in outbox.rows]
+    assert keys[0] != keys[1]
+    assert ":status:rev0:" in keys[0]
+    assert ":status:rev1:" in keys[1]
+
+
+async def test_message_event_dedupe_key_is_deterministic_sha256(coord, store):
+    """MessageEvent dedupe key is a stable sha256 of the content, not the
+    salted builtin hash() that reset every process."""
+    import re
+
+    from deep_research.progress.events import MessageEvent
+
+    runner, outbox = _runner_with_recording_outbox(coord, store)
+    await store.create(_make_bound_record("mg-det"))
+
+    ev = MessageEvent(content="- topic 1\n- topic 2")
+    await runner._event_to_outbox("mg-det", ev)
+    await runner._event_to_outbox("mg-det", ev)
+
+    keys = [r["dedupe_key"] for r in outbox.rows]
+    assert keys[0] == keys[1]
+    assert re.fullmatch(r"mg-det:msg-1:replace:msg:rev0:[0-9a-f]{16}", keys[0])
+
+    # Different content → different key.
+    await runner._event_to_outbox("mg-det", MessageEvent(content="different"))
+    assert outbox.rows[-1]["dedupe_key"] != keys[0]
+
+
+async def test_status_dedupe_survives_simulated_restart(coord, store, tmp_path):
+    """A fresh JobRunner sharing the same durable OutboxWorker must NOT
+    re-enqueue a status row whose (job, message, revision, content)
+    identity already exists — proving the key is restart-stable and no
+    in-memory counter is carried over."""
+    from deep_research.entrypoints.openapi_tool.outbox import OutboxWorker
+    from deep_research.progress.events import StatusEvent
+
+    class _NoopClient:
+        async def post_message_event(self, *a, **k):
+            return None
+
+    worker = OutboxWorker(
+        db_path=tmp_path / "restart-outbox.sqlite",
+        owui_client=_NoopClient(),
+        poll_interval_s=0.05,
+        max_attempts=3,
+        max_backoff_s=2,
+    )
+    await worker.start(spawn_loop=False)
+    try:
+        await store.create(_make_bound_record("st-restart"))
+        ev = StatusEvent(description="Cycle 1 of 3", level="info", done=False)
+
+        runner_a = JobRunner(
+            coord=coord, store=store, outbox=worker, public_base_url=""
+        )
+        await runner_a._event_to_outbox("st-restart", ev)
+
+        # Simulate a restart: brand-new runner, same durable store +
+        # outbox, no in-memory state carried over.
+        runner_b = JobRunner(
+            coord=coord, store=store, outbox=worker, public_base_url=""
+        )
+        await runner_b._event_to_outbox("st-restart", ev)
+
+        counts = await worker.count_by_status()
+        assert sum(counts.values()) == 1, counts
+    finally:
+        await worker.stop()
+
+
+async def test_bootstrap_embed_dedupe_key_is_revision_based(coord, store):
+    """The bootstrap iframe dedupe key is deterministic on
+    (message_id, revision): identical target+revision dedupes; a bumped
+    revision or a rebound message_id yields a distinct key. No
+    process-local counter."""
+    import dataclasses
+
+    runner, outbox = _runner_with_recording_outbox(coord, store)
+
+    rec_r0 = _make_bound_record("bs-key")  # revision 0, target msg-1
+    await runner._enqueue_bootstrap_embed(rec_r0, "vt")
+    await runner._enqueue_bootstrap_embed(rec_r0, "vt")
+    keys = [r["dedupe_key"] for r in outbox.rows]
+    assert keys[0] == keys[1] == "bs-key:msg-1:embeds:bootstrap:0"
+
+    # A revision bump (e.g. rebind_target_message) → distinct key.
+    rec_r1 = dataclasses.replace(rec_r0, revision=1)
+    await runner._enqueue_bootstrap_embed(rec_r1, "vt")
+    assert outbox.rows[-1]["dedupe_key"] == "bs-key:msg-1:embeds:bootstrap:1"
+
+    # A rebound (new) message_id → distinct key even at the same revision.
+    rec_m2 = dataclasses.replace(rec_r0, target_message_id="msg-2")
+    await runner._enqueue_bootstrap_embed(rec_m2, "vt")
+    assert outbox.rows[-1]["dedupe_key"] == "bs-key:msg-2:embeds:bootstrap:0"

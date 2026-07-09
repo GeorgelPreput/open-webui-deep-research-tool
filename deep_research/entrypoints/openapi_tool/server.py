@@ -478,7 +478,6 @@ async def start_research_job(
     req: StartResearchRequest,
     request: Request,
     token: _ApiToken,
-    creds: _BearerCreds,
 ) -> StartResearchResponse:
     chat_id = request.headers.get("X-OpenWebUI-Chat-Id")
     message_id = request.headers.get("X-OpenWebUI-Message-Id")
@@ -496,7 +495,14 @@ async def start_research_job(
             ),
         )
 
-    if creds is not None and creds.credentials and not chat_id:
+    # Detector gates on chat-id absence ALONE, not on bearer presence: the
+    # signal for "OWUI isn't forwarding user-info headers" is the missing
+    # X-OpenWebUI-Chat-Id, and OWUI's inbound auth type (none/bearer/session)
+    # is an orthogonal knob. Gating on credentials would blind us to the
+    # OWUI-with-auth:none-tool-server-plus-forwarding-off deployment (writeback
+    # silently dies, operator never told). The cost is a benign one-shot false
+    # positive if a non-OWUI caller starts a job without the header.
+    if not chat_id:
         async with request.app.state.config_warnings_lock:
             if not getattr(request.app.state, "_forward_headers_warned", False):
                 request.app.state._forward_headers_warned = True
@@ -504,9 +510,9 @@ async def start_research_job(
                     code="OWUI_HEADERS_NOT_FORWARDED",
                     severity="warning",
                     message=(
-                        "An authenticated request arrived without "
-                        "X-OpenWebUI-Chat-Id. OWUI is not forwarding user-info "
-                        "headers; writeback is silently disabled."
+                        "A request arrived without X-OpenWebUI-Chat-Id. If it "
+                        "came from OWUI, user-info headers are not being "
+                        "forwarded and writeback is silently disabled."
                     ),
                     remediation=(
                         "On the OWUI container, set "
