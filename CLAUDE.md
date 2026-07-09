@@ -226,6 +226,29 @@ deliver in insertion order. UUIDs as `outbox_id` are useless for
 ordering and the original `outbox_id ASC` secondary sort produced
 nondeterministic delivery sequence.
 
+**Dedupe keys are content-deterministic across process restarts.** The
+`_event_to_outbox` status and replace key shapes are
+`{job_id}:{message_id}:status:rev{revision}:{sha256(description|int(done))[:16]}`
+and
+`{job_id}:{message_id}:replace:msg:rev{revision}:{sha256(content)[:16]}`
+respectively; the bootstrap-embed key is
+`{job_id}:{message_id}:embeds:bootstrap:{revision}` and the
+engine-embed key is `{job_id}:{message_id}:embeds:engine:{revision}`.
+Identical status/message content within the same `JobRecord.revision`
+deduplicates by design — this aligns with `EventBus._flusher`'s
+consecutive-collapse behaviour and OWUI overwriting the status pill on
+each post. **Do not reintroduce a process-local sequence counter** (the
+old `_status_dedupe_counter` / the never-landed `_bootstrap_seq`):
+Python's builtin `hash()` is per-process salted and such counters reset
+to zero on restart, so `INSERT OR IGNORE` silently stops deduping
+across restarts and each counter leaks one int per completed job. The
+revision segment is the restart-stable namespace — a genuine re-submit
+either lands on a new `message_id` (rebind) or a bumped `revision`, so
+it gets a fresh key without any counter; only a true duplicate against
+the identical `(message_id, revision)` collapses. Pinned by
+`tests/test_openapi_runner.py::test_status_dedupe_*` and
+`::test_bootstrap_embed_dedupe_key_is_revision_based`.
+
 Worker loop spawn is opt-out: `OutboxWorker.start(spawn_loop=False)`
 opens the sqlite connection without spawning the background drain.
 The tests use this mode so `drain_once()` is deterministic; production
@@ -531,6 +554,22 @@ research and the live snapshot becomes meaningful). The only
 user-visible content in the preliminary tool-call message is the
 topic-list `MessageEvent → replace`.
 
+`_enqueue_bootstrap_embed` has exactly one production caller
+(`submit_feedback` Phase C) and takes no `marker` argument. Its dedupe
+key is `{job_id}:{message_id}:embeds:bootstrap:{record.revision}` —
+deterministic, no process-local counter (see the dedupe-key note under
+"Phase 2 writeback wiring"). A genuine re-submit lands on a rebound
+`message_id` (which also bumps `revision` via
+`rebind_target_message`) so it enqueues a fresh iframe row; a true
+duplicate against the identical `(message_id, revision)` correctly
+dedupes. The snapshot read of `self._snapshots[job_id]` is **not**
+lock-guarded and must not be: the sink's `_update_snapshot` and this
+read are both synchronous (no `await` between the read and the
+`{**snapshot, ...}` copy), so on the single event loop they cannot
+interleave; and `_enqueue_bootstrap_embed` already runs inside the
+caller's per-job lock, so acquiring any per-job `asyncio.Lock` here
+would deadlock (not reentrant). Do not "fix" the missing lock.
+
 **Config warning code taxonomy.** The OpenAPI Tool Server runs a
 startup configuration audit
 (`deep_research/entrypoints/openapi_tool/config_audit.py`) plus one
@@ -562,10 +601,20 @@ The stable `code` values:
     surfaces the floored value). Emitted once at lifespan time;
     appears in `/health` until the next pod restart.
   - `OWUI_HEADERS_NOT_FORWARDED` — detected at runtime (not startup):
-    the first authenticated request to `start_research_job` arrived
-    without `X-OpenWebUI-Chat-Id`. One-shot per process via
+    the first request to `start_research_job` arrived without
+    `X-OpenWebUI-Chat-Id`. One-shot per process via
     `app.state._forward_headers_warned`. Means OWUI hasn't set
-    `ENABLE_FORWARD_USER_INFO_HEADERS=true`.
+    `ENABLE_FORWARD_USER_INFO_HEADERS=true`. The detector gates on
+    header absence **alone**, deliberately NOT on bearer presence:
+    OWUI's inbound-auth type (none/bearer/session) is orthogonal to
+    header forwarding, so gating on credentials would blind the warning
+    to an OWUI instance whose tool server is configured `auth: none`
+    with forwarding off — the exact silent-writeback misconfig this
+    detector exists to surface. The accepted trade-off is a benign
+    one-shot false positive when a non-OWUI caller (operator/curl/test)
+    starts a job without the header; the remediation text names the
+    OWUI knob, which is only meaningful if the caller is OWUI. Pinned by
+    `tests/test_openapi_jobs.py::test_headers_not_forwarded_fires_without_bearer`.
 
 Probe endpoint is `GET /api/v1/auths/`, not `GET /api/v1/users/`:
 `auths/` admits any valid token and returns the holder's `role`

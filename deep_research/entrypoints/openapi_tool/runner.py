@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import uuid
@@ -136,7 +137,6 @@ class JobRunner:
         self._snapshots: dict[str, dict[str, Any]] = {}
         self._owui_tokens: dict[str, str] = {}
         self._view_tokens: dict[str, str] = {}
-        self._status_dedupe_counter: dict[str, int] = {}
         # Two-tier locking: `_registry_lock` serialises mutations of
         # `_job_locks` (and is the cross-job lock used by shutdown).
         # Each `_job_locks[job_id]` serialises lifecycle transitions
@@ -222,7 +222,6 @@ class JobRunner:
         self._owui_tokens.pop(job_id, None)
         self._view_tokens.pop(job_id, None)
         self._snapshots.pop(job_id, None)
-        self._status_dedupe_counter.pop(job_id, None)
         self._cancel_requested.discard(job_id)
         prewarm = self._prewarm_tasks.pop(job_id, None)
         if prewarm is not None and not prewarm.done():
@@ -457,9 +456,7 @@ class JobRunner:
             if cancel_token is None:
                 cancel_token = CancellationToken()
             if view_token:
-                await self._enqueue_bootstrap_embed(
-                    refreshed, view_token, marker="feedback"
-                )
+                await self._enqueue_bootstrap_embed(refreshed, view_token)
             else:
                 # State-dict inconsistency: record is non-terminal but
                 # the in-memory token slot is empty. Should not happen
@@ -890,8 +887,18 @@ class JobRunner:
         chat_id, message_id = target
 
         if isinstance(event, StatusEvent):
-            seq = self._status_dedupe_counter.get(job_id, 0) + 1
-            self._status_dedupe_counter[job_id] = seq
+            # Content-hash + revision dedupe identity — deterministic
+            # across process restarts (Python's builtin hash() is
+            # per-process salted, which broke INSERT-OR-IGNORE dedupe
+            # after any restart). Two consecutive StatusEvents with the
+            # same (description, done) within one revision now collapse,
+            # matching EventBus._flusher's consecutive-collapse and the
+            # fact that OWUI overwrites the status pill on each post.
+            # `description|int(done)` uses a separator that cannot appear
+            # in `done` (0/1) to avoid "foo"+"|1" vs "foo|"+"1" collisions.
+            content_hash = hashlib.sha256(
+                f"{event.description}|{int(event.done)}".encode()
+            ).hexdigest()[:16]
             await self._outbox.enqueue(
                 outbox_id=str(uuid.uuid4()),
                 job_id=job_id,
@@ -902,9 +909,15 @@ class JobRunner:
                     "description": event.description,
                     "done": event.done,
                 },
-                dedupe_key=f"{job_id}:{message_id}:status:{seq}",
+                dedupe_key=(
+                    f"{job_id}:{message_id}:status:"
+                    f"rev{record.revision}:{content_hash}"
+                ),
             )
         elif isinstance(event, MessageEvent):
+            content_hash = hashlib.sha256(
+                event.content.encode()
+            ).hexdigest()[:16]
             await self._outbox.enqueue(
                 outbox_id=str(uuid.uuid4()),
                 job_id=job_id,
@@ -914,7 +927,7 @@ class JobRunner:
                 payload={"content": event.content},
                 dedupe_key=(
                     f"{job_id}:{message_id}:replace:"
-                    f"msg:{record.revision}:{hash(event.content) & 0xFFFFFFFF}"
+                    f"msg:rev{record.revision}:{content_hash}"
                 ),
             )
         elif isinstance(event, EmbedEvent):
@@ -946,14 +959,19 @@ class JobRunner:
         self,
         record: JobRecord,
         view_token: str,
-        *,
-        marker: str,
     ) -> None:
-        """Post the iframe HTML to the (current) target message once.
+        """Post the iframe HTML to the (current) target message.
 
-        ``marker`` distinguishes the start-of-job bootstrap (``bootstrap``)
-        from the post-feedback re-attach (``feedback``), so the dedupe
-        key stays unique across the two phases of a single job.
+        The dedupe key is deterministic — ``{job_id}:{message_id}:embeds:
+        bootstrap:{revision}`` — so it is stable across process restarts
+        (no salted-hash or process-local counter). A genuine re-submit
+        against a *new* tool-call message differs on ``message_id``; a
+        re-submit that also bumped the DB revision differs on
+        ``revision``; a true duplicate against the identical
+        ``(message_id, revision)`` correctly dedupes under
+        ``INSERT OR IGNORE``. The namespace segment ``bootstrap``
+        keeps this key disjoint from the engine-emitted
+        ``...:embeds:engine:{revision}`` key.
         """
         if self._outbox is None:
             return
@@ -961,6 +979,14 @@ class JobRunner:
         if target is None:
             return
         chat_id, message_id = target
+        # Copy the shared snapshot dict synchronously. The engine sink's
+        # `_update_snapshot` mutates `self._snapshots[job_id]` in place,
+        # but it (like this copy) contains no `await`, so on the single
+        # event loop the two synchronous sections cannot interleave — the
+        # `{**snapshot, ...}` copy below is atomic w.r.t. the sink. Do NOT
+        # wrap this in the per-job lock: `_enqueue_bootstrap_embed` runs
+        # inside `submit_feedback` Phase C which already holds that lock,
+        # and `asyncio.Lock` is not reentrant (would deadlock).
         snapshot = self._snapshots.get(record.job_id, {}) or {}
         snapshot = {**snapshot, "query": record.prompt}
         status_url = (
@@ -980,7 +1006,10 @@ class JobRunner:
             message_id=message_id,
             event_type="embeds",
             payload={"embeds": [iframe_html], "replace": True},
-            dedupe_key=f"{record.job_id}:{message_id}:embeds:{marker}",
+            dedupe_key=(
+                f"{record.job_id}:{message_id}:embeds:"
+                f"bootstrap:{record.revision}"
+            ),
         )
 
     async def _enqueue_terminal_writeback(

@@ -9,8 +9,9 @@ returns a structured warning list. Consumers:
   - ``GET /health`` returns the cached list as JSON for ``curl``-able
     operator inspection.
   - ``start_research_job`` appends ``OWUI_HEADERS_NOT_FORWARDED`` at
-    runtime (one-shot per process) when an authenticated request
-    arrives without ``X-OpenWebUI-Chat-Id``.
+    runtime (one-shot per process) when a request arrives without
+    ``X-OpenWebUI-Chat-Id`` (gated on header absence alone, not on
+    bearer presence).
 
 Fail-fast (server refuses to start) lives in ``server.py:lifespan``,
 not here — this module produces warnings only.
