@@ -45,10 +45,3 @@ row (and broadcasts to live WebSocket clients) are:
 `status`, `message`, `replace`, `embeds`, `files`, `source` /
 `citation`. Long-name aliases (`chat:message:embeds` etc.) broadcast
 but do NOT persist — only the short names are durable.
-
-### OWUI Pipelines (legacy)
-
-OWUI itself flagged the Pipelines plugin loader as legacy. This
-project dropped its Pipelines entrypoint in `v2`; the three supported
-runtimes are now **OWUI Function**, **OpenAPI Tool Server**, and
-**MCP**.

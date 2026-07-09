@@ -10,7 +10,7 @@ class StaticToken:
     """Bearer token captured once at construction time.
 
     Covers every current call-site: server-side static API keys
-    (OpenAPI/MCP/Pipeline runtimes) and per-request tokens lifted from
+    (OpenAPI/MCP runtimes) and per-request tokens lifted from
     the Authorization header in the OWUI Function shim. A dynamic
     rotating-token provider would implement BearerTokenProvider directly.
     """
