@@ -211,3 +211,6 @@ __marimo__/
 # Quality/security scan artifacts (Makefile: make all)
 reports/
 *.sarif
+
+# Local run logs (manual capture, not for version control)
+run-log*.txt
