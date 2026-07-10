@@ -120,9 +120,17 @@ def render_progress_embed_html(
             "since_version": int(snapshot.get("revision", 0) or 0),
         }
         # Carry the bootstrap config through an HTML-escaped data attribute
-        # rather than interpolating JSON into the <script> body. HTML escaping
-        # is a recognised XSS barrier and prevents any stray `</script>` in
-        # user-derived values (job_id, view_token) from terminating the tag.
+        # rather than interpolating JSON into the <script> body. The three
+        # current fields are all server-side: ``poll_url`` is built from
+        # ``DR_OPENAPI_PUBLIC_BASE_URL`` (or the request host) and the
+        # UUID-shaped ``job_id``; ``view_token`` is
+        # ``secrets.token_urlsafe(32)`` minted at job creation;
+        # ``since_version`` is an int coerced from ``snapshot["revision"]``.
+        # None of these are user-derived today. The escape is retained as
+        # defence-in-depth: a future addition to the bootstrap dict carrying
+        # user-derived data (e.g. an echoed query string) must not be able
+        # to break out of the data attribute or terminate the surrounding
+        # ``<script>`` block with a stray ``</script>`` / ``<!--`` sequence.
         bootstrap_attr = html.escape(json.dumps(bootstrap), quote=True)
         poll_script = (
             f'<div id="dr-bootstrap" hidden data-bootstrap="{bootstrap_attr}"></div>'
