@@ -482,6 +482,18 @@ exists; #1 fires when it's ready). The intentional duplication is
 documented here so a future cleanup pass doesn't accidentally
 collapse them.
 
+Site #3's text is stored in the module-level constant
+`deep_research.entrypoints.openapi_tool.schemas.USER_FACING_INSTRUCTION`,
+referenced by both the field default and the `json_schema_extra` example
+within the schema module (Group 14 collapsed that intra-file
+duplication; pinned by
+`tests/test_openapi_jobs.py::test_user_facing_instruction_default_equals_example`).
+This is still site #3 — the separation from site #1 is unchanged. (The
+`local:` 409 body and its `START_DESCRIPTION` LLM-relay paragraph were
+left as two strings: their remedy advice is already worded per-audience,
+not byte-identical, so a shared constant would have forced a text
+change.)
+
 The `/q` and `/quit` cancel commands live in **two** sites, not three,
 because they're never parsed by the engine's
 `process_outline_feedback_continuation` as a normal command — they

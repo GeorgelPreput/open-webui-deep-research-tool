@@ -17,6 +17,24 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# User-facing instruction emitted verbatim into the chat after a successful
+# start_research_job call. CLAUDE.md's "Slash-command grammar lives in three
+# places" documents this as site #3 of the slash-command grammar,
+# intentionally separate from site #1
+# (deep_research.research.outline_feedback.render_outline_prompt) — different
+# audience, different timing; do NOT consolidate with site #1. This constant
+# collapses the previous intra-file duplication between the field default and
+# the json_schema_extra example.
+USER_FACING_INSTRUCTION: str = (
+    "I've started the preliminary research. When the topic list "
+    "is ready you'll see it appear right here — reply with "
+    "`/k <numbers>` to keep specific topics, `/r <numbers>` to "
+    "remove specific topics, or `/continue` to research all "
+    "topics as-is. A live progress view will appear once you've "
+    "chosen which topics to research. You can cancel at any time "
+    "by replying `/q` or `/quit`."
+)
+
 
 class HistoryMessage(BaseModel):
     model_config = ConfigDict(
@@ -87,16 +105,7 @@ class StartResearchResponse(BaseModel):
                 "status": "running",
                 "next_action": "await_user_selection",
                 "view_token": "qGc4-redacted-example-token-value",
-                "user_facing_instruction": (
-                    "I've started the preliminary research. When the topic "
-                    "list is ready you'll see it appear right here — reply "
-                    "with `/k <numbers>` to keep specific topics, "
-                    "`/r <numbers>` to remove specific topics, or "
-                    "`/continue` to research all topics as-is. A live "
-                    "progress view will appear once you've chosen which "
-                    "topics to research. You can cancel at any time by "
-                    "replying `/q` or `/quit`."
-                ),
+                "user_facing_instruction": USER_FACING_INSTRUCTION,
             }
         }
     )
@@ -135,15 +144,7 @@ class StartResearchResponse(BaseModel):
             "attached to your assistant message; this string tells "
             "the user what to do next."
         ),
-        default=(
-            "I've started the preliminary research. When the topic list "
-            "is ready you'll see it appear right here — reply with "
-            "`/k <numbers>` to keep specific topics, `/r <numbers>` to "
-            "remove specific topics, or `/continue` to research all "
-            "topics as-is. A live progress view will appear once you've "
-            "chosen which topics to research. You can cancel at any time "
-            "by replying `/q` or `/quit`."
-        ),
+        default=USER_FACING_INSTRUCTION,
     )
 
 

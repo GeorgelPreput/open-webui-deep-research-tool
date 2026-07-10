@@ -125,6 +125,23 @@ def test_start_research_job_returns_user_facing_instruction(client):
         assert fragment in text
 
 
+def test_user_facing_instruction_default_equals_example():
+    """Both the field default and the json_schema_extra example resolve
+    through the single USER_FACING_INSTRUCTION constant (Group 14). A future
+    edit to one site without the other would desync them — catch it here."""
+    from deep_research.entrypoints.openapi_tool.schemas import (
+        USER_FACING_INSTRUCTION,
+        StartResearchResponse,
+    )
+
+    assert (
+        StartResearchResponse.model_fields["user_facing_instruction"].default
+        == USER_FACING_INSTRUCTION
+    )
+    example = StartResearchResponse.model_config["json_schema_extra"]["example"]
+    assert example["user_facing_instruction"] == USER_FACING_INSTRUCTION
+
+
 def test_start_research_job_returns_view_token(app_with_state, client):
     _, _, runner = app_with_state
     resp = client.post("/research_jobs", json={"prompt": "Q"})
