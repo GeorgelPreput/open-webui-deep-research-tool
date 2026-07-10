@@ -27,6 +27,15 @@ import aiosqlite
 logger = logging.getLogger("deep_research.entrypoints.openapi.jobs")
 
 
+# WARNING: `StrEnum` (not plain `str, Enum`). This changes `str(JobPhase.X)`
+# semantics: `StrEnum` returns the *value* ("queued"), where the pre-3.11
+# `str, Enum` idiom returned the *name* ("JobPhase.QUEUED"). Every site in
+# this codebase uses `.value` explicitly, so the migration was safe. If you
+# add a new site, prefer `.value` (explicit-is-better-than-implicit); if you
+# write `f"{record.phase}"` you get the lowercase value, which matches
+# `.value` but reads ambiguously in logs. Pinned by
+# tests/test_openapi_jobs_store.py::test_job_phase_str_returns_value_not_name;
+# changing the base class will fail there.
 class JobPhase(StrEnum):
     QUEUED = "queued"
     BOOTSTRAPPING = "bootstrapping"

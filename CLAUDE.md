@@ -911,6 +911,27 @@ lock*. `asyncio.Lock` is **not reentrant**, so they must use distinct locks
 (`_vocab_emb_load_lock` and `_vocab_load_lock`). A single shared lock deadlocks
 the whole run (hangs forever). Keep them separate.
 
+### `JobPhase` is `StrEnum`, not `str, Enum`
+
+`JobPhase` (`entrypoints/openapi_tool/jobs.py`) inherits from
+`enum.StrEnum`, so `str(JobPhase.X)` returns the lowercase **value**
+(`"queued"`), not the pre-3.11 `str, Enum` **name** form
+(`"JobPhase.QUEUED"`). Every persistence site uses `.value` explicitly, so
+the migration was deliberate and safe. Don't "fix" the explicit `.value`
+usage with a `__str__` override — that would silently restore the old
+name-form and contradict the codebase-wide convention. Writing
+`f"{record.phase}"` yields the value (matches `.value`) but reads
+ambiguously in logs; prefer `.value`. A warning comment sits above the
+class declaration and the contract is pinned by
+`tests/test_openapi_jobs_store.py::test_job_phase_str_returns_value_not_name`
+— a revert to `(str, Enum)` fails there.
+
+`RunContext.cancellation_token` (and the two `Coordinator` signatures it
+flows through) is typed `CancellationToken | None` via a `TYPE_CHECKING`
+import + `from __future__ import annotations`, not `Any`. The import cycle
+it originally dodged was speculative (`core.cancellation` only imports
+`asyncio`); the guard is kept as cheap insurance.
+
 ### `render_progress_embed_html` has two render modes
 
 `progress/embed.py::render_progress_embed_html(snapshot, *, poll_url=None,

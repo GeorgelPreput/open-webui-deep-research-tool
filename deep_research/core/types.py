@@ -1,8 +1,13 @@
+from __future__ import annotations
+
 import enum
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from typing_extensions import TypedDict
+
+if TYPE_CHECKING:
+    from deep_research.core.cancellation import CancellationToken
 
 
 class BibliographyEntry(TypedDict):
@@ -47,7 +52,7 @@ class Report:
     content: str
     title: str = ""
     sources: dict[str, Any] = field(default_factory=dict)
-    bibliography: list["BibliographyEntry"] = field(default_factory=list)
+    bibliography: list[BibliographyEntry] = field(default_factory=list)
     token_usage: dict[str, Any] = field(default_factory=dict)
     report_file_id: str | None = None
     conversation_id: str = ""
@@ -116,8 +121,12 @@ class RunContext:
     # does (OpenAPI runtime's /cancel endpoint, MCP cancel notifications).
     # Phase boundaries call ``ctx.raise_if_cancelled()`` so a cancellation
     # propagates as asyncio.CancelledError out of the run.
-    # Typed Any to avoid an import cycle with core.cancellation.
-    cancellation_token: Any = None
+    # The import sits behind a TYPE_CHECKING guard at the top of this
+    # module; the runtime cycle was speculative — core.cancellation only
+    # imports asyncio. We keep the TYPE_CHECKING form anyway as cheap
+    # insurance against a future import in core.cancellation reaching back
+    # into core.types.
+    cancellation_token: CancellationToken | None = None
     # OWUI assistant-message id this run writes back to, when known. Captured
     # from the inbound X-OpenWebUI-Message-Id header by the OpenAPI runner;
     # consumed by the runner's event→outbox mapping (Phase 2). The engine
