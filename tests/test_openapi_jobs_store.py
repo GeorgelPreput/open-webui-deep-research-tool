@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 
 from deep_research.entrypoints.openapi_tool.jobs import (
+    _TERMINAL_PHASE_VALUES,
     TERMINAL_PHASES,
     JobPhase,
     JobRecord,
@@ -214,6 +215,41 @@ def test_terminal_phases_constant():
     assert JobPhase.FAILED in TERMINAL_PHASES
     assert JobPhase.CANCELLED in TERMINAL_PHASES
     assert JobPhase.RESEARCHING not in TERMINAL_PHASES
+
+
+def test_terminal_phase_values_are_sorted():
+    """Pins deterministic ordering of the SQL `IN (...)` value tuple so a
+    future switch back to `tuple(p.value for p in TERMINAL_PHASES)` (whose
+    frozenset order is unspecified) fails loudly."""
+    assert _TERMINAL_PHASE_VALUES == ("cancelled", "completed", "failed")
+
+
+def test_terminal_phase_values_match_terminal_phases():
+    """Completeness guard: a new terminal phase added to TERMINAL_PHASES
+    without updating the sorted tuple would desync the two — catch it."""
+    assert set(_TERMINAL_PHASE_VALUES) == {p.value for p in TERMINAL_PHASES}
+
+
+def test_job_phase_str_returns_value_not_name():
+    """Pin StrEnum semantics.
+
+    `JobPhase` inherits from `enum.StrEnum`, so `str(JobPhase.X)` returns the
+    lowercase *value* rather than the `"JobPhase.X"` form the pre-3.11
+    `str, Enum` idiom produced. Every persistence site uses `.value`
+    explicitly, so the migration was deliberate. If a future change reverts
+    the base class to `(str, Enum)`, f-strings like `f"phase={record.phase}"`
+    would emit `"phase=JobPhase.QUEUED"` instead of `"phase=queued"`,
+    drifting log shape and any external consumer parsing those lines.
+    """
+    assert str(JobPhase.QUEUED) == "queued"
+    assert str(JobPhase.AWAITING_OUTLINE_FEEDBACK) == "awaiting_outline_feedback"
+    assert str(JobPhase.COMPLETED) == "completed"
+    # f-string path — the dangerous case the warning comment in jobs.py calls
+    # out. Must also return the value, not "JobPhase.X".
+    assert f"{JobPhase.FAILED}" == "failed"
+    # `.value` is the explicit form every production site uses; parity with
+    # `str()` is the entire point of `StrEnum`.
+    assert JobPhase.CANCELLED.value == str(JobPhase.CANCELLED)
 
 
 # -------------------------------------------------------- UNIQUE partial index

@@ -27,6 +27,15 @@ import aiosqlite
 logger = logging.getLogger("deep_research.entrypoints.openapi.jobs")
 
 
+# WARNING: `StrEnum` (not plain `str, Enum`). This changes `str(JobPhase.X)`
+# semantics: `StrEnum` returns the *value* ("queued"), where the pre-3.11
+# `str, Enum` idiom returned the *name* ("JobPhase.QUEUED"). Every site in
+# this codebase uses `.value` explicitly, so the migration was safe. If you
+# add a new site, prefer `.value` (explicit-is-better-than-implicit); if you
+# write `f"{record.phase}"` you get the lowercase value, which matches
+# `.value` but reads ambiguously in logs. Pinned by
+# tests/test_openapi_jobs_store.py::test_job_phase_str_returns_value_not_name;
+# changing the base class will fail there.
 class JobPhase(StrEnum):
     QUEUED = "queued"
     BOOTSTRAPPING = "bootstrapping"
@@ -42,6 +51,15 @@ class JobPhase(StrEnum):
 
 TERMINAL_PHASES: frozenset[JobPhase] = frozenset(
     {JobPhase.COMPLETED, JobPhase.FAILED, JobPhase.CANCELLED}
+)
+
+# Pre-sorted phase values for SQL `IN (...)` callers. `frozenset` iteration
+# order is unspecified and varies between processes, so any site that bakes
+# the order into a SQL string (placeholder layout, parameter tuple) must use
+# this constant rather than iterating `TERMINAL_PHASES` directly. Membership
+# tests (`x in TERMINAL_PHASES`) are order-independent and keep using the set.
+_TERMINAL_PHASE_VALUES: tuple[str, ...] = tuple(
+    sorted(p.value for p in TERMINAL_PHASES)
 )
 
 
@@ -329,7 +347,7 @@ class JobStore:
 
     async def find_active_by_chat(self, chat_id: str) -> JobRecord | None:
         """Return the most-recent non-terminal job for a chat, if any."""
-        terminal_values = tuple(p.value for p in TERMINAL_PHASES)
+        terminal_values = _TERMINAL_PHASE_VALUES
         placeholders = ",".join("?" for _ in terminal_values)
         sql = (
             "SELECT * FROM research_jobs "

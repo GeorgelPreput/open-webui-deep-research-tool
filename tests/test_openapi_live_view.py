@@ -310,3 +310,15 @@ async def test_live_view_status_completed_flag(app_with_store):
     )
     assert resp.status_code == 200
     assert resp.json()["completed"] is True
+
+
+def test_204_response_documented_in_openapi_schema(app_with_store):
+    """Group 15: the 204 no-change branch of /live_view/{job_id}/status must
+    be declared in the published OpenAPI schema, not just returned at runtime.
+    Pins the schema-contract gap the review flagged."""
+    app, _, _ = app_with_store
+    client = TestClient(app)
+    schema = client.get("/openapi.json").json()
+    responses = schema["paths"]["/live_view/{job_id}/status"]["get"]["responses"]
+    assert "204" in responses
+    assert responses["204"]["description"].strip()

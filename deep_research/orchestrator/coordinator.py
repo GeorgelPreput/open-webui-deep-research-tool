@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import time
@@ -7,7 +9,7 @@ from datetime import datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from deep_research.adapter.auth import (
     BearerTokenProvider,
@@ -25,6 +27,9 @@ from deep_research.core.caches import EmbeddingCache, LRUBytesBoundedCache, Tran
 from deep_research.core.state import ResearchStateManager
 from deep_research.core.types import ChatMessage, Report, ResearchMode, RunContext, RunUser
 from deep_research.progress.events import EventBus, Sink, StatusEvent
+
+if TYPE_CHECKING:
+    from deep_research.core.cancellation import CancellationToken
 
 logger = logging.getLogger("deep_research.orchestrator")
 
@@ -86,7 +91,7 @@ class CacheBundle:
         self.models: dict[str, Any] = {}
 
     @classmethod
-    def create(cls, valves: Valves, config: RuntimeConfig) -> "CacheBundle":
+    def create(cls, valves: Valves, config: RuntimeConfig) -> CacheBundle:
         return cls(valves, config)
 
 
@@ -299,7 +304,7 @@ class Coordinator:
         prompt: str,
         history: list[ChatMessage],
         sink: Sink,
-        cancellation_token: Any = None,
+        cancellation_token: CancellationToken | None = None,
         target_message_id: str | None = None,
     ) -> Report:
         inflight_key = f"{user.id}:{conversation_id}"
@@ -470,7 +475,7 @@ class Coordinator:
         history: list[ChatMessage],
         sink: Sink,
         *,
-        cancellation_token: Any = None,
+        cancellation_token: CancellationToken | None = None,
         target_message_id: str | None = None,
     ) -> RunContext:
         event_bus = EventBus(sink, flush_interval_ms=self._valves.events.flush_interval_ms)

@@ -46,7 +46,11 @@ The OpenAPI Tool Server was rewritten around a **two-call** workflow:
   - `GET /live_view/{job_id}` HTML iframe — per-job view tokens,
     sha256-hashed at rest, self-polling. View-token equality is
     compared with `hmac.compare_digest` for constant-time safety.
-  - `GET /live_view/{job_id}/status` JSON snapshot used by the iframe.
+  - `GET /live_view/{job_id}/status` JSON snapshot used by the iframe;
+    returns `204 No Content` (empty body) when `since_version` matches the
+    current revision, so the polling script skips a re-render. The 204
+    branch is declared in the route's `responses=` (the 403/404 use
+    FastAPI's default `{"detail": ...}` shape, not `ErrorResponse`).
 
 The cleartext `view_token` returned on the start response is only
 needed when an OpenAPI consumer renders the iframe URL itself
@@ -482,6 +486,18 @@ exists; #1 fires when it's ready). The intentional duplication is
 documented here so a future cleanup pass doesn't accidentally
 collapse them.
 
+Site #3's text is stored in the module-level constant
+`deep_research.entrypoints.openapi_tool.schemas.USER_FACING_INSTRUCTION`,
+referenced by both the field default and the `json_schema_extra` example
+within the schema module (Group 14 collapsed that intra-file
+duplication; pinned by
+`tests/test_openapi_jobs.py::test_user_facing_instruction_default_equals_example`).
+This is still site #3 — the separation from site #1 is unchanged. (The
+`local:` 409 body and its `START_DESCRIPTION` LLM-relay paragraph were
+left as two strings: their remedy advice is already worded per-audience,
+not byte-identical, so a shared constant would have forced a text
+change.)
+
 The `/q` and `/quit` cancel commands live in **two** sites, not three,
 because they're never parsed by the engine's
 `process_outline_feedback_continuation` as a normal command — they
@@ -521,6 +537,15 @@ defence-in-depth for any pre-upgrade JobRecord still in
 `jobs.sqlite` and to keep the existing
 `tests/test_openapi_writeback_e2e.py::test_writeback_skipped_when_chat_id_is_local`
 invariant honest.
+
+The complementary case — `chat_id` arriving as `None` / empty — is
+handled *asymmetrically* on purpose: it is **soft-degraded** (the job
+runs, writeback skips, `OWUI_HEADERS_NOT_FORWARDED` surfaces on
+`/health`) rather than 409'd, because a missing chat-id header is a
+deployment-config issue (`ENABLE_FORWARD_USER_INFO_HEADERS` off), not a
+per-call user error. The asymmetry is annotated inline above the
+`local:` gate in `start_research_job`; do NOT symmetrise `None` into a
+409 — it would break the headers-off OWUI deployment story.
 
 **Terminal writebacks no longer clear the iframe.** Both successful
 completion and cancellation go through `_enqueue_terminal_writeback`
@@ -679,10 +704,13 @@ not restore the silent-suppress shape during cleanup.
     do not log any fragment of the raw blob — the test
     `test_deserialise_history_logs_on_bad_blob` pins this.
 
-The analogous risk in the *cancellation* branches (`runner.py:201-203,
-292-294, 367-369`, each calling
-`_store.update(phase=CANCELLED, ...)`) is tracked in TODO.md Group 3
-and deferred to that group's terminal-cancel-helper extraction.
+The analogous *cancellation* branches — the three
+`_store.update(phase=CANCELLED, ...)` calls (`cancel()`'s Phase C plus the
+`CancelledError` handlers of `_run_initial` / `_run_feedback`) — now carry
+the same `try/except Exception` + `logger.exception` guard, with
+`_mark_phase(CANCELLED)` running unconditionally after. This landed under
+Group 3 alongside the terminal-cancel-helper extraction; the FAILED-write
+and CANCELLED-write paths are now symmetric.
 
 ---
 
@@ -907,6 +935,27 @@ is a str elsewhere.
 lock*. `asyncio.Lock` is **not reentrant**, so they must use distinct locks
 (`_vocab_emb_load_lock` and `_vocab_load_lock`). A single shared lock deadlocks
 the whole run (hangs forever). Keep them separate.
+
+### `JobPhase` is `StrEnum`, not `str, Enum`
+
+`JobPhase` (`entrypoints/openapi_tool/jobs.py`) inherits from
+`enum.StrEnum`, so `str(JobPhase.X)` returns the lowercase **value**
+(`"queued"`), not the pre-3.11 `str, Enum` **name** form
+(`"JobPhase.QUEUED"`). Every persistence site uses `.value` explicitly, so
+the migration was deliberate and safe. Don't "fix" the explicit `.value`
+usage with a `__str__` override — that would silently restore the old
+name-form and contradict the codebase-wide convention. Writing
+`f"{record.phase}"` yields the value (matches `.value`) but reads
+ambiguously in logs; prefer `.value`. A warning comment sits above the
+class declaration and the contract is pinned by
+`tests/test_openapi_jobs_store.py::test_job_phase_str_returns_value_not_name`
+— a revert to `(str, Enum)` fails there.
+
+`RunContext.cancellation_token` (and the two `Coordinator` signatures it
+flows through) is typed `CancellationToken | None` via a `TYPE_CHECKING`
+import + `from __future__ import annotations`, not `Any`. The import cycle
+it originally dodged was speculative (`core.cancellation` only imports
+`asyncio`); the guard is kept as cheap insurance.
 
 ### `render_progress_embed_html` has two render modes
 
