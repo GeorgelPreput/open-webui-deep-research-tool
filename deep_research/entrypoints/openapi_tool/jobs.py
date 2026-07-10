@@ -44,6 +44,15 @@ TERMINAL_PHASES: frozenset[JobPhase] = frozenset(
     {JobPhase.COMPLETED, JobPhase.FAILED, JobPhase.CANCELLED}
 )
 
+# Pre-sorted phase values for SQL `IN (...)` callers. `frozenset` iteration
+# order is unspecified and varies between processes, so any site that bakes
+# the order into a SQL string (placeholder layout, parameter tuple) must use
+# this constant rather than iterating `TERMINAL_PHASES` directly. Membership
+# tests (`x in TERMINAL_PHASES`) are order-independent and keep using the set.
+_TERMINAL_PHASE_VALUES: tuple[str, ...] = tuple(
+    sorted(p.value for p in TERMINAL_PHASES)
+)
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -329,7 +338,7 @@ class JobStore:
 
     async def find_active_by_chat(self, chat_id: str) -> JobRecord | None:
         """Return the most-recent non-terminal job for a chat, if any."""
-        terminal_values = tuple(p.value for p in TERMINAL_PHASES)
+        terminal_values = _TERMINAL_PHASE_VALUES
         placeholders = ",".join("?" for _ in terminal_values)
         sql = (
             "SELECT * FROM research_jobs "

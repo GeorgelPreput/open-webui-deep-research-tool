@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 
 from deep_research.entrypoints.openapi_tool.jobs import (
+    _TERMINAL_PHASE_VALUES,
     TERMINAL_PHASES,
     JobPhase,
     JobRecord,
@@ -214,6 +215,19 @@ def test_terminal_phases_constant():
     assert JobPhase.FAILED in TERMINAL_PHASES
     assert JobPhase.CANCELLED in TERMINAL_PHASES
     assert JobPhase.RESEARCHING not in TERMINAL_PHASES
+
+
+def test_terminal_phase_values_are_sorted():
+    """Pins deterministic ordering of the SQL `IN (...)` value tuple so a
+    future switch back to `tuple(p.value for p in TERMINAL_PHASES)` (whose
+    frozenset order is unspecified) fails loudly."""
+    assert _TERMINAL_PHASE_VALUES == ("cancelled", "completed", "failed")
+
+
+def test_terminal_phase_values_match_terminal_phases():
+    """Completeness guard: a new terminal phase added to TERMINAL_PHASES
+    without updating the sorted tuple would desync the two — catch it."""
+    assert set(_TERMINAL_PHASE_VALUES) == {p.value for p in TERMINAL_PHASES}
 
 
 # -------------------------------------------------------- UNIQUE partial index
