@@ -482,6 +482,20 @@ async def start_research_job(
     chat_id = request.headers.get("X-OpenWebUI-Chat-Id")
     message_id = request.headers.get("X-OpenWebUI-Message-Id")
 
+    # chat_id handling is intentionally asymmetric across three input states:
+    #   - "local:..."  → hard-reject 409 (below): OWUI's /event endpoint
+    #     silently drops events posted to ephemeral chats, so a multi-minute
+    #     run whose progress/report can never reach the user is bad value.
+    #     Fail fast and have the LLM ask the user to persist the chat first.
+    #   - None / ""    → soft-degrade (the `if not chat_id` block further
+    #     down): the job runs, writeback skips (runner._writeback_target
+    #     returns None), and OWUI_HEADERS_NOT_FORWARDED surfaces on /health.
+    #     This is a deployment-config issue (ENABLE_FORWARD_USER_INFO_HEADERS
+    #     off), not a per-call user error.
+    #   - real UUID    → proceed normally.
+    # See CLAUDE.md "`local:` chats are refused at `start_research_job`" and
+    # "Config warning code taxonomy". Do NOT symmetrise None into a 409 —
+    # it would break the headers-off OWUI deployment story.
     if chat_id and chat_id.startswith("local:"):
         raise _error(
             409,
@@ -734,7 +748,27 @@ async def live_view(
 @app.get(
     "/live_view/{job_id}/status",
     summary="JSON snapshot of a job for the iframe's polling loop.",
+    description=(
+        "Returns a `LiveViewSnapshot` JSON body with the current job state. "
+        "If the client passes `since_version=N` and the job's current "
+        "revision equals N (no change since the last poll), the endpoint "
+        "returns `204 No Content` with an empty body so the polling iframe "
+        "can skip a re-render. The 204 branch is only taken when "
+        "`since_version` is supplied; omitting it always yields a 200 with "
+        "the snapshot."
+    ),
     response_model=LiveViewSnapshot,
+    responses={
+        204: {
+            "description": (
+                "No change since `since_version`. Empty body. The iframe's "
+                "polling script treats this as a no-op and schedules the "
+                "next poll."
+            ),
+        },
+        403: {"description": "View token does not match the job's stored hash."},
+        404: {"description": "Unknown job_id."},
+    },
     tags=["live_view"],
 )
 async def live_view_status(
@@ -743,6 +777,14 @@ async def live_view_status(
     token: Annotated[str, Query()],
     since_version: Annotated[int | None, Query(ge=0)] = None,
 ) -> Response:
+    """Poll a job's snapshot for the live-view iframe.
+
+    Returns a 200 with a `LiveViewSnapshot` JSON body by default. If the
+    caller supplies `since_version=N` and the job's current revision equals
+    N, returns a bare 204 with an empty body — the iframe's polling script
+    reads this as "no change, keep polling." 403/404 use FastAPI's default
+    ``{"detail": ...}`` shape (bare ``HTTPException``), not ``ErrorResponse``.
+    """
     store: JobStore = request.app.state.job_store
     runner: JobRunner = request.app.state.runner
 

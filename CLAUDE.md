@@ -46,7 +46,11 @@ The OpenAPI Tool Server was rewritten around a **two-call** workflow:
   - `GET /live_view/{job_id}` HTML iframe — per-job view tokens,
     sha256-hashed at rest, self-polling. View-token equality is
     compared with `hmac.compare_digest` for constant-time safety.
-  - `GET /live_view/{job_id}/status` JSON snapshot used by the iframe.
+  - `GET /live_view/{job_id}/status` JSON snapshot used by the iframe;
+    returns `204 No Content` (empty body) when `since_version` matches the
+    current revision, so the polling script skips a re-render. The 204
+    branch is declared in the route's `responses=` (the 403/404 use
+    FastAPI's default `{"detail": ...}` shape, not `ErrorResponse`).
 
 The cleartext `view_token` returned on the start response is only
 needed when an OpenAPI consumer renders the iframe URL itself
@@ -533,6 +537,15 @@ defence-in-depth for any pre-upgrade JobRecord still in
 `jobs.sqlite` and to keep the existing
 `tests/test_openapi_writeback_e2e.py::test_writeback_skipped_when_chat_id_is_local`
 invariant honest.
+
+The complementary case — `chat_id` arriving as `None` / empty — is
+handled *asymmetrically* on purpose: it is **soft-degraded** (the job
+runs, writeback skips, `OWUI_HEADERS_NOT_FORWARDED` surfaces on
+`/health`) rather than 409'd, because a missing chat-id header is a
+deployment-config issue (`ENABLE_FORWARD_USER_INFO_HEADERS` off), not a
+per-call user error. The asymmetry is annotated inline above the
+`local:` gate in `start_research_job`; do NOT symmetrise `None` into a
+409 — it would break the headers-off OWUI deployment story.
 
 **Terminal writebacks no longer clear the iframe.** Both successful
 completion and cancellation go through `_enqueue_terminal_writeback`
