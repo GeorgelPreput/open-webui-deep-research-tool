@@ -679,10 +679,13 @@ not restore the silent-suppress shape during cleanup.
     do not log any fragment of the raw blob — the test
     `test_deserialise_history_logs_on_bad_blob` pins this.
 
-The analogous risk in the *cancellation* branches (`runner.py:201-203,
-292-294, 367-369`, each calling
-`_store.update(phase=CANCELLED, ...)`) is tracked in TODO.md Group 3
-and deferred to that group's terminal-cancel-helper extraction.
+The analogous *cancellation* branches — the three
+`_store.update(phase=CANCELLED, ...)` calls (`cancel()`'s Phase C plus the
+`CancelledError` handlers of `_run_initial` / `_run_feedback`) — now carry
+the same `try/except Exception` + `logger.exception` guard, with
+`_mark_phase(CANCELLED)` running unconditionally after. This landed under
+Group 3 alongside the terminal-cancel-helper extraction; the FAILED-write
+and CANCELLED-write paths are now symmetric.
 
 ---
 
